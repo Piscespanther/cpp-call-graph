@@ -1,0 +1,181 @@
+{
+  "name": "cpp-call-graph",
+  "displayName": "C/C++ 调用关系图 (Call Graph)",
+  "description": "在底部面板以图形化方式浏览 C/C++ 函数的被调用关系与调用关系，每次查询一个标签页（基于 LSP Call Hierarchy / clangd）。",
+  "version": "0.19.2",
+  "publisher": "Piscespanther",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Piscespanther/cpp-call-graph.git"
+  },
+  "engines": {
+    "vscode": "^1.75.0",
+    "node": ">=20"
+  },
+  "categories": [
+    "Programming Languages",
+    "Visualization"
+  ],
+  "keywords": [
+    "c",
+    "cpp",
+    "callgraph",
+    "call hierarchy",
+    "clangd"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onStartupFinished",
+    "onLanguage:c",
+    "onLanguage:cpp",
+    "onLanguage:cuda-cpp",
+    "onLanguage:objective-c",
+    "onLanguage:objective-cpp"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "cppCallGraph.showCallers",
+        "title": "显示被调用关系",
+        "category": "调用关系图",
+        "icon": "$(arrow-left)"
+      },
+      {
+        "command": "cppCallGraph.showCallees",
+        "title": "显示调用关系",
+        "category": "调用关系图",
+        "icon": "$(arrow-right)"
+      },
+      {
+        "command": "cppCallGraph.focusGraph",
+        "title": "聚焦调用关系图（在面板中打开）",
+        "category": "调用关系图",
+        "icon": "$(type-hierarchy)"
+      },
+      {
+        "command": "cppCallGraph.copyElement",
+        "title": "复制元素",
+        "category": "调用关系图",
+        "icon": "$(symbol-method)"
+      },
+      {
+        "command": "cppCallGraph.copyLocation",
+        "title": "复制地址",
+        "category": "调用关系图",
+        "icon": "$(link)"
+      },
+      {
+        "command": "cppCallGraph.copyActive",
+        "title": "复制当前标签为文本",
+        "category": "调用关系图",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "cppCallGraph.closeAllTabs",
+        "title": "关闭全部调用关系标签",
+        "category": "调用关系图",
+        "icon": "$(close-all)"
+      },
+      {
+        "command": "cppCallGraph.diagnose",
+        "title": "诊断（出问题时先跑这个）",
+        "category": "调用关系图",
+        "icon": "$(debug-alt)"
+      },
+      {
+        "command": "cppCallGraph.showLog",
+        "title": "显示日志",
+        "category": "调用关系图",
+        "icon": "$(output)"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "cppCallGraph.showCallers",
+          "when": "editorLangId == c || editorLangId == cpp || editorLangId == cuda-cpp || editorLangId == objective-c || editorLangId == objective-cpp",
+          "group": "0_navigation@-2"
+        },
+        {
+          "command": "cppCallGraph.showCallees",
+          "when": "editorLangId == c || editorLangId == cpp || editorLangId == cuda-cpp || editorLangId == objective-c || editorLangId == objective-cpp",
+          "group": "0_navigation@-1"
+        }
+      ],
+      "view/title": []
+    },
+    "viewsContainers": {
+      "panel": [
+        {
+          "id": "cppCallGraphPanel",
+          "title": "调用关系图",
+          "icon": "$(type-hierarchy)"
+        }
+      ]
+    },
+    "views": {
+      "cppCallGraphPanel": [
+        {
+          "id": "cppCallGraph.graphView",
+          "name": "调用关系图",
+          "contextualTitle": "调用关系图",
+          "icon": "$(type-hierarchy)",
+          "type": "webview",
+          "when": "cppCallGraph.hasSessions"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "调用关系图",
+      "properties": {
+        "cppCallGraph.languageService": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "clangd",
+            "cpptools"
+          ],
+          "enumItemLabels": [
+            "自动（交给 VS Code 决定）",
+            "优先 clangd",
+            "优先 C/C++ 扩展 (cpptools)"
+          ],
+          "default": "auto",
+          "markdownDescription": "C/C++ 的调用层级由哪个语言服务提供。\n\n- **clangd**：需要 clangd *扩展* **加上**真正的 `clangd` 可执行文件（扩展只是客户端，装 clang 编译器 `clang.exe` 不算），并且工程要有 `compile_commands.json`。\n- **cpptools**：C/C++ 扩展，调用层级走它自己的 RPC。\n\n两者注册在同一个语言 ID 上，VS Code 会按注册顺序选用，扩展无法强制指定；本设置只影响结果取舍与展示标注。要彻底避免两个引擎互相干扰，建议只启用其中一个：用 clangd 时把 `C_Cpp.intelliSenseEngine` 设为 `disabled`，或直接禁用 C/C++ 扩展。"
+        },
+        "cppCallGraph.maxChildrenPerNode": {
+          "type": "number",
+          "default": 200,
+          "minimum": 1,
+          "markdownDescription": "同一层每个函数最多显示多少个调用者/被调用者。"
+        },
+        "cppCallGraph.autoReveal": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "点击图形里的函数框时自动打开对应文件并定位到函数声明处。"
+        },
+        "cppCallGraph.showEngineWarning": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "检测到 clangd 与 C/C++ 扩展（cpptools）同时可用时，提示如何处理，避免调用关系结果被两个引擎混用。"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "check": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.scripts.json",
+    "build": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "smoke": "node esbuild.js && node scripts/buildChecks.js && node scripts/smoke.js && node scripts/pickCheck.js && node scripts/webviewCheck.js && node scripts/renderCheck.js && node scripts/iconCheck.js && node scripts/iconShapeCheck.js && node scripts/genSymbolIcons.js --verify",
+    "package": "node esbuild.js --production && vsce package --no-dependencies",
+    "vscode:prepublish": "node esbuild.js --production"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/vscode": "^1.75.0",
+    "@vscode/vsce": "^3.2.1",
+    "esbuild": "^0.24.2",
+    "typescript": "^5.7.2"
+  }
+}

@@ -1,0 +1,28 @@
+* text=auto eol=lf
+
+*.ts    text
+*.js    text
+*.json  text
+*.md    text
+*.txt   text
+*.html  text
+*.css   text
+*.yml   text
+*.yaml  text
+
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+
+*.vsix  binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.ttf   binary
+*.woff  binary
+*.woff2 binary
+*.zip   binary
+
+package-lock.json  linguist-generated=true

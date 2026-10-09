@@ -1,0 +1,526 @@
+:root {
+  --node-bg: var(--vscode-editorWidget-background, #252526);
+  /* 方框边：深紫色（按需求）。原来的 #c586c0 偏亮偏粉，观感像粉红 */
+  --node-border: #7b3fa0;
+  --node-fg: var(--vscode-foreground, #cccccc);
+  --muted: var(--vscode-descriptionForeground, #8b8b8b);
+  --accent: #a855f7;
+  --edge: var(--vscode-editorCodeLens-foreground, #8b8b8b);
+  --edge-active: var(--vscode-charts-blue, #3794ff);
+  --tab-bg: var(--vscode-panel-background, #1e1e1e);
+  --tab-active-bg: var(--vscode-editor-background, #1e1e1e);
+  /* 根方框：同色但深一档 + 线更粗，便于一眼认出起点 */
+  --root-border: #9552c4;
+  --node-hover: #b06fe0;
+  --cycle: var(--vscode-charts-orange, #d18616);
+  /* 符号角标：优先用主题的 --vscode-symbolIcon-*，缺失时退回这个紫色 */
+  --symbol-fallback: #c586c0;
+  /* 工具栏按钮图标色 */
+  --icon-fg: var(--vscode-icon-foreground, var(--vscode-foreground, #cccccc));
+}
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  font-family: var(--vscode-font-family);
+  font-size: var(--vscode-font-size, 13px);
+  color: var(--node-fg);
+  background: var(--vscode-panel-background, #1e1e1e);
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+}
+
+/* ------------------------------------------------------------ 标签栏 */
+
+.tabs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: stretch;
+  gap: 2px;
+  border-bottom: 1px solid var(--vscode-panel-border, #2b2b2b);
+  background: var(--tab-bg);
+  flex: 0 0 auto;
+}
+
+.tabs:empty {
+  display: none;
+}
+
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px 5px 10px;
+  border: none;
+  border-right: 1px solid var(--vscode-panel-border, #2b2b2b);
+  background: transparent;
+  color: var(--muted);
+  font-family: inherit;
+  font-size: inherit;
+  white-space: nowrap;
+  cursor: pointer;
+  max-width: 260px;
+  /*
+   * 关键：flex 项默认 min-width: auto，内容（nowrap 的文字）撑住不肯缩，
+   * 于是标签宽度明显超出内容该有的宽度，甚至互相重叠。
+   * 置 0 之后标签才会按内容自适应，过长时由 .tab-label 省略号截断。
+   */
+  min-width: 0;
+}
+
+.tab:hover {
+  color: var(--node-fg);
+  background: var(--vscode-toolbar-hoverBackground, rgba(90, 93, 94, 0.31));
+}
+
+.tab.active {
+  color: var(--node-fg);
+  background: var(--tab-active-bg);
+  box-shadow: inset 0 -1px 0 var(--accent);
+}
+
+/* 标签标题：按内容自适应宽度，过长才截断。
+   min-width: 0 同样是为了让它能被压缩，而不是把兄弟元素挤出去。 */
+.tab .tab-label {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 方向图标与关闭按钮不参与压缩，避免被挤没 */
+.tab .tab-direction,
+.tab .tab-close {
+  flex: 0 0 auto;
+}
+
+/* 方向图标：放在元素名右侧，表示「被调用关系 / 调用关系」。
+   用 currentColor 跟随标签文字色（激活时更亮），尺寸固定不压缩。 */
+.tab .tab-direction {
+  width: 13px;
+  height: 13px;
+  flex: 0 0 auto;
+  fill: currentColor;
+  opacity: 0.75;
+}
+
+.tab.active .tab-direction,
+.tab:hover .tab-direction {
+  opacity: 1;
+}
+
+.tab .tab-engine {
+  color: var(--muted);
+  font-size: 0.85em;
+}
+
+.tab .tab-close {
+  border: none;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  border-radius: 3px;
+  padding: 0 4px;
+  font-size: 12px;
+  line-height: 16px;
+}
+
+.tab .tab-close:hover {
+  background: var(--vscode-toolbar-hoverBackground, rgba(90, 93, 94, 0.5));
+  color: var(--vscode-errorForeground, #f48771);
+}
+
+/* ------------------------------------------------------------ 状态提示 */
+
+/* 工具条已去掉，状态信息改为画布右下角的浮层，不占布局空间 */
+.summary {
+  position: absolute;
+  right: 10px;
+  bottom: 8px;
+  max-width: 70%;
+  padding: 2px 6px;
+  border-radius: 4px;
+  color: var(--muted);
+  background: var(--vscode-editorWidget-background, rgba(37, 37, 38, 0.75));
+  font-size: 0.85em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 2;
+}
+
+/* ------------------------------------------------------------ 工具栏 */
+
+/* 最上面的一小栏按钮（在标签栏之上）。用 VS Code 自己的 toolbar 变量，观感与内置工具栏一致。
+   分隔线只由下面的标签栏提供，这里不再画一条，免得出现双层线。 */
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 4px;
+  flex: 0 0 auto;
+  background: var(--tab-bg);
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.toolbar button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--vscode-icon-foreground, var(--node-fg));
+  cursor: pointer;
+}
+
+.toolbar button:hover {
+  background: var(--vscode-toolbar-hoverBackground, rgba(90, 93, 94, 0.31));
+}
+
+.toolbar button:active {
+  background: var(--vscode-toolbar-activeBackground, rgba(99, 102, 103, 0.4));
+}
+
+.toolbar button:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder, #007fd4);
+  outline-offset: -1px;
+}
+
+.toolbar button:disabled {
+  opacity: 0.4;
+  cursor: default;
+  background: transparent;
+}
+
+/* 图标是内联 SVG：用 currentColor 填充，跟着按钮的文字色走 */
+.toolbar button svg {
+  width: 14px;
+  height: 14px;
+  fill: currentColor;
+  pointer-events: none;
+}
+
+/* 没有打开的标签时整栏没什么可操作，直接隐藏（与面板收起的行为一致） */
+.toolbar.is-empty {
+  display: none;
+}
+
+/* ------------------------------------------------------------ 方框右键菜单 */
+
+/* 注意：[hidden] 必须显式写成 display: none —— 下面的 display: flex
+   会覆盖浏览器默认的 [hidden] 规则，否则菜单会一直显示。 */
+.box-menu[hidden] {
+  display: none;
+}
+
+.box-menu {
+  position: fixed;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  min-width: 148px;
+  padding: 4px;
+  border: 1px solid var(--vscode-menu-border, var(--vscode-panel-border, #454545));
+  border-radius: 5px;
+  background: var(--vscode-menu-background, var(--vscode-editorWidget-background, #252526));
+  box-shadow: 0 2px 8px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.36));
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.box-menu button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px 5px 8px;
+  border: none;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--vscode-menu-foreground, var(--node-fg));
+  font-family: inherit;
+  font-size: inherit;
+  text-align: left;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.box-menu button:hover {
+  background: var(--vscode-menu-selectionBackground, var(--vscode-toolbar-hoverBackground, #094771));
+  color: var(--vscode-menu-selectionForeground, var(--node-fg));
+}
+
+.box-menu button svg {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  fill: currentColor;
+  pointer-events: none;
+}
+
+/* ------------------------------------------------------------ 画布 */
+
+.canvas {
+  position: relative;
+  flex: 1 1 auto;
+  /* 滚动交给浏览器：滚轮上下平滑滚动、Shift+滚轮左右滚，链太长时出现滚动条 */
+  overflow: auto;
+  overscroll-behavior: contain;
+  scroll-behavior: smooth;
+  /* 双击方框是「跳转」，不要选中方框里的文字（否则会留下蓝色选区）。
+     SVG 里的 <text> 默认是可选中的，所以整块画布都关掉选择。 */
+  user-select: none;
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  -ms-user-select: none;
+}
+
+/* 双击产生的选区也一并压掉，避免某些 Chromium 版本仍画出高亮 */
+.canvas ::selection {
+  background: transparent;
+}
+
+#svg {
+  display: block;
+  /* 宽高由脚本设为内容尺寸，配合同尺寸的 viewBox：
+     1 内容单位 = 1 像素，字号就是 CSS 里的值，不随窗口变化。
+     没有缩放功能，滚动完全交给浏览器。 */
+  /* 与 .canvas 同因：方框是交互元素，不是可复制文本 */
+  user-select: none;
+  -webkit-user-select: none;
+  /* 双击不要触发浏览器的「选词」行为 */
+  -webkit-tap-highlight-color: transparent;
+}
+
+.empty {
+  position: absolute;
+  inset: 0;
+  display: none;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  color: var(--muted);
+  pointer-events: none;
+}
+
+.empty .hint {
+  font-size: 0.9em;
+}
+
+/* ------------------------------------------------------------ 连线 */
+
+.edge {
+  fill: none;
+  stroke: var(--edge);
+  stroke-width: 1.3;
+  /* 90° 折线，拐角稍微圆一点，不要变成曲线 */
+  stroke-linejoin: round;
+  stroke-linecap: round;
+  marker-end: url(#arrow);
+}
+
+.edge.dir-left {
+  /* 被调用关系：箭头指向左侧的被调用方 */
+  marker-end: url(#arrow);
+}
+
+.edge.cycle {
+  stroke: var(--cycle);
+  stroke-dasharray: 4 3;
+}
+
+.arrow-head {
+  fill: var(--edge);
+}
+
+/* ------------------------------------------------------------ 节点 */
+
+.node {
+  cursor: pointer;
+}
+
+.node .box {
+  fill: var(--node-bg);
+  stroke: var(--node-border);
+  stroke-width: 1;
+  /* 直角方形：不加圆角 */
+}
+
+.node.root .box {
+  stroke: var(--root-border);
+  stroke-width: 1.5;
+}
+
+.node.cycle .box {
+  stroke: var(--cycle);
+  stroke-dasharray: 4 3;
+}
+
+.node:hover .box {
+  stroke: var(--node-hover);
+}
+
+.node.selected .box {
+  stroke: var(--node-hover);
+  stroke-width: 2;
+}
+
+/* 符号角标：用 VS Code 主题的符号色（--vscode-symbolIcon-*），
+   所以函数的紫、变量的蓝、类的橙等会自动与大纲里的图标一致。
+   主题变量缺失时退回紫色。 */
+.node .kind-icon .icon-shape {
+  fill: currentColor;
+}
+
+.node .kind-icon[data-codicon='symbol-method'] {
+  color: var(--vscode-symbolIcon-functionForeground, var(--symbol-fallback));
+}
+.node .kind-icon[data-codicon='symbol-operator'] {
+  color: var(--vscode-symbolIcon-operatorForeground, var(--symbol-fallback));
+}
+.node .kind-icon[data-codicon='symbol-class'] {
+  color: var(--vscode-symbolIcon-classForeground, var(--symbol-fallback));
+}
+.node .kind-icon[data-codicon='symbol-interface'] {
+  color: var(--vscode-symbolIcon-interfaceForeground, var(--symbol-fallback));
+}
+.node .kind-icon[data-codicon='symbol-struct'] {
+  color: var(--vscode-symbolIcon-structForeground, var(--symbol-fallback));
+}
+.node .kind-icon[data-codicon='symbol-enum'] {
+  color: var(--vscode-symbolIcon-enumeratorForeground, var(--symbol-fallback));
+}
+.node .kind-icon[data-codicon='symbol-enum-member'] {
+  color: var(--vscode-symbolIcon-enumeratorMemberForeground, var(--symbol-fallback));
+}
+.node .kind-icon[data-codicon='symbol-parameter'] {
+  color: var(--vscode-symbolIcon-typeParameterForeground, var(--symbol-fallback));
+}
+.node .kind-icon[data-codicon='symbol-variable'] {
+  color: var(--vscode-symbolIcon-variableForeground, var(--symbol-fallback));
+}
+.node .kind-icon[data-codicon='symbol-field'] {
+  color: var(--vscode-symbolIcon-fieldForeground, var(--symbol-fallback));
+}
+.node .kind-icon[data-codicon='symbol-property'] {
+  color: var(--vscode-symbolIcon-propertyForeground, var(--symbol-fallback));
+}
+.node .kind-icon[data-codicon='symbol-constant'] {
+  color: var(--vscode-symbolIcon-constantForeground, var(--symbol-fallback));
+}
+.node .kind-icon[data-codicon='symbol-module'] {
+  color: var(--vscode-symbolIcon-moduleForeground, var(--symbol-fallback));
+}
+.node .kind-icon[data-codicon='symbol-event'] {
+  color: var(--vscode-symbolIcon-eventForeground, var(--symbol-fallback));
+}
+.node .kind-icon[data-codicon='symbol-key'] {
+  color: var(--vscode-symbolIcon-keyForeground, var(--symbol-fallback));
+}
+.node .kind-icon[data-codicon='symbol-string'] {
+  color: var(--vscode-symbolIcon-stringForeground, var(--symbol-fallback));
+}
+.node .kind-icon[data-codicon='symbol-numeric'] {
+  color: var(--vscode-symbolIcon-numberForeground, var(--symbol-fallback));
+}
+.node .kind-icon[data-codicon='symbol-boolean'] {
+  color: var(--vscode-symbolIcon-booleanForeground, var(--symbol-fallback));
+}
+.node .kind-icon[data-codicon='symbol-array'] {
+  color: var(--vscode-symbolIcon-arrayForeground, var(--symbol-fallback));
+}
+.node .kind-icon[data-codicon='symbol-file'] {
+  color: var(--vscode-symbolIcon-fileForeground, var(--symbol-fallback));
+}
+.node .kind-icon[data-codicon='symbol-color'] {
+  color: var(--vscode-symbolIcon-colorForeground, var(--symbol-fallback));
+}
+
+.node .name {
+  font-family: var(--vscode-font-family);
+  font-size: var(--vscode-font-size, 13px);
+  fill: var(--node-fg);
+  font-weight: 600;
+}
+
+.node .loc {
+  font-family: var(--vscode-font-family);
+  font-size: calc(var(--vscode-font-size, 13px) - 1px);
+  fill: var(--muted);
+}
+
+.node .detail {
+  font-family: var(--vscode-font-family);
+  font-size: calc(var(--vscode-font-size, 13px) - 1px);
+  fill: var(--muted);
+}
+
+.node .callsite {
+  font-family: var(--vscode-font-family);
+  font-size: calc(var(--vscode-font-size, 13px) - 1px);
+  fill: var(--vscode-charts-purple, #bc8cff);
+}
+
+.node .cycle-badge {
+  font-size: 11px;
+  fill: var(--cycle);
+}
+
+/* ------------------------------------------------------------ 展开按钮 */
+
+.expander {
+  cursor: pointer;
+}
+
+.expander .ring {
+  fill: var(--node-bg);
+  stroke: var(--node-border);
+  stroke-width: 1;
+}
+
+.expander:hover .ring {
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+
+/* 加减号：几何图形（矩形/圆环），中心就是坐标原点，不依赖字体度量。
+   颜色用方框文字色，保证在深色/浅色主题下都看得清。 */
+.expander .sign-shape {
+  fill: var(--node-fg);
+}
+
+.expander .sign-shape[fill='none'] {
+  fill: none;
+  stroke: var(--node-fg);
+  stroke-width: 1.6;
+  stroke-linecap: round;
+}
+
+.expander.loading .sign-spin {
+  animation: spin 1s linear infinite;
+  transform-origin: 0 0;
+}
+
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}

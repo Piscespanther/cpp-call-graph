@@ -1,0 +1,17 @@
+.vscode/**
+src/**
+scripts/**
+out/**
+node_modules/**
+dist/**/*.map
+dist/engine-check.js
+dist/layout-check.js
+esbuild.js
+tsconfig.json
+tsconfig.scripts.json
+**/*.vsix
+.gitignore
+.npmrc
+.npm-cache/**
+samples/**
+.probe/**

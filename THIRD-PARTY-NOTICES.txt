@@ -1,0 +1,40 @@
+================================================================================
+第三方组件与许可声明 / Third-Party Notices
+================================================================================
+
+本项目（cpp-call-graph）自身代码以 MIT 许可发布，见根目录 LICENSE 文件。
+
+但本项目包含一部分**派生自第三方图标素材**的图形数据，该部分**不适用 MIT**，
+其来源与许可如下。此文件随扩展一起分发（VSIX 内）。
+
+
+--------------------------------------------------------------------------------
+1. VS Code Codicons（图标字形轮廓数据）
+--------------------------------------------------------------------------------
+
+  组件        @vscode/codicons
+  上游仓库    https://github.com/microsoft/vscode-codicons
+  版权        Copyright (c) Microsoft Corporation
+  许可        Creative Commons Attribution 4.0 International (CC BY 4.0)
+              https://creativecommons.org/licenses/by/4.0/
+  许可全文    https://creativecommons.org/licenses/by/4.0/legalcode
+  素材位置    https://github.com/microsoft/vscode-codicons
+              （字形取自 VS Code 自带的 codicon.ttf，字体文件位于
+                <VS Code 安装目录>/resources/app/out/media/codicon.ttf）
+
+  说明：@vscode/codicons 的图标、字体与文档按 CC BY 4.0 授权；
+  其构建脚本按 MIT 授权。本声明针对的是其中的图标字形轮廓数据，
+  即 CC BY 4.0 覆盖的部分，不是 MIT 部分。
+
+具体的派生数据位于（合计 30 条轮廓路径）：
+
+  - src/webview/symbolIcons.ts     21 条 —— 21 个符号图标（由生成脚本产出）
+  - src/webview/callIcons.ts        2 条 —— 2 个方向图标（call-incoming / call-outgoing）
+  - src/webview/graph.html          7 条 —— 工具栏 5 个按钮 + 方框右键菜单 2 项
+
+免责声明（CC BY 4.0 §5）
+
+除非适用法律要求或书面同意，许可人按「现状」提供本素材，不附带任何明示或
+默示的担保，包括但不限于所有权、可商售性、适用于特定用途或不侵权的担保。
+详见 CC BY 4.0 法律文本第 5 节：
+https://creativecommons.org/licenses/by/4.0/legalcode
