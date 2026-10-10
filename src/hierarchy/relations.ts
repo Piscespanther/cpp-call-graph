@@ -4,9 +4,10 @@
  * 走 LSP 调用层级：
  *   vscode.prepareCallHierarchy / provideIncomingCalls / provideOutgoingCalls
  *
- * 备注：宏、变量、类型这些 C/C++ 里没有「调用层级」的符号，需要引用查找
- * （vscode.executeReferenceProvider）。该能力曾实现过一版但按需求移除了，
- * 需要时在这里新增一种 RelationQuery 即可，图/布局/会话层不用改。
+ * 备注：宏、变量、类型这些 C/C++ 里没有「调用层级」的符号走**引用查找**
+ * （`references.ts` 的 `resolveByReferences()`）：它在会话建立时算好一层
+ * `Answer[]`，再由 `CallSession.seedRoot()` 写进图 —— 不经过这里的 `RelationQuery`，
+ * 因为那一层来自引用而不是调用层级。
  */
 import * as vscode from 'vscode';
 import { fetchCallsDetailed } from './callHierarchy';

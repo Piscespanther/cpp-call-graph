@@ -43,6 +43,14 @@ export const NODE_WIDTH = 230;
  * 并按**真实字体墨迹**复核（只比基线差会算错）。
  */
 export const NODE_HEIGHT = 43;
+/**
+ * **单行**方框的高度：设置 `cppCallGraph.showLocation` 关掉时用（方框里只有元素名）。
+ *
+ * 26 = 13px 粗体名称的墨迹（基线上方 9 / 下方 3）加上下各 7px 留白。
+ * 改这里必须同步改 webview 里 `nameBaselineFor()` / `iconYFor()` 的口径
+ * （基线取 框高/2 + 3，图标在框里垂直居中）。
+ */
+export const NODE_HEIGHT_COMPACT = 26;
 /** 左侧留一点内边距，但第一个方框基本贴着左边缘。 */
 export const MARGIN_LEFT = 16;
 export const MARGIN_TOP = 10;
@@ -116,11 +124,14 @@ function shortenPath(file: string, max: number): string {
  * 与 webview 的 measureBoxWidth 公式保持一致：
  *   TEXT_X(22) + max(名称宽, 路径宽) + 加减号预留
  * 只是把「实测宽」换成「字符数 × 字号 × 保守系数」。
+ *
+ * @param showLocation 方框里是否显示「文件路径:行号」那一行（设置 `cppCallGraph.showLocation`）。
+ *   关掉时只按名称估宽，方框才会跟着收窄 —— 否则列位置仍按带路径的宽度排，右边会空一大截。
  */
-export function estimateBoxWidth(node: GraphNode): number {
+export function estimateBoxWidth(node: GraphNode, showLocation = true): number {
   const nameText = `${node.isCycle ? '↻ ' : ''}${truncateMiddle(node.name, NAME_MAX_CHARS)}`;
-  const locText = `${shortenPath(node.file, LOC_MAX_CHARS)}:${node.line}`;
   const nameWidth = (nameText.length * 13 * CHAR_WIDTH_MILLI) / 1000;
+  const locText = showLocation ? `${shortenPath(node.file, LOC_MAX_CHARS)}:${node.line}` : '';
   const locWidth = (locText.length * 12 * CHAR_WIDTH_MILLI) / 1000;
   // 22 是文字起点，13 是加减号，5 是右边距，6 是安全余量（与 webview 同口径）
   const total = 22 + Math.max(nameWidth, locWidth) + 10 + 13 + 5 + 6;
@@ -131,15 +142,27 @@ export function estimateBoxWidth(node: GraphNode): number {
  * 布局入口。
  *
  * @param measuredWidths webview 回传的**实测方框宽度**（按节点 id）。
- *   宿主没法自己量文字（没有排版引擎），只能估算；而估算偏大就会把列推远、
+ *   宿主无法自行测量文字（没有排版引擎），只能估算；而估算偏大就会把列推远、
  *   箭头拉长。所以 webview 每帧把量到的真实宽度报回来，这里优先采用，
  *   于是「列间距」严格等于 COLUMN_GAP。缺失的节点退回估宽。
+ * @param collapsed webview 里**被收起**的节点集合。收起的子树必须当作不存在：
+ *   否则它仍然占着高度，同级的兄弟之间会留下一段空荡荡的「空挡」
+ *   （用户 2026-10-10 实测反馈：把第三级折叠后第二级的空挡还在）。
+ *   这些节点**不会拿到坐标**，等 webview 展开时再来一次布局即可。
+ * @param showLocation 方框里是否显示「文件路径:行号」（设置 `cppCallGraph.showLocation`）。
+ *   关掉时估宽只算名称，否则 webview 还没回传实测宽度的那一帧会按带路径的宽度排，右边空一截。
  */
 export function createLayout(
   nodes: Record<string, GraphNode>,
   rootId: string,
-  measuredWidths?: Map<string, number>
+  measuredWidths?: Map<string, number>,
+  collapsed?: ReadonlySet<string>,
+  showLocation = true
 ): GraphLayout {
+  /** 被收起的节点当作叶子：子树既不给坐标，也不占高度。 */
+  const kidsOf = (node: GraphNode): string[] => (collapsed?.has(node.id) ? [] : node.children);
+  /** 这一版布局用的方框高度：显示路径时两行（43），不显示时单行（26）。 */
+  const nodeHeight = showLocation ? NODE_HEIGHT : NODE_HEIGHT_COMPACT;
   const boxes: Record<string, LayoutBox> = {};
   /** 每个节点在第几列（BFS 第一层深度），用于按列平移。 */
   const columnOf = new Map<string, number>();
@@ -158,7 +181,7 @@ export function createLayout(
     }
     boxes[id] = { x: 0, y: 0, width: 0, height: 0 };
     const column = columnOf.get(id) ?? 0;
-    for (const child of node.children) {
+    for (const child of kidsOf(node)) {
       // 同一节点可能被多次入栈，取已记录的最浅列（画面上更靠左，不会盖住）
       const existing = columnOf.get(child);
       const next = column + 1;
@@ -196,16 +219,16 @@ export function createLayout(
     if (!node) {
       continue;
     }
-    const kids = node.children.filter((child) => boxes[child] !== undefined);
+    const kids = kidsOf(node).filter((child) => boxes[child] !== undefined);
     if (kids.length === 0) {
-      heights.set(id, NODE_HEIGHT);
+      heights.set(id, nodeHeight);
       continue;
     }
     let sum = 0;
     for (const child of kids) {
-      sum += (heights.get(child) ?? NODE_HEIGHT) + ROW_GAP;
+      sum += (heights.get(child) ?? nodeHeight) + ROW_GAP;
     }
-    heights.set(id, Math.max(NODE_HEIGHT, sum - ROW_GAP));
+    heights.set(id, Math.max(nodeHeight, sum - ROW_GAP));
   }
 
   let minX = Number.POSITIVE_INFINITY;
@@ -213,35 +236,35 @@ export function createLayout(
   let maxX = Number.NEGATIVE_INFINITY;
   let maxY = Number.NEGATIVE_INFINITY;
 
-  const place = (id: string, depth: number, top: number): void => {
+  const place = (id: string, top: number): void => {
     const node = nodes[id];
     if (!node || boxes[id] === undefined) {
       return;
     }
-    const subtreeHeight = heights.get(id) ?? NODE_HEIGHT;
-    const y = top + (subtreeHeight - NODE_HEIGHT) / 2;
+    const subtreeHeight = heights.get(id) ?? nodeHeight;
+    const y = top + (subtreeHeight - nodeHeight) / 2;
     // 先按「零偏移」落位，等各列的预估宽度都收齐后再统一平移（见下面 shift 列）。
     // 优先用 webview 回传的实测宽度；没有才退回估宽。
     const measured = measuredWidths?.get(id);
     const width =
       typeof measured === 'number' && Number.isFinite(measured) && measured > 0
         ? Math.min(MAX_BOX_WIDTH, Math.max(MIN_BOX_WIDTH, Math.round(measured)))
-        : estimateBoxWidth(node);
-    boxes[id] = { x: 0, y, width, height: NODE_HEIGHT };
+        : estimateBoxWidth(node, showLocation);
+    boxes[id] = { x: 0, y, width, height: nodeHeight };
     minY = Math.min(minY, y);
-    maxY = Math.max(maxY, y + NODE_HEIGHT);
+    maxY = Math.max(maxY, y + nodeHeight);
     // breadth：该节点在第几列，供后续按列平移
     const column = columnOf.get(id) ?? 0;
     columnWidths.set(column, Math.max(columnWidths.get(column) ?? 0, boxes[id].width));
 
-    const kids = node.children.filter((child) => boxes[child] !== undefined);
+    const kids = kidsOf(node).filter((child) => boxes[child] !== undefined);
     let cursor = top;
     for (const child of kids) {
-      place(child, depth + 1, cursor);
-      cursor += (heights.get(child) ?? NODE_HEIGHT) + ROW_GAP;
+      place(child, cursor);
+      cursor += (heights.get(child) ?? nodeHeight) + ROW_GAP;
     }
   };
-  place(rootId, 0, 0);
+  place(rootId, 0);
 
   // 按列平移：第 n 列的 x = 前面各列「最宽方框 + 列间距」之和。
   // 这样列宽随内容变化，方框之间始终留出 COLUMN_GAP，箭头那一段不会被盖住。
@@ -263,7 +286,7 @@ export function createLayout(
     minX = 0;
     minY = 0;
     maxX = NODE_WIDTH;
-    maxY = NODE_HEIGHT;
+    maxY = nodeHeight;
   }
   return {
     boxes,

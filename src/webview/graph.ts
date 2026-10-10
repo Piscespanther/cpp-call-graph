@@ -102,6 +102,16 @@ interface InitMessage {
   /** 所有标签的摘要，用于立即画出标签栏。 */
   summaries: SessionSummary[];
   activeId: string;
+  /** 宿主读到的设置（webview 自己读不到 VS Code 设置）。 */
+  settings?: WebviewSettings;
+}
+
+/** 需要下发给 webview 的设置项（与宿主 settingsPayload() 一一对应）。 */
+interface WebviewSettings {
+  /** 纵向滚动时把父方框钉在窗口垂直中央。 */
+  stickyParent?: boolean;
+  /** 方框里是否显示「文件路径:行号」那一行。 */
+  showLocation?: boolean;
 }
 
 interface SessionUpdateMessage {
@@ -120,7 +130,30 @@ interface UpdateMessage {
   activeId: string;
 }
 
-type HostMessage = InitMessage | SessionUpdateMessage | SelectTabMessage | UpdateMessage;
+/** 设置变了：宿主重新下发一次。 */
+interface SettingsMessage {
+  type: 'settings';
+  settings: WebviewSettings;
+}
+
+/**
+ * 宿主的解析进度：解析较慢的查询（宏、结构体、变量这些要走引用查找的符号）
+ * 会在开始时下发 `busy: true`、结束时下发 `busy: false`，webview 据此显示加载遮罩。
+ */
+interface BusyMessage {
+  type: 'busy';
+  busy: boolean;
+  /** 遮罩上的文案（可选）。 */
+  label?: string;
+}
+
+type HostMessage =
+  | InitMessage
+  | SessionUpdateMessage
+  | SelectTabMessage
+  | UpdateMessage
+  | SettingsMessage
+  | BusyMessage;
 
 interface VSCodeApi {
   postMessage(message: unknown): void;
@@ -142,6 +175,64 @@ const svgEl = document.getElementById('svg') as unknown as SVGSVGElement;
 const viewportEl = document.getElementById('viewport') as unknown as SVGGElement;
 const edgesEl = document.getElementById('edges') as unknown as SVGGElement;
 const nodesEl = document.getElementById('nodes') as unknown as SVGGElement;
+const busyEl = document.getElementById('busy') as HTMLDivElement | null;
+const busyLabelEl = document.getElementById('busy-label') as HTMLParagraphElement | null;
+
+/** 遮罩延迟：快查询不闪一下（毫秒）。 */
+const BUSY_DELAY_MS = 240;
+/** 遮罩默认文案（与 graph.html 里 #busy-label 的初始文本一致）。 */
+const BUSY_DEFAULT_LABEL = '正在解析…';
+/** 宿主是否正在解析（busy 消息维护）。 */
+let hostBusy = false;
+/** 已排队的遮罩显示定时器。 */
+let busyTimer: ReturnType<typeof setTimeout> | undefined;
+
+/**
+ * 按当前状态决定遮罩的显隐。
+ *
+ * 两个来源都要算：宿主正在解析（`hostBusy`，宏/结构体/变量这类掉进引用查找的查询）
+ * 与本地正在展开某个方框（`state.loading`）。延迟一小会儿才显示，避免快查询闪一下。
+ */
+function updateBusy(): void {
+  if (!busyEl) {
+    return;
+  }
+  const wanted = hostBusy || state.loading.size > 0;
+  if (!wanted) {
+    if (busyTimer !== undefined) {
+      clearTimeout(busyTimer);
+      busyTimer = undefined;
+    }
+    busyEl.hidden = true;
+    return;
+  }
+  if (!busyEl.hidden || busyTimer !== undefined) {
+    return;
+  }
+  busyTimer = setTimeout(() => {
+    busyTimer = undefined;
+    if (!busyEl) {
+      return;
+    }
+    // 定时器排队期间可能已经解析完 / 取消，所以这里再确认一次
+    busyEl.hidden = !(hostBusy || state.loading.size > 0);
+  }, BUSY_DELAY_MS);
+}
+
+/** 立刻收起遮罩（例如点了「取消」）。 */
+function hideBusy(): void {
+  if (busyTimer !== undefined) {
+    clearTimeout(busyTimer);
+    busyTimer = undefined;
+  }
+  if (busyEl) {
+    busyEl.hidden = true;
+  }
+  // 文案复位：否则下一次不带 label 的 busy 会继续显示上一阶段的文字
+  if (busyLabelEl) {
+    busyLabelEl.textContent = BUSY_DEFAULT_LABEL;
+  }
+}
 
 const state = {
   sessions: new Map<string, SessionPayload>(),
@@ -155,6 +246,10 @@ const state = {
   collapsed: new Map<string, Set<string>>(),
   /** 待居中的会话：新查询时把根方框摆到视图中间。 */
   centerRequest: undefined as string | undefined,
+  /** 由宿主下发的设置：纵向滚动时是否把父方框钉在窗口垂直中央。 */
+  stickyParent: true,
+  /** 由宿主下发的设置：方框里是否显示「文件路径:行号」那一行。 */
+  showLocation: true,
 };
 
 /**
@@ -193,6 +288,47 @@ const TEXT_X = ICON_X + ICON_BOX + ICON_GAP;
  */
 const NAME_BASELINE = 15;
 const LOC_BASELINE = 32;
+/**
+ * 方框高度。**必须与宿主 `graphLayout.ts` 的 NODE_HEIGHT / NODE_HEIGHT_COMPACT 一致**：
+ * 正常路径下方框几何由宿主算好下发，这两个值只用于「几何缺失」时兜底。
+ *
+ * 显示路径时两行（43），不显示时单行（26）—— 后者见 `nameBaselineFor()` 的居中口径。
+ */
+const NODE_HEIGHT = 43;
+const NODE_HEIGHT_COMPACT = 26;
+
+/** 几何缺失时的兜底框高：跟着「显示路径」开关走。 */
+function defaultBoxHeight(): number {
+  return state.showLocation ? NODE_HEIGHT : NODE_HEIGHT_COMPACT;
+}
+
+/**
+ * 名称基线。显示路径时是两行布局的第一行（固定 15）。
+ *
+ * 不显示路径时整框只剩一行，于是按**墨迹上下留白相等**居中：
+ * 13px 粗体名称的墨迹约在基线上方 9、下方 3，所以「墨迹中心 = 框中心」对应
+ * 基线 = 框高/2 + 3（26 高的框 → 16，上下各留 7px）。
+ */
+function nameBaselineFor(height: number): number {
+  return state.showLocation ? NAME_BASELINE : height / 2 + 3;
+}
+
+/** 图标左上角 y。显示路径时贴着名称行（ICON_Y）；单行时在框里垂直居中。 */
+function iconYFor(height: number): number {
+  return state.showLocation ? ICON_Y : (height - ICON_BOX) / 2;
+}
+
+/**
+ * 搜索命中时元素名背后的底纹尺寸。
+ *
+ * 13px 粗体名称的墨迹约在基线上方 9px、下方 3px（见上面的校准说明），
+ * 四周各留 2px：于是底纹从基线以上 11px 起、高 16px。
+ * 宽度按**同一段文字**用 measureTextWidth 量（和算方框宽度用的是同一套），
+ * 所以底纹永远贴合实际渲染出来的名字。
+ */
+const NAME_HIT_PAD_X = 2;
+const NAME_HIT_ABOVE = 11;
+const NAME_HIT_HEIGHT = 16;
 
 /** 常量：文字截断上限与方框宽度范围。 */
 const NAME_MAX_CHARS = 30;
@@ -207,9 +343,8 @@ const MIN_BOX_WIDTH = 120;
  * 当前文字上限约 40 字符 ≈ 300px，加两侧预留约 320，故取 400 留出余量。
  */
 const MAX_BOX_WIDTH = 400;
-/** 几何缺失时的兜底尺寸（正常路径下不会用到）。与 NODE_HEIGHT / 量宽结果相称。 */
+/** 几何缺失时的兜底宽度（正常路径下不会用到）。 */
 const DEFAULT_BOX_WIDTH = 200;
-const NODE_HEIGHT_FALLBACK = 36;
 /** 文字右端到加减号之间的最小间隙（保证加减号不压文字）。 */
 const EXPANDER_GAP = 10;
 /**
@@ -246,38 +381,77 @@ function nodeLocText(node: GraphNode): string {
  *
  * 顺序：`getComputedTextLength()`（最准）→ `getBBox().width` → 按字符数估算。
  * 估算刻意估宽，宁可留空隙也不要让文字顶住加减号。
+ *
+ * ⚠️ 性能：这里每帧要为「每个可见方框的名称 + 路径」各量一次（几百节点 = 上千次），
+ * 而每次量宽都会触发一次**强制同步布局**。所以：
+ *   ① 结果按「文字 + 字号 + 粗细」缓存（同名元素在后续帧里直接命中，开销归零）；
+ *   ② 探测节点常驻复用，不再每次新建 / 挂载 / 摘除（少大量 DOM 变更）。
+ * 只缓存**量成功**的结果：退到估算时不缓存，免得一帧的失败被永久记住。
  */
+const MEASURE_CACHE_LIMIT = 4000;
+const measureCache = new Map<string, number>();
+let measureProbe: SVGTextElement | undefined;
+
+/** 常驻探测节点（挂在 <svg> 下、visibility:hidden，不参与节点/连线的遍历）。 */
+function probeElement(): SVGTextElement | undefined {
+  if (!svgEl) {
+    return undefined;
+  }
+  if (!measureProbe || measureProbe.parentNode !== svgEl) {
+    const probe = document.createElementNS(SVG_NS, 'text') as SVGTextElement;
+    probe.setAttribute('visibility', 'hidden');
+    probe.setAttribute('aria-hidden', 'true');
+    probe.setAttribute('class', 'measure-probe');
+    svgEl.appendChild(probe);
+    measureProbe = probe;
+  }
+  return measureProbe;
+}
+
 function measureTextWidth(text: string, fontSize: number, bold: boolean): number {
   if (!text) {
     return 0;
   }
-  const probe = document.createElementNS(SVG_NS, 'text') as SVGTextElement;
-  if (bold) {
-    probe.setAttribute('font-weight', '600');
+  const key = `${fontSize}|${bold ? 'b' : 'n'}|${text}`;
+  const cached = measureCache.get(key);
+  if (cached !== undefined) {
+    return cached;
   }
-  probe.setAttribute('font-size', `${fontSize}px`);
-  probe.textContent = text;
-  try {
-    probe.setAttribute('visibility', 'hidden');
-    // 用可选调用：万一调用时机过早（svgEl 尚未取到），也只会退到估算，不会抛错
-    svgEl?.appendChild(probe);
-    const length = (probe as unknown as { getComputedTextLength?: () => number })
-      .getComputedTextLength;
-    if (typeof length === 'function') {
-      const measured = length.call(probe);
-      if (Number.isFinite(measured) && measured > 0) {
-        return measured;
+  const probe = probeElement();
+  let measured = 0;
+  if (probe) {
+    probe.setAttribute('font-size', `${fontSize}px`);
+    if (bold) {
+      probe.setAttribute('font-weight', '600');
+    } else {
+      probe.removeAttribute('font-weight');
+    }
+    probe.textContent = text;
+    try {
+      const length = (probe as unknown as { getComputedTextLength?: () => number })
+        .getComputedTextLength;
+      if (typeof length === 'function') {
+        const value = length.call(probe);
+        if (Number.isFinite(value) && value > 0) {
+          measured = value;
+        }
       }
+      if (measured === 0) {
+        const width = probe.getBBox().width;
+        if (Number.isFinite(width) && width > 0) {
+          measured = width;
+        }
+      }
+    } catch {
+      // 忽略：退到估算
     }
-    const width = probe.getBBox().width;
-    if (Number.isFinite(width) && width > 0) {
-      return width;
+  }
+  if (measured > 0) {
+    if (measureCache.size >= MEASURE_CACHE_LIMIT) {
+      measureCache.clear();
     }
-  } catch {
-    // 忽略：退到估算
-  } finally {
-    // 无论量成功与否都要摘掉，避免残留节点影响后续统计与渲染
-    probe.remove();
+    measureCache.set(key, measured);
+    return measured;
   }
   return text.length * fontSize * (bold ? 0.66 : 0.6);
 }
@@ -288,7 +462,10 @@ function measureTextWidth(text: string, fontSize: number, bold: boolean): number
  */
 function measureBoxWidth(node: GraphNode): number {
   const nameWidth = measureTextWidth(nodeNameText(node), NAME_FONT_SIZE, true);
-  const locWidth = measureTextWidth(nodeLocText(node), LOC_FONT_SIZE, false);
+  // 关掉「显示路径」时方框只按名称算宽 —— 否则右边会空出一整块（路径那一行的宽度）
+  const locWidth = state.showLocation
+    ? measureTextWidth(nodeLocText(node), LOC_FONT_SIZE, false)
+    : 0;
   const content = Math.max(nameWidth, locWidth);
   const total = TEXT_X + content + EXPANDER_GAP + EXPANDER_BOX + ICON_X + WIDTH_SAFETY;
   return Math.min(MAX_BOX_WIDTH, Math.max(MIN_BOX_WIDTH, Math.ceil(total)));
@@ -320,6 +497,9 @@ function measureSessionWidths(session: SessionPayload): void {
  * 估宽一旦偏大，列就被推远、箭头被拉得很长。这里回传实测值后，宿主用真实宽度
  * 排列各列，列间距才严格等于设计值。宿主会在宽度变化时才重排，所以不会死循环。
  */
+/** 上一次回报给宿主的宽度（按会话）：一模一样就不再发，省掉每帧一次含 N 项的 IPC。 */
+const lastReportedWidths = new Map<string, string>();
+
 function reportMeasuredWidths(session: SessionPayload): void {
   const widths: Array<{ id: string; width: number }> = [];
   for (const node of visibleNodes(session)) {
@@ -328,9 +508,15 @@ function reportMeasuredWidths(session: SessionPayload): void {
       widths.push({ id: node.id, width: geometry.width });
     }
   }
-  if (widths.length > 0) {
-    post({ type: 'reportWidths', sessionId: session.id, widths });
+  if (widths.length === 0) {
+    return;
   }
+  const signature = widths.map((item) => `${item.id}:${Math.round(item.width)}`).join('|');
+  if (lastReportedWidths.get(session.id) === signature) {
+    return;
+  }
+  lastReportedWidths.set(session.id, signature);
+  post({ type: 'reportWidths', sessionId: session.id, widths });
 }
 
 // ------------------------------------------------------------ 工具
@@ -356,11 +542,11 @@ function svg<K extends keyof SVGElementTagNameMap>(
  *
  * codicon 的坐标系是 16×16，这里整体缩放到 ICON_BOX。
  */
-function buildKindIcon(kind: NodeKind): SVGGElement {
+function buildKindIcon(kind: NodeKind, iconY: number = ICON_Y): SVGGElement {
   const codicon = KIND_TO_ICON[kind] ?? KIND_TO_ICON.other;
   const icon = svg('g', {
     class: `kind-icon kind-${kind}`,
-    transform: `translate(${ICON_X} ${ICON_Y}) scale(${ICON_BOX / 16})`,
+    transform: `translate(${ICON_X} ${iconY}) scale(${ICON_BOX / 16})`,
     'data-codicon': codicon,
   });
   const definition = ICON_BY_CODICON[codicon] ?? ICON_BY_CODICON['symbol-color'];
@@ -478,6 +664,17 @@ function collapsedSet(sessionId: string): Set<string> {
   return set;
 }
 
+/**
+ * 把「哪些节点被收起」整份下发给宿主。
+ *
+ * 坐标是宿主算的：收起的子树必须从布局里去掉 —— 否则它继续占着高度，
+ * 同级的兄弟之间就留下一段空荡荡的「空挡」（用户 2026-10-10 实测反馈过：
+ * 把第三级折叠后第二级的空挡还在）。所以每次改变收起状态都要发一次。
+ */
+function postCollapsed(sessionId: string): void {
+  post({ type: 'collapse', sessionId, collapsed: [...collapsedSet(sessionId)] });
+}
+
 /** 从根开始收集当前可见的节点（跳过被收起的子树）。 */
 function visibleNodes(session: SessionPayload): GraphNode[] {
   const collapsed = collapsedSet(session.id);
@@ -500,6 +697,39 @@ function visibleNodes(session: SessionPayload): GraphNode[] {
     }
     for (const child of node.children) {
       stack.push(child);
+    }
+  }
+  return result;
+}
+
+/**
+ * 从根开始遍历**全部**已加载节点（不管有没有被收起），顺序为前序遍历、
+ * 且兄弟节点按 `children` 的声明顺序 —— 与宿主排布兄弟节点的顺序一致，
+ * 所以搜索的「下一个 / 上一个」就是用户从上往下看到的顺序。
+ *
+ * 注意别写成 `visibleNodes` 那种直接 pop 的栈式遍历：那样兄弟节点是**倒序**的。
+ *
+ * 与 `visibleNodes` 的另一处区别：后者遇到被收起的节点就停止下探，这个不。
+ * 搜索需要它来找「命中但当前被收起」的节点，好在计数里提示用户。
+ */
+function allNodes(session: SessionPayload): GraphNode[] {
+  const result: GraphNode[] = [];
+  const stack = [session.rootId];
+  const seen = new Set<string>();
+  while (stack.length > 0) {
+    const id = stack.pop() as string;
+    if (seen.has(id)) {
+      continue;
+    }
+    seen.add(id);
+    const node = session.nodes[id];
+    if (!node) {
+      continue;
+    }
+    result.push(node);
+    // 逆序压栈：出栈顺序才与 children 的声明顺序一致
+    for (let index = node.children.length - 1; index >= 0; index -= 1) {
+      stack.push(node.children[index]);
     }
   }
   return result;
@@ -590,6 +820,8 @@ function findNodeGroup(sessionId: string, nodeId: string): FakeSvgGroup | undefi
 
 type FakeSvgGroup = {
   getAttribute(name: string): string | null;
+  /** 粘性父框要改根分组的 transform（真实 DOM 的 SVGGElement 与测试桩都有这个方法）。 */
+  setAttribute(name: string, value: string): void;
   getBoundingClientRect(): { left: number; top: number };
   children?: unknown[];
 };
@@ -659,7 +891,7 @@ function shortEngine(label: string): string {
  * 「展开全部」后要清掉的「已收起」标记。
  *
  * 工具栏的「展开全部」语义是**把图重新完整显示出来**，而不只是「加载数据」。
- * 用户点了「收起全部」（或逐个收起了方框）之后，数据其实还在、只是被本地标记为
+ * 用户点了「收起全部」（或逐个收起了方框）之后，数据仍然存在、仅被本地标记为
  * 收起状态；此时再点「展开全部」，若不清理这些标记，就会**什么都不发生**——
  * 这正是用户报的「展开折叠一遍后再展开又无效了」。
  */
@@ -674,6 +906,13 @@ function render(): void {
     edgesEl.textContent = '';
     emptyEl.style.display = 'flex';
     summaryEl.textContent = '';
+    // 标签全关掉时把搜索也复位，免得下次打开还留着上一张图的命中计数
+    refreshSearchMatches(undefined);
+    updateSearchUi();
+    // 没有会话了：任何「正在展开」的标记都失效。必须在这里清掉并刷新遮罩，
+    // 否则已排队的定时器会把遮罩显示在空状态上，而且此后再也无人把它关掉。
+    state.loading.clear();
+    updateBusy();
     return;
   }
   emptyEl.style.display = 'none';
@@ -686,6 +925,13 @@ function render(): void {
     pendingExpandAll = undefined;
     collapsedSet(session.id).clear();
   }
+
+  // 搜索命中集合每帧重算：数据更新、切换标签、改查询走的都是这条路径，
+  // 类名也在这一帧写进节点分组，所以状态只有一份。
+  refreshSearchMatches(session);
+
+  // 粘性父框：先定下这一帧钉住哪些方框、各自移多少，下面的连线与方框都按它画。
+  refreshSticky(session);
 
   // 方框宽度按内容自适应：先量宽写回 boxes，再算画布与箭头锚点。
   measureSessionWidths(session);
@@ -708,52 +954,32 @@ function render(): void {
   edgesEl.textContent = '';
   nodesEl.textContent = '';
 
+  stickyEdges = [];
   for (const edge of session.edges) {
     if (!isVisible(session, edge.from) || !isVisible(session, edge.to)) {
       continue;
     }
-    const fromBox = boxOf(session, edge.from);
-    const toBox = boxOf(session, edge.to);
-    if (!fromBox || !toBox) {
+    // 折线几何统一走 edgeGeometry：边的 from/to 已带方向语义（callers 里 from 是调用者、
+    // 指向左侧的被调用方），按实际左右位置取锚点，画成 90° 折线。
+    // 注意宽度是逐节点自适应的，两个锚点各取自己那个方框的几何
+    // （曾经两个锚点都用 from 的宽度，目标方框较宽/较窄时箭头就接不上边）。
+    const geometry = edgeGeometry(session, edge);
+    if (!geometry) {
       continue;
     }
-    // 边的 from/to 已经带有方向语义（callers 里 from 是调用者、指向左侧的被调用方）。
-    // 按实际左右位置取锚点，画成 90° 折线：出方框一小段 → 竖直走 → 水平进目标 → 进方框一小段。
-    // 注意：宽度是自适应后逐节点不同的，两个锚点必须各取自己那个方框的几何
-    // （曾经两个锚点都用 from 的宽度，目标方框较宽/较窄时箭头就接不上边）。
-    const fromGeometry = session.boxes[edge.from];
-    const toGeometry = session.boxes[edge.to];
-    const fromW = fromGeometry?.width ?? DEFAULT_BOX_WIDTH;
-    const toW = toGeometry?.width ?? DEFAULT_BOX_WIDTH;
-    const fromH = fromGeometry?.height ?? NODE_HEIGHT_FALLBACK;
-    const toH = toGeometry?.height ?? NODE_HEIGHT_FALLBACK;
-    const backward = fromBox.x > toBox.x;
-    const fromAnchor = backward
-      ? { x: fromBox.x, y: fromBox.y + fromH / 2 }
-      : { x: fromBox.x + fromW, y: fromBox.y + fromH / 2 };
-    const toAnchor = backward
-      ? { x: toBox.x + toW, y: toBox.y + toH / 2 }
-      : { x: toBox.x, y: toBox.y + toH / 2 };
-
-    // 出/入方框各画一小段直奔线（直角拐弯），让箭头看起来是一条清晰的折线。
-    // 14px 是视觉上调出来的：太小会被方框边框「吃掉」，看起来像箭头很短。
-    const stub = 14;
-    const startX = fromAnchor.x + (backward ? -stub : stub);
-    const endX = toAnchor.x + (backward ? stub : -stub);
-    const path = svg('path', {
-      d:
-        `M ${fromAnchor.x} ${fromAnchor.y} ` +
-        `L ${startX} ${fromAnchor.y} ` +
-        `L ${startX} ${toAnchor.y} ` +
-        `L ${endX} ${toAnchor.y} ` +
-        `L ${toAnchor.x} ${toAnchor.y}`,
-      class: 'edge',
-    });
+    const path = svg('path', { d: geometry.d, class: 'edge' });
     const toNode = session.nodes[edge.to];
     if (toNode?.isCycle) {
       path.classList.add('cycle');
     }
     edgesEl.appendChild(path);
+    // 只要有一端**被钉住**，这条线就会随滚动改变形状，记下来逐帧重画。
+    // ⚠️ 判据必须是「被钉住」而不是「这一帧位移 ≠ 0」：位移的取值区间穿过 0
+    // （父框正好在自己槽位中央时位移就是 0），用位移判会出现「这一帧恰好为 0 → 这条边
+    // 永不登记 → 之后滚动时方框动了、箭头却没重画」的脱节。
+    if (stickyShifts.has(edge.from) || stickyShifts.has(edge.to)) {
+      stickyEdges.push({ path, from: edge.from, to: edge.to });
+    }
   }
 
   for (const node of visibleNodes(session)) {
@@ -764,6 +990,11 @@ function render(): void {
     }
     nodesEl.appendChild(renderNode(session, node, position, geometry));
   }
+
+  updateSearchUi();
+
+  // 加载遮罩：本地的展开状态（state.loading）也在这一帧变化，一并刷新
+  updateBusy();
 
   // 新查询：把根方框摆到视图中间（等这一帧画完再滚动）
   if (state.centerRequest === session.id) {
@@ -784,52 +1015,76 @@ function renderNode(
       node.depth === 0 ? 'root' : '',
       node.isCycle ? 'cycle' : '',
       state.selected === node.id ? 'selected' : '',
+      searchState.hits.has(node.id) ? 'match' : '',
+      currentMatchId() === node.id ? 'match-current' : '',
     ]
       .filter(Boolean)
       .join(' '),
-    transform: `translate(${position.x} ${position.y})`,
+    // 链上节点各自带上自己的粘性位移：纵向滚动时它们都停在视口垂直中央（见「粘性父框」一节）
+    transform: `translate(${position.x} ${position.y + stickyShiftOf(node.id)})`,
     'data-node': node.id,
   });
 
+  // 框高由宿主布局给出（显示路径 43 / 不显示 26）；文字基线与图标位置都按框高算，
+  // 所以关掉路径后方框不只是「少一行」，而是**整框变矮**、剩下那行在框里居中。
+  const boxHeight = geometry.height || defaultBoxHeight();
+  const nameBaseline = nameBaselineFor(boxHeight);
   group.appendChild(
-    svg('rect', { class: 'box', width: geometry.width, height: geometry.height, rx: 0 })
+    svg('rect', { class: 'box', width: geometry.width, height: boxHeight, rx: 0 })
   );
 
   // 第一行开头放符号角标（模仿 VS Code 的小图标），文字从图标右侧开始。
-  group.appendChild(buildKindIcon(node.kind));
+  group.appendChild(buildKindIcon(node.kind, iconYFor(boxHeight)));
 
   // 两行布局：第一行「图标 + 名称 + 加减号」，第二行「文件路径:行号」。
   // 方框宽度已按这两行的实际渲染宽度量好（measureSessionWidths），
   // 所以文字不会溢出，右边的加减号也不会压到文字上。
-  const nameText = svg('text', { x: TEXT_X, y: NAME_BASELINE, class: 'name' });
-  nameText.textContent = nodeNameText(node);
+  // 搜索命中：只给**元素名**垫一层底纹，方框本身不动（按需求）。
+  // 必须先 append 底纹、再 append 文字，底纹才画在文字下面。
+  const displayName = nodeNameText(node);
+  if (searchState.hits.has(node.id)) {
+    const hitWidth = measureTextWidth(displayName, NAME_FONT_SIZE, true);
+    group.appendChild(
+      svg('rect', {
+        class: 'name-hit',
+        x: TEXT_X - NAME_HIT_PAD_X,
+        y: nameBaseline - NAME_HIT_ABOVE,
+        width: Math.max(1, Math.ceil(hitWidth) + NAME_HIT_PAD_X * 2),
+        height: NAME_HIT_HEIGHT,
+        rx: 2,
+      })
+    );
+  }
+
+  const nameText = svg('text', { x: TEXT_X, y: nameBaseline, class: 'name' });
+  nameText.textContent = displayName;
   group.appendChild(nameText);
 
-  const locText = svg('text', { x: TEXT_X, y: LOC_BASELINE, class: 'loc' });
-  locText.textContent = nodeLocText(node);
-  group.appendChild(locText);
+  // 「文件路径:行号」那一行由设置控制：关掉后每个方框里只有元素名
+  if (state.showLocation) {
+    const locText = svg('text', { x: TEXT_X, y: LOC_BASELINE, class: 'loc' });
+    locText.textContent = nodeLocText(node);
+    group.appendChild(locText);
+  }
 
   const title = svg('title', {});
   title.textContent = buildTooltip(node);
   group.appendChild(title);
 
-  // 单击：选中并高亮这个方框（按需求；跳转仍然是双击）。
-  // 注意事件顺序：单击先触发、双击后触发，所以双击时会先选中再跳转——
-  // 这正是想要的效果（跳转的对象就是刚选中的那个）。
+  // 单击选中、双击跳转（按需求：单击不再打开文件）。
+  //
+  // ⚠️ 不要用 `dblclick` 事件：单击会走 markSelected → render()，把整个 #nodes 子树换成
+  // 新元素；浏览器按「两次点击是否命中同一元素」配对双击，命中不同元素时 `dblclick`
+  // 根本不会派发 —— 表现是「第一次双击只选中、要再双击一次才跳转」。
+  // 改成在 click 里看 `event.detail`：detail ≥ 2 就是双击，与元素是否被替换无关。
   group.addEventListener('click', (event) => {
     event.stopPropagation();
     markSelected(session, node);
-  });
-
-  // 双击才跳转（按需求：单击不再打开文件）。
-  // 同时 preventDefault：双击会让浏览器选词/选中 SVG 文本，留下蓝色选区，
-  // 而这里的方框是交互元素，不该出现选区（CSS 里也做了 user-select: none 兜底）。
-  group.addEventListener('dblclick', (event) => {
-    event.stopPropagation();
-    event.preventDefault();
-    // 兜底再选一次，保证「复制元素 / 复制地址」复制的就是跳转的对象
-    markSelected(session, node);
-    post({ type: 'openLocation', nodeId: node.id, sessionId: session.id });
+    if (event.detail >= 2) {
+      // 双击会选中 SVG 文本留下蓝色选区，这里压掉（CSS 的 user-select: none 是兜底）
+      event.preventDefault();
+      post({ type: 'openLocation', nodeId: node.id, sessionId: session.id });
+    }
   });
 
   // 右键：弹出该方框自己的菜单（复制元素 / 复制地址）
@@ -875,7 +1130,10 @@ function buildExpander(
   // 中心留出 EXPANDER_BOX/2 + ICON_X，保证加减号与文字之间至少 EXPANDER_GAP。
   const expander = svg('g', {
     class: `expander ${mode}`,
-    transform: `translate(${geometry.width - ICON_X - EXPANDER_BOX / 2} ${ICON_Y + ICON_BOX / 2})`,
+    // 中心与图标在同一水平线上（单行布局时两者都在框里居中）
+    transform: `translate(${geometry.width - ICON_X - EXPANDER_BOX / 2} ${
+      iconYFor(geometry.height || defaultBoxHeight()) + ICON_BOX / 2
+    })`,
   });
   // 命中区域比视觉方块大，方便点击
   expander.appendChild(svg('circle', { class: 'hit', r: 12, fill: 'transparent' }));
@@ -893,12 +1151,14 @@ function buildExpander(
   const tip = svg('title', {});
   tip.textContent =
     mode === 'expand'
-      ? `展开：${node.direction === 'callers' ? '谁调用了' : '它调用了谁'} ${node.name}`
+      ? node.direction === 'callers'
+        ? `展开：显示 ${node.name} 的调用者`
+        : `展开：显示 ${node.name} 调用的函数`
       : mode === 'collapse'
-        ? `收起 ${node.name} 的下一层`
+        ? `收起：${node.name} 的下一层`
         : mode === 'loading'
           ? '正在加载…'
-          : '没有下一层调用关系';
+          : '无下一层调用关系';
   expander.appendChild(tip);
 
   if (mode === 'leaf') {
@@ -907,6 +1167,11 @@ function buildExpander(
   }
 
   expander.addEventListener('mousedown', (event) => {
+    // 只认左键：右键点加减号时 contextmenu 会弹菜单，若这里也记下目标，
+    // 松开右键就会在 window 的 mouseup 里把它当成一次展开/收起。
+    if (event.button !== 0) {
+      return;
+    }
     event.stopPropagation();
     event.preventDefault();
     if (mode === 'loading') {
@@ -1045,6 +1310,8 @@ window.addEventListener('mouseup', () => {
     pointer.expandTarget = undefined;
     if (mode === 'collapse') {
       collapsedSet(sessionId).add(nodeId);
+      // 收起状态变了：让宿主按「收起的子树不占高度」重算一次坐标
+      postCollapsed(sessionId);
       render();
     } else {
       const session = state.sessions.get(sessionId);
@@ -1053,10 +1320,13 @@ window.addEventListener('mouseup', () => {
         if (node.loaded) {
           // 数据已有，只是被收起过：直接展开，不需要再问语言服务
           collapsedSet(sessionId).delete(nodeId);
+          postCollapsed(sessionId);
           render();
         } else {
           state.loading.add(nodeId);
-          // 以被点的方框为基准，展开后它不要在屏幕上跳动
+          // 以被点的方框为基准，展开后它不要在屏幕上跳动。
+          // （粘性父框开着时，紧接着这一帧会把它钉到视口中央 —— 以那条不变式为准；
+          //   关掉设置或内容本来就不高时，才由这里保住它的屏幕位置。）
           anchorOn(session, nodeId);
           post({ type: 'expand', sessionId, nodeId });
           render();
@@ -1149,6 +1419,9 @@ window.addEventListener('keydown', (event) => {
   }
 });
 canvasEl.addEventListener('scroll', closeBoxMenu, { passive: true });
+// 纵向滚动时把「已展开下一层」的方框钉在视口垂直中央（只改位置与相关连线，见「粘性父框」一节）。
+// 用 scheduleStickyFrame 合并：滚动事件密度远高于帧率，逐个处理等于白做几十次。
+canvasEl.addEventListener('scroll', scheduleStickyFrame, { passive: true });
 
 // ------------------------------------------------------------ 工具栏
 
@@ -1172,7 +1445,475 @@ function collapseAll(): void {
   const collapsed = collapsedSet(session.id);
   collapsed.clear();
   collapsed.add(session.rootId);
+  // ⚠️ 必须把新的收起状态告诉宿主：坐标是宿主算的（它按这个集合决定哪些子树不占高度）。
+  //    漏掉这一步，宿主手里那份集合就一直是旧的 —— 之后任何一次重排（展开全部、
+  //    改设置触发 relayout）都会继续把那些子树排除在布局之外，画面上表现为
+  //    「只展开到第二级、第二级的加号点不开」（节点没有坐标 → 整棵被跳过）。
+  postCollapsed(session.id);
   render();
+}
+
+// ------------------------------------------------------------ 粘性父框（可设置）
+
+/**
+ * 纵向滚动时把**所有「已经展开了下一层」的方框**都钉在视口垂直中央当参照：
+ * 画面中间因此是一条「父框带」，各层的子方框从它旁边滑过；与被钉住的方框相连的箭头
+ * 每帧重画，保证箭头不脱节。
+ *
+ * 为什么是「所有展开了下一层的」而不是「最后展开的那一个」：同一层里可以展开好几个
+ * （隔几个同级标签各展开一个），它们都该留在中间当参照 —— 只钉最后那个，
+ * 先展开的就会跟着内容滚走。
+ *
+ * 三条必须的约束（都有断言兜着，**别删**）：
+ *   ① **不能压到同列的邻居** —— 每个方框只能在它自己的「空挡」里上下滑（见 `stickySubtreeSlot()`），
+ *      空挡边缘离相邻方框正好是正常行距 ROW_GAP；这一条也顺带把方框留在了 viewBox 内
+ *      （跑出 viewBox 会被裁掉，看不见）。
+ *   ② **同一列里多个方框都想居中时，彼此不会重叠**：各自的「空挡」互不相交
+ *      （子树区域在布局里本来就是分开的），所以不需要额外的按列收敛逻辑
+ *      —— 曾经有一个 `enforceColumnSpacing()`，在改成「空挡 = 整棵子树那一段」后已删除。
+ *      第一级只有根一个方框、独占一列，所以它可以完全自由地居中。
+ *   ③ **内容还没视口高时不做** —— 那会儿没什么可滚的，硬居中反而会把方框推出内容外。
+ *
+ * 开关是 `cppCallGraph.stickyParent`（宿主读配置后随消息下发，见 `settingsPayload()`）。
+ */
+/** 这一帧要钉住的方框（所有展开了下一层、且当前可见的方框）。 */
+let stickyPinned: string[] = [];
+/** 每个可见方框这一帧的位移（内容坐标的额外下移量；不在表里就是 0）。 */
+let stickyShifts = new Map<string, number>();
+/** 会被粘性位移影响的可见连线：位移一变就得重画它们。 */
+let stickyEdges: Array<{ path: SVGPathElement; from: string; to: string }> = [];
+
+/** 某个节点这一帧的粘性位移（没被钉住就是 0）。 */
+function stickyShiftOf(nodeId: string): number {
+  return stickyShifts.get(nodeId) ?? 0;
+}
+
+/**
+ * 这一帧要钉住谁：**所有「已经展开了下一层」的可见方框**。
+ *
+ * 「展开了下一层」= 至少有一个子节点当前可见（被收起的不算、没加载过的不算）。
+ * 于是根、以及每一层里展开过的父框都在内；叶子（没有下一层可看）不在内 ——
+ * 它们没有什么可当参照的，钉住也没有意义。
+ */
+function stickyPinnedIds(session: SessionPayload): string[] {
+  const pinned: string[] = [];
+  for (const [id, node] of Object.entries(session.nodes)) {
+    if (!session.boxes[id] || !isVisible(session, id)) {
+      continue;
+    }
+    if (node.children.some((child) => isVisible(session, child))) {
+      pinned.push(id);
+    }
+  }
+  return pinned;
+}
+
+/** 当前是否该启用粘性父框（设置开着 **且** 内容确实比视口高）。 */
+function stickyEnabled(session: SessionPayload | undefined): boolean {
+  if (!session || !state.stickyParent) {
+    return false;
+  }
+  const viewportHeight = Number(canvasEl.clientHeight) || 0;
+  return viewportHeight > 0 && contentBounds(session).height > viewportHeight;
+}
+
+/**
+ * 被钉住方框的「空挡」= **它整棵子树在布局里占的那一段**（用户 2026-10-10 定的规则）。
+ *
+ * 递归定义：有可见子框时 = 第一个子框的空挡上沿 ~ 最后一个子框的空挡下沿
+ * （子框的空挡在布局里是首尾相接的）；自己就是叶子（没有可见子框）时 = 自己那一段。
+ *
+ * 于是父框可以**平行着子框、以及子框再展开出来的更深层**上下滑 ——
+ * 用户原话：「第三级的子集也有好几个时，第二级的空挡也要增加到覆盖第三级展开出来的情况」，
+ * 否则第二级无法与已展开的第三级保持平齐。
+ *
+ * 为什么这样最安全：各家的子树区域在布局里本来就是分开的，父框滑不出自己的子树，
+ * 就永远撞不到同列的兄弟方框。
+ */
+function stickySubtreeSlot(
+  session: SessionPayload,
+  nodeId: string,
+  cache: Map<string, { top: number; bottom: number }>,
+  visiting?: Set<string>
+): { top: number; bottom: number } | undefined {
+  const cached = cache.get(nodeId);
+  if (cached) {
+    return cached;
+  }
+  const node = session.nodes[nodeId];
+  const box = session.boxes[nodeId];
+  if (!node || !box || !isVisible(session, nodeId)) {
+    return undefined;
+  }
+  const own = {
+    top: box.y,
+    bottom: box.y + (box.height || defaultBoxHeight()),
+  };
+  // 图里可能有环：正在展开的链上再遇到自己就退回「只有自己这一段」
+  const path = visiting ?? new Set<string>();
+  if (path.has(nodeId)) {
+    return own;
+  }
+  path.add(nodeId);
+  let top = Number.POSITIVE_INFINITY;
+  let bottom = Number.NEGATIVE_INFINITY;
+  for (const child of node.children) {
+    if (!session.boxes[child] || !isVisible(session, child)) {
+      continue;
+    }
+    const childSlot = stickySubtreeSlot(session, child, cache, path);
+    if (!childSlot) {
+      continue;
+    }
+    top = Math.min(top, childSlot.top);
+    bottom = Math.max(bottom, childSlot.bottom);
+  }
+  path.delete(nodeId);
+  const slot = Number.isFinite(top) ? { top, bottom } : own;
+  cache.set(nodeId, slot);
+  return slot;
+}
+
+/**
+ * 算出这一帧每个被钉住方框的位移。
+ *
+ * 规则（用户 2026-10-10 定）：把它中心对到视口垂直中央，但**只能在自己的空挡里滑**
+ * —— 空挡 = 它整棵子树在布局里占的那一段（见 `stickySubtreeSlot()`，跟着子框展开的部分一起长）：
+ * 空挡内保持居中，碰到上下界就停住。第一级独占一列、子树铺满内容，所以它可以完全自由居中。
+ *
+ * 屏幕 y 与内容 y 的关系是 `screenY = svgRect.top + (contentY − view.y)`（1 单位 = 1 像素），
+ * 直接读两个 rect 反解即可，不必自己维护滚动量 —— 也就不会累积漂移。
+ */
+function computeStickyShifts(session: SessionPayload): Map<string, number> {
+  const shifts = new Map<string, number>();
+  const view = readView(session);
+  const canvasRect = canvasEl.getBoundingClientRect();
+  const svgRect = svgEl.getBoundingClientRect();
+  const wantedScreenCenter = canvasRect.top + canvasEl.clientHeight / 2;
+  const bounds = contentBounds(session);
+  const slotCache = new Map<string, { top: number; bottom: number }>();
+  for (const id of stickyPinned) {
+    const box = session.boxes[id];
+    const slot = stickySubtreeSlot(session, id, slotCache);
+    if (!box || !slot) {
+      continue;
+    }
+    const height = box.height || defaultBoxHeight();
+    const wantedTop = wantedScreenCenter - svgRect.top + view.y - height / 2;
+    // 空挡内可滑的 top 范围；再夹进内容边界（跑出 viewBox 会被裁掉）
+    const minTop = Math.max(bounds.y, slot.top);
+    const maxTop = Math.min(
+      bounds.y + bounds.height - height,
+      Math.max(minTop, slot.bottom - height)
+    );
+    shifts.set(id, Math.min(maxTop, Math.max(minTop, wantedTop)) - box.y);
+  }
+  return shifts;
+}
+
+/** 重算这一帧「钉住哪些方框、各自移多少」。渲染前与滚动时都走这里。 */
+function refreshSticky(session: SessionPayload): void {
+  stickyPinned = stickyPinnedIds(session);
+  stickyShifts = stickyEnabled(session) ? computeStickyShifts(session) : new Map<string, number>();
+}
+
+/**
+ * 某条连线一侧锚点的中心 y：加上该端方框（及其所属块）的粘性位移。
+ */
+function anchorCenterY(nodeId: string, top: number, height: number): number {
+  return top + stickyShiftOf(nodeId) + height / 2;
+}
+
+/**
+ * 一条连线的折线路径。
+ *
+ * 渲染时用它画、滚动时用它重画 —— 同一份几何，避免两处算法各写一遍后漂移。
+ */
+function edgeGeometry(
+  session: SessionPayload,
+  edge: { from: string; to: string }
+): { d: string; backward: boolean } | undefined {
+  const fromBox = boxOf(session, edge.from);
+  const toBox = boxOf(session, edge.to);
+  if (!fromBox || !toBox) {
+    return undefined;
+  }
+  const fromWidth = session.boxes[edge.from]?.width ?? DEFAULT_BOX_WIDTH;
+  const toWidth = session.boxes[edge.to]?.width ?? DEFAULT_BOX_WIDTH;
+  const fromHeight = session.boxes[edge.from]?.height ?? defaultBoxHeight();
+  const toHeight = session.boxes[edge.to]?.height ?? defaultBoxHeight();
+  const backward = fromBox.x > toBox.x;
+  const fromAnchor = {
+    x: backward ? fromBox.x : fromBox.x + fromWidth,
+    y: anchorCenterY(edge.from, fromBox.y, fromHeight),
+  };
+  const toAnchor = {
+    x: backward ? toBox.x + toWidth : toBox.x,
+    y: anchorCenterY(edge.to, toBox.y, toHeight),
+  };
+  // 出/入方框各画一小段直奔线（直角拐弯）。14px 是视觉调出来的：太小会被方框边框吃掉。
+  const stub = 14;
+  const startX = fromAnchor.x + (backward ? -stub : stub);
+  const endX = toAnchor.x + (backward ? stub : -stub);
+  return {
+    backward,
+    d:
+      `M ${fromAnchor.x} ${fromAnchor.y} ` +
+      `L ${startX} ${fromAnchor.y} ` +
+      `L ${startX} ${toAnchor.y} ` +
+      `L ${endX} ${toAnchor.y} ` +
+      `L ${toAnchor.x} ${toAnchor.y}`,
+  };
+}
+
+/** 滚动帧是否已排队（用 rAF 合并：一次滚动事件风暴只做一帧的工作）。 */
+let stickyFrameQueued = false;
+
+/**
+ * 滚动事件的入口：用 `requestAnimationFrame` 合并。
+ *
+ * 滚轮/触控板一次滑动会连发几十个 scroll 事件，直接逐个跑完整帧 = 几十次强制布局 +
+ * 几十轮 DOM 写入。合并成「一帧一次」后开销与帧率绑定，与事件密度无关。
+ */
+function scheduleStickyFrame(): void {
+  if (stickyFrameQueued) {
+    return;
+  }
+  stickyFrameQueued = true;
+  requestAnimationFrame(() => {
+    stickyFrameQueued = false;
+    applyStickyFrame();
+  });
+}
+
+/** 上一次写进 transform 的字符串：没变就不写 DOM（写 attribute 会触发重新布局）。 */
+const lastStickyTransform = new WeakMap<Element, string>();
+
+/**
+ * 滚动时逐帧调用：只改「方框的位置」与「被钉住方框相关的连线」，不重建整棵树。
+ * （重建要重新量所有方框宽度、重排连线，滚动时那样做会卡。）
+ *
+ * 两个早退：没开粘性、或这一帧没有任何「已展开下一层」的方框可钉 —— 此时各节点在
+ * render() 里写下的 transform 已经是正确位置，白算一遍没有任何收益。
+ */
+function applyStickyFrame(): void {
+  if (!state.stickyParent || stickyPinned.length === 0) {
+    return;
+  }
+  const session = activeSession();
+  if (!session) {
+    return;
+  }
+  refreshSticky(session);
+  // 每个可见方框都按自己的位移摆好（被钉住的父框在中央，叶子跟着自己的父框）
+  for (const element of nodesEl.children) {
+    const id = element.getAttribute?.('data-node');
+    const box = id ? session.boxes[id] : undefined;
+    if (!id || !box) {
+      continue;
+    }
+    const transform = `translate(${box.x} ${box.y + stickyShiftOf(id)})`;
+    // 位移没变就别写 DOM：写 attribute 会让浏览器重新布局这一棵子树
+    if (lastStickyTransform.get(element) !== transform) {
+      lastStickyTransform.set(element, transform);
+      element.setAttribute('transform', transform);
+    }
+  }
+  for (const item of stickyEdges) {
+    const geometry = edgeGeometry(session, item);
+    if (geometry) {
+      item.path.setAttribute('d', geometry.d);
+    }
+  }
+}
+
+// ------------------------------------------------------------ 搜索栏
+
+/**
+ * 按**元素名**搜索当前标签：命中方框黄色高亮，上下箭头在多个命中间跳。
+ * 三个开关彼此独立：区分大小写 / 全字 / 正则。
+ *
+ * 设计取舍：
+ *   ① 命中集合在 render() 里重算、类名也在那一帧写进节点分组 —— 与「单击选中」同一套路，
+ *      状态只有一份，测试桩按 class 断言即可，不必再维护一套增量更新。
+ *   ② 跳转只在**可见**命中之间循环：被收起子树里的命中是隐藏的、滚不过去，
+ *      计数用「+N」把它们标出来，免得看起来像「没搜到」。
+ *   ③ 输入即重绘（不做防抖）：与现有的展开/收起/切标签一致。命中高亮本来就是整帧重建的
+ *      一部分；真遇到超大图卡顿，再考虑加防抖。
+ */
+const searchState = {
+  query: '',
+  caseSensitive: false,
+  wholeWord: false,
+  regex: false,
+  /** 当前会话里**可见**的命中节点 id（按显示顺序），上下箭头在这个数组里循环。 */
+  matches: [] as string[],
+  /** 命中的节点 id 集合：渲染时判 class 用，避免逐节点 includes 的平方复杂度。 */
+  hits: new Set<string>(),
+  /** 命中但被收起、跳不过去的数量。 */
+  hidden: 0,
+  index: 0,
+  /** 正则写出语法错误时为 true。 */
+  invalid: false,
+};
+
+/** 按当前开关编译「元素名 → 是否命中」；没有输入或正则非法时返回 undefined。 */
+function buildNameMatcher(): ((name: string) => boolean) | undefined {
+  const query = searchState.query;
+  if (!query) {
+    searchState.invalid = false;
+    return undefined;
+  }
+  // 全字：两侧不能是「词字符」。这里用 lookaround 而不是 \b —— \b 只认 ASCII 词字符，
+  // 在中文或下划线相邻处判定很反直觉（例如 bsp_boot 里的 boot 不会被当成整词）。
+  const left = searchState.wholeWord ? '(?<![\\w$])' : '';
+  const right = searchState.wholeWord ? '(?![\\w$])' : '';
+  const body = searchState.regex ? `(?:${query})` : query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  try {
+    const pattern = new RegExp(`${left}${body}${right}`, searchState.caseSensitive ? '' : 'i');
+    searchState.invalid = false;
+    return (name) => pattern.test(name);
+  } catch {
+    // 正则写到一半本来就可能非法。这里绝不能让异常冒出去，否则整帧渲染会被打断。
+    searchState.invalid = true;
+    return undefined;
+  }
+}
+
+/** 重算命中集合（render() 每帧调用）。 */
+function refreshSearchMatches(session: SessionPayload | undefined): void {
+  searchState.matches = [];
+  searchState.hits = new Set<string>();
+  searchState.hidden = 0;
+  const matcher = session ? buildNameMatcher() : undefined;
+  if (!session || !matcher) {
+    searchState.index = 0;
+    return;
+  }
+  for (const node of allNodes(session)) {
+    if (!matcher(node.name)) {
+      continue;
+    }
+    searchState.hits.add(node.id);
+    if (isVisible(session, node.id)) {
+      searchState.matches.push(node.id);
+    } else {
+      searchState.hidden += 1;
+    }
+  }
+  if (searchState.index >= searchState.matches.length) {
+    searchState.index = 0;
+  }
+}
+
+/** 当前命中的节点 id（上下箭头落脚的地方）。 */
+function currentMatchId(): string | undefined {
+  return searchState.matches[searchState.index];
+}
+
+/** 把命中计数、正则描红、开关与箭头的可用状态写回界面。 */
+function updateSearchUi(): void {
+  const countEl = document.getElementById('search-count');
+  if (countEl) {
+    if (searchState.invalid) {
+      countEl.textContent = '正则错误';
+      countEl.classList.add('empty');
+    } else if (!searchState.query) {
+      countEl.textContent = '';
+      countEl.classList.remove('empty');
+    } else if (searchState.matches.length === 0) {
+      countEl.textContent = '无命中';
+      countEl.classList.add('empty');
+    } else {
+      const hidden = searchState.hidden > 0 ? ` +${searchState.hidden}` : '';
+      countEl.textContent = `${searchState.index + 1}/${searchState.matches.length}${hidden}`;
+      countEl.classList.remove('empty');
+    }
+    countEl.title = searchState.hidden > 0 ? `另有 ${searchState.hidden} 个命中在已收起的节点里` : '';
+  }
+  document.getElementById('search-input')?.classList.toggle('invalid', searchState.invalid);
+
+  const toggles: Array<[string, boolean]> = [
+    ['btn-search-case', searchState.caseSensitive],
+    ['btn-search-word', searchState.wholeWord],
+    ['btn-search-regex', searchState.regex],
+  ];
+  for (const [id, on] of toggles) {
+    document.getElementById(id)?.classList.toggle('on', on);
+  }
+
+  const hasMatches = searchState.matches.length > 0;
+  for (const id of ['btn-search-prev', 'btn-search-next']) {
+    const button = document.getElementById(id) as HTMLButtonElement | null;
+    if (button) {
+      button.disabled = !hasMatches;
+    }
+  }
+}
+
+/** 在可见命中之间循环跳：delta = +1 下一个，-1 上一个。 */
+function stepMatch(delta: number): void {
+  const session = activeSession();
+  const total = searchState.matches.length;
+  if (!session || total === 0) {
+    return;
+  }
+  searchState.index = (searchState.index + delta + total) % total;
+  // 重绘一帧让「当前命中」的高亮跟过去，再把那个方框滚到视图中间
+  render();
+  const id = currentMatchId();
+  if (id) {
+    centerOn(session, id);
+  }
+}
+
+// 搜索栏接线：输入框、三个开关、上下箭头。
+// 元素可能不存在（例如 HTML 是旧版本），所以整体做空值保护、不注册就静默跳过。
+const searchInputEl = document.getElementById('search-input') as HTMLInputElement | null;
+if (searchInputEl) {
+  searchInputEl.addEventListener('input', () => {
+    searchState.query = searchInputEl.value;
+    // 查询变了：从第一处命中重新数起
+    searchState.index = 0;
+    render();
+  });
+
+  searchInputEl.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      stepMatch(event.shiftKey ? -1 : 1);
+    } else if (event.key === 'Escape') {
+      event.preventDefault();
+      searchInputEl.value = '';
+      searchState.query = '';
+      searchState.index = 0;
+      render();
+    }
+  });
+
+  const toggleWiring: Array<[string, 'caseSensitive' | 'wholeWord' | 'regex']> = [
+    ['btn-search-case', 'caseSensitive'],
+    ['btn-search-word', 'wholeWord'],
+    ['btn-search-regex', 'regex'],
+  ];
+  for (const [id, key] of toggleWiring) {
+    document.getElementById(id)?.addEventListener('click', () => {
+      searchState[key] = !searchState[key];
+      searchState.index = 0;
+      render();
+    });
+  }
+
+  document.getElementById('btn-search-prev')?.addEventListener('click', () => stepMatch(-1));
+  document.getElementById('btn-search-next')?.addEventListener('click', () => stepMatch(1));
+
+  // Ctrl/Cmd+F 聚焦搜索框：webview 里没有 VS Code 自带的查找框，这里自己接管。
+  window.addEventListener('keydown', (event) => {
+    if ((event.ctrlKey || event.metaKey) && (event.key === 'f' || event.key === 'F')) {
+      event.preventDefault();
+      searchInputEl.focus();
+    }
+  });
 }
 
 // 工具栏最左边的按钮：关闭**全部**标签并把整个「调用关系图」视图收起来。
@@ -1187,6 +1928,11 @@ document.getElementById('btn-expand-all')?.addEventListener('click', () => {
   if (!session) {
     return;
   }
+  // 「展开全部」之前先把「已收起」清干净，并同步给宿主（它按这个集合算坐标）。
+  // 否则「收起全部 → 展开全部」之后宿主仍把根当成收起的，或把先前手动收起过的
+  // 子树整棵漏在布局外 —— 用户实测的现象就是「只展开到第二级、第二级加号点不开」。
+  collapsedSet(session.id).clear();
+  postCollapsed(session.id);
   // 展开是逐层请求语言服务，交给宿主做（前端只管画）。
   // 记下 pending：等宿主的响应回来时清掉本地的「已收起」标记，
   // 否则「收起全部后再展开全部」会什么都不发生（数据已加载，但又全被标记为收起）。
@@ -1209,6 +1955,17 @@ document.getElementById('btn-collapse-all')?.addEventListener('click', () => {
 document.getElementById('btn-settings')?.addEventListener('click', () => {
   // 交给宿主调 VS Code 内置的设置命令
   post({ type: 'openSettings' });
+});
+
+document.getElementById('btn-busy-cancel')?.addEventListener('click', () => {
+  // 让宿主停下手上的多步解析 —— 引用查找是一串语言服务请求，可以中途停下。
+  // 单个语言服务调用（例如展开某个方框）拦不住，那边会自行结束。
+  // 本地的「正在展开」标记也要一并清掉：只藏遮罩的话，下一次 render() 会因为
+  // loading 非空而让它自己又冒出来（「取消」形同虚设）。
+  state.loading.clear();
+  post({ type: 'cancelResolve' });
+  hostBusy = false;
+  hideBusy();
 });
 
 // ------------------------------------------------------------ 与宿主通信
@@ -1236,6 +1993,15 @@ function handleHostMessage(message: HostMessage): void {
       state.sessions.clear();
       state.order = [];
       state.loading.clear();
+      // 按会话索引的本地表也要一起清（与 update 的删除口径保持一致）：
+      // 留着只会白占内存，还可能在恢复出来的会话上套用上一次的收起状态。
+      state.viewports.clear();
+      state.collapsed.clear();
+      pendingExpandAll = undefined;
+      state.centerRequest = undefined;
+      // 设置随 init 一起下发；字段缺失时保留当前值（旧宿主也能用）
+      state.stickyParent = message.settings?.stickyParent ?? state.stickyParent;
+      state.showLocation = message.settings?.showLocation ?? state.showLocation;
       for (const summary of message.summaries ?? []) {
         state.sessions.set(summary.id, {
           id: summary.id,
@@ -1272,7 +2038,12 @@ function handleHostMessage(message: HostMessage): void {
         // 新查询：等这一帧画完后把根方框摆到视图中间
         state.centerRequest = session.id;
       }
-      state.activeId = session.id;
+      // ⚠️ 只有「新会话」才抢活动标签。宿主在 relayout（例如改「显示路径」）时会把
+      // 所有会话逐个重发一遍，无条件设 activeId 会让活动标签跳到最后一个 ——
+      // 用户看到的是「标签自己跳了」，而宿主的 activeId 没变，两边就此分叉。
+      if (isNew || state.activeId === undefined) {
+        state.activeId = session.id;
+      }
       for (const id of Object.keys(session.nodes)) {
         state.loading.delete(id);
       }
@@ -1291,6 +2062,14 @@ function handleHostMessage(message: HostMessage): void {
       const known = new Set(message.sessions.map((session) => session.id));
       for (const id of [...state.order]) {
         if (!known.has(id)) {
+          // 关掉的会话如果还有节点留在「正在展开」里，遮罩会被永久点亮（宿主不会再发
+          // 它的 sessionUpdate），所以这里按节点 id 一并清掉。
+          const gone = state.sessions.get(id);
+          if (gone) {
+            for (const nodeId of Object.keys(gone.nodes)) {
+              state.loading.delete(nodeId);
+            }
+          }
           state.sessions.delete(id);
           state.viewports.delete(id);
           state.collapsed.delete(id);
@@ -1321,6 +2100,28 @@ function handleHostMessage(message: HostMessage): void {
       const requested = message.activeId || state.activeId;
       state.activeId = requested && known.has(requested) ? requested : state.order[0];
       render();
+      break;
+    }
+    case 'settings': {
+      // 设置变了（宿主在 onDidChangeConfiguration 里下发）：
+      // 只更新开关再重绘一帧，不做别的状态处理。
+      state.stickyParent = message.settings?.stickyParent ?? state.stickyParent;
+      state.showLocation = message.settings?.showLocation ?? state.showLocation;
+      render();
+      break;
+    }
+    case 'busy': {
+      // 宿主开始/结束一次较慢的解析（宏、结构体、变量这类要走引用查找的符号）
+      hostBusy = message.busy === true;
+      if (hostBusy) {
+        if (busyLabelEl && typeof message.label === 'string' && message.label.length > 0) {
+          busyLabelEl.textContent = message.label;
+        }
+        updateBusy();
+      } else {
+        // 结束时用 hideBusy：顺带把文案复位，免得下一阶段沿用上一阶段的文字
+        hideBusy();
+      }
       break;
     }
   }

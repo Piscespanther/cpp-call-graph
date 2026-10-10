@@ -1,15 +1,17 @@
 /**
- * 会话模型：每一次「显示被调用关系 / 显示调用关系 / 显示引用 …」= 一个标签页。
+ * 会话模型：每一次「被调用关系图 / 调用关系图」= 一个标签页。
  *
  * 每个会话独立持有自己的关系图（节点、子节点、引用点、展开状态），互不影响；
  * 关闭某个标签只是丢弃这个会话，其它标签继续存在。
  *
- * 两类关系共用这一套模型：
- *   - call：函数 ←→ 调用者（被调用关系 / 调用关系）
- *   - refs：宏、宏函数、变量、类型等的引用关系（被引用关系 / 引用关系）
+ * 两条取数路径共用这一套模型：
+ *   - 调用关系：`expandRelation()` → 语言服务的调用层级（`provideIncomingCalls` 等）
+ *   - 引用关系：宏、类型、变量这类**没有调用层级**的符号，由 `references.ts` 用引用查找
+ *     预先算好一层，再经 `seedRoot()` 按同样的形状写进图（下面各层照旧走调用层级）
  */
 import * as vscode from 'vscode';
 import { itemKey } from './callHierarchy';
+import { logWarn } from '../util/log';
 import {
   Answer,
   RelationQuery,
@@ -41,13 +43,24 @@ interface SerializedRange {
   end: { line: number; character: number };
 }
 
+/**
+ * 快照里的节点：在 `GraphNode` 之外多存一份「语言服务给的项」。
+ *
+ * ⚠️ 必须存：`expand()` 与「双击跳转」都依赖每个节点的 item。只恢复根的话，
+ * 重载窗口后除根以外所有方框的双击跳转都会静默失效，叶子的「+」点了也没反应。
+ * 旧版本快照没有这个字段，恢复时按「无 item」处理（当叶子，不画死「+」）。
+ */
+export interface SerializedNode extends GraphNode {
+  item?: RootDescriptor;
+}
+
 export interface SerializedSession {
   id: string;
   direction: Direction;
   kind: SessionKind;
   engineLabel: string;
   root: RootDescriptor;
-  nodes: GraphNode[];
+  nodes: SerializedNode[];
   createdAt: number;
 }
 
@@ -132,7 +145,7 @@ export class CallSession {
       kind: symbolKindToNodeKind(rootItem.kind),
     });
     this.items.set(rootId, rootItem);
-    this.edges = collectEdges(this.nodeRecord(), rootId);
+    // 边由 graph() 现算（这里算一次的结果下一次必然被覆盖，属于白做）
   }
 
   get rootId(): string {
@@ -206,12 +219,27 @@ export class CallSession {
     return this.applyResults(node, results, ancestors);
   }
 
+  /**
+   * 把「引用查找」得到的一层结果直接灌进根节点 —— 供宏、类型、变量这类
+   * **没有调用层级**的符号使用。
+   *
+   * 与 `expand()` 的区别只在于那一层的来源：调用层级来自语言服务，引用来自
+   * `resolveByReferences()`。写进图时走的是同一个 `applyResults()`，所以子节点的 id、
+   * 边、调用点、图标类型都与正常展开完全一致 —— 下面的层照旧可以继续展开。
+   */
+  seedRoot(answers: Answer[]): number {
+    const node = this.nodes.get(this.rootId);
+    if (!node || node.loaded) {
+      return 0;
+    }
+    return this.applyResults(node, answers, [this.rootId]);
+  }
+
   private applyResults(
     node: GraphNode,
     results: Answer[],
     ancestors: string[]
   ): number {
-    const seen = new Set<string>();
     let added = 0;
     for (const result of results) {
       const key = itemKey(result.item);
@@ -219,16 +247,13 @@ export class CallSession {
       const id = isCycle
         ? `${node.id}>cycle@${key}@${result.item.selectionRange.start.line}`
         : `${node.id}>${key}`;
+      // 同一个 id 只可能来自同一份结果（id 由 key 决定），已在图里就只补一条父子边。
       if (this.nodes.has(id)) {
         if (!node.children.includes(id)) {
           node.children.push(id);
         }
         continue;
       }
-      if (seen.has(id)) {
-        continue;
-      }
-      seen.add(id);
       this.nodes.set(id, {
         id,
         name: result.item.name,
@@ -280,7 +305,14 @@ export class CallSession {
       engineLabel: this.engineLabel,
       root: serializeItem(this.rootItem),
       createdAt: this.createdAt,
-      nodes: [...this.nodes.values()].map((node) => ({ ...node, children: [...node.children] })),
+      nodes: [...this.nodes.values()].map((node) => {
+        const item = this.items.get(node.id);
+        return {
+          ...node,
+          children: [...node.children],
+          item: item ? serializeItem(item) : undefined,
+        };
+      }),
     };
   }
 
@@ -296,17 +328,27 @@ export class CallSession {
     session.nodes = new Map();
     session.items = new Map();
     for (const node of snapshot.nodes) {
-      const restored: GraphNode = {
+      const withItem = node.item;
+      const restored: SerializedNode = {
         ...node,
         children: [...node.children],
         // 旧版本存下来的 kind 可能是已废弃的值（如 'macro' / 'type'），
         // 统一归一化，避免恢复到不认识的类型后角标画不出来。
         kind: normalizeNodeKind(node.kind),
-        // 恢复时把「已加载但子节点丢失」的节点重置为可展开，避免出现空 + 号。
-        loaded: node.loaded && (!node.children.length || node.isCycle),
+        // 有 item 的节点按原样恢复加载态（数据还在，展开/跳转都可用）；
+        // 没有 item 的（旧快照）只能当叶子 —— 否则会画出一个点了没反应的「+」。
+        loaded: withItem ? node.loaded && (!node.children.length || node.isCycle) : true,
       };
       session.nodes.set(restored.id, restored);
+      if (withItem) {
+        try {
+          session.items.set(restored.id, deserializeItem(withItem));
+        } catch (error) {
+          logWarn(`恢复节点 ${restored.id} 的语言服务项失败：${String(error)}`);
+        }
+      }
     }
+    // 根始终以快照里的 root 为准（它一定存在）
     session.items.set(session.rootId, item);
     return session;
   }

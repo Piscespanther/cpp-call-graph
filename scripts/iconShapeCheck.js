@@ -112,7 +112,9 @@ for (const item of results) {
   );
 }
 
-assert(results.length >= 18, `图标数量不足：${results.length}`);
+// 等值断言（不是下限）：合规声明里写死了 21 条符号图标轮廓，
+// 少解析出几个也必须失败，否则署名数量与实际不符。
+assert(results.length === 21, `符号图标数量应为 21（与署名声明一致），实际 ${results.length}`);
 
 // 关键断言：这些必须是空心轮廓，不能是实心块
 for (const item of results) {

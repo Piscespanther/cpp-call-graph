@@ -17,6 +17,14 @@
   --symbol-fallback: #c586c0;
   /* 工具栏按钮图标色 */
   --icon-fg: var(--vscode-icon-foreground, var(--vscode-foreground, #cccccc));
+  /* 搜索命中：只给元素名垫一层**淡**黄底纹 + 黄色描边来标记，
+     文字**保持主题前景色**（深色主题下就是白的）。
+     关键约束：底纹必须够淡，白色文字压上去才仍然清晰 ——
+     实测 rgba(255,193,7,0.22) 混在默认深色背景上，白字对比约 9:1、主题默认前景约 5.6:1，
+     而之前那种亮黄不透明底 + 浅字只有 1.1:1（等于看不清）。 */
+  --search-match-bg: rgba(255, 193, 7, 0.22);
+  --search-match-stroke: #ffca28;
+  --search-current-stroke: #ffb300;
 }
 * {
   box-sizing: border-box;
@@ -220,6 +228,82 @@ body {
   display: none;
 }
 
+/* ------------------------------------------------------------ 搜索栏 */
+
+/* 在这一小栏的最右侧：margin-left:auto 把它推到行尾（按钮本身靠左排）。 */
+.search {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+  padding-left: 6px;
+}
+
+.search-input {
+  width: 132px;
+  height: 20px;
+  padding: 0 6px;
+  border: 1px solid var(--vscode-input-border, transparent);
+  border-radius: 3px;
+  background: var(--vscode-input-background, rgba(255, 255, 255, 0.06));
+  color: var(--vscode-input-foreground, var(--node-fg));
+  font-family: inherit;
+  font-size: 12px;
+  outline: none;
+}
+
+.search-input::placeholder {
+  color: var(--vscode-input-placeholderForeground, rgba(204, 204, 204, 0.5));
+}
+
+.search-input:focus {
+  border-color: var(--vscode-focusBorder, #007fd4);
+}
+
+/* 正则写错时描红：否则用户只会看到「什么都没命中」，不知道是语法问题 */
+.search-input.invalid {
+  border-color: var(--vscode-inputValidation-errorBorder, #be1100);
+}
+
+/* 注意：这些按钮在 .toolbar 里，必须用 `.toolbar .xxx` 提高优先级，
+   否则会被上面的 `.toolbar button { width:22px; height:22px }` 压成方块。 */
+.toolbar .search-toggle,
+.toolbar .search-step {
+  width: auto;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 4px;
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1;
+  border: 1px solid transparent;
+}
+
+/* 开关处于开启状态：加边框与底色，一眼看出「这个模式生效中」 */
+.toolbar .search-toggle.on {
+  border-color: var(--vscode-inputOption-activeBorder, #007fd4);
+  background: var(--vscode-inputOption-activeBackground, rgba(255, 255, 255, 0.12));
+  color: var(--vscode-inputOption-activeForeground, var(--node-fg));
+}
+
+.toolbar .search-step {
+  font-size: 12px;
+}
+
+.search-count {
+  min-width: 36px;
+  padding: 0 2px;
+  color: var(--vscode-descriptionForeground, rgba(204, 204, 204, 0.7));
+  font-size: 11px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 无命中 / 正则写错：计数用警示色 */
+.search-count.empty {
+  color: var(--vscode-errorForeground, #f48771);
+}
+
 /* ------------------------------------------------------------ 方框右键菜单 */
 
 /* 注意：[hidden] 必须显式写成 display: none —— 下面的 display: flex
@@ -274,9 +358,22 @@ body {
 
 /* ------------------------------------------------------------ 画布 */
 
+/*
+ * stage 包住画布：它**不滚动**，所以挂在它上面的加载遮罩不会随内容滚走，
+ * 遮罩的「正中」也就是眼前这块面板的正中。
+ */
+.stage {
+  position: relative;
+  display: flex;
+  flex: 1 1 auto;
+  /* flex 子项默认 min-height:auto，会把内容高度顶开、令画布无法滚动 */
+  min-height: 0;
+}
+
 .canvas {
   position: relative;
   flex: 1 1 auto;
+  min-width: 0;
   /* 滚动交给浏览器：滚轮上下平滑滚动、Shift+滚轮左右滚，链太长时出现滚动条 */
   overflow: auto;
   overscroll-behavior: contain;
@@ -320,6 +417,79 @@ body {
 
 .empty .hint {
   font-size: 0.9em;
+}
+
+/* ------------------------------------------------------------ 加载遮罩
+ *
+ * 解析较慢的查询（宏、结构体、变量这类要走引用查找的符号）时盖在画布上：
+ * 背景轻微压暗 + 模糊，正中一张卡片（转圈 + 文案 + 取消）。
+ * 由 graph.ts 延迟 ~240ms 才显示 —— 快查询不会闪一下。
+ */
+.busy {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* 轻微压暗：底下的方框仍可辨，但不再是主体 */
+  background: rgba(0, 0, 0, 0.18);
+  backdrop-filter: blur(3px);
+}
+
+.busy[hidden] {
+  display: none;
+}
+
+.busy-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 18px 22px;
+  border: 1px solid var(--vscode-editorWidget-border, #454545);
+  border-radius: 6px;
+  background: var(--vscode-editorWidget-background, #252526);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+}
+
+.busy-spinner {
+  width: 26px;
+  height: 26px;
+  border: 3px solid var(--vscode-editorWidget-border, #454545);
+  border-top-color: var(--vscode-progressBar-background, #0e70c0);
+  border-radius: 50%;
+  animation: busy-spin 0.9s linear infinite;
+}
+
+@keyframes busy-spin {
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.busy-label {
+  margin: 0;
+  color: var(--vscode-foreground, #cccccc);
+  font-size: 12px;
+}
+
+.busy-cancel {
+  padding: 3px 14px;
+  border: none;
+  border-radius: 2px;
+  color: var(--vscode-button-foreground, #ffffff);
+  background: var(--vscode-button-background, #0e639c);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.busy-cancel:hover {
+  background: var(--vscode-button-hoverBackground, #1177bb);
 }
 
 /* ------------------------------------------------------------ 连线 */
@@ -378,6 +548,21 @@ body {
 .node.selected .box {
   stroke: var(--node-hover);
   stroke-width: 2;
+}
+
+/* 搜索命中：只给**元素名**垫一层淡黄底纹 + 黄色描边，方框本身不动（按需求）。
+   文字不覆盖颜色，继续用主题前景色（深色主题下就是白的）——
+   靠「淡底纹 + 亮描边」标记，白字的对比度因此不受影响。
+   当前命中不改底色（改深了白字对比会掉），只用更亮更粗的描边区分。 */
+.node.match .name-hit {
+  fill: var(--search-match-bg);
+  stroke: var(--search-match-stroke);
+  stroke-width: 1.5;
+}
+
+.node.match-current .name-hit {
+  stroke: var(--search-current-stroke);
+  stroke-width: 2.5;
 }
 
 /* 符号角标：用 VS Code 主题的符号色（--vscode-symbolIcon-*），

@@ -2,7 +2,7 @@
   "name": "cpp-call-graph",
   "displayName": "C/C++ 调用关系图 (Call Graph)",
   "description": "在底部面板以图形化方式浏览 C/C++ 函数的被调用关系与调用关系，每次查询一个标签页（基于 LSP Call Hierarchy / clangd）。",
-  "version": "0.19.2",
+  "version": "0.20.0",
   "publisher": "Piscespanther",
   "license": "MIT",
   "repository": {
@@ -37,13 +37,13 @@
     "commands": [
       {
         "command": "cppCallGraph.showCallers",
-        "title": "显示被调用关系",
+        "title": "被调用关系图",
         "category": "调用关系图",
         "icon": "$(arrow-left)"
       },
       {
         "command": "cppCallGraph.showCallees",
-        "title": "显示调用关系",
+        "title": "调用关系图",
         "category": "调用关系图",
         "icon": "$(arrow-right)"
       },
@@ -79,7 +79,7 @@
       },
       {
         "command": "cppCallGraph.diagnose",
-        "title": "诊断（出问题时先跑这个）",
+        "title": "诊断信息（排查问题时使用）",
         "category": "调用关系图",
         "icon": "$(debug-alt)"
       },
@@ -137,28 +137,38 @@
             "cpptools"
           ],
           "enumItemLabels": [
-            "自动（交给 VS Code 决定）",
+            "自动（由 VS Code 决定）",
             "优先 clangd",
             "优先 C/C++ 扩展 (cpptools)"
           ],
           "default": "auto",
-          "markdownDescription": "C/C++ 的调用层级由哪个语言服务提供。\n\n- **clangd**：需要 clangd *扩展* **加上**真正的 `clangd` 可执行文件（扩展只是客户端，装 clang 编译器 `clang.exe` 不算），并且工程要有 `compile_commands.json`。\n- **cpptools**：C/C++ 扩展，调用层级走它自己的 RPC。\n\n两者注册在同一个语言 ID 上，VS Code 会按注册顺序选用，扩展无法强制指定；本设置只影响结果取舍与展示标注。要彻底避免两个引擎互相干扰，建议只启用其中一个：用 clangd 时把 `C_Cpp.intelliSenseEngine` 设为 `disabled`，或直接禁用 C/C++ 扩展。"
+          "markdownDescription": "C/C++ 的调用层级由哪个语言服务提供。\n\n- **clangd**：需要 clangd *扩展* **与**真正的 `clangd` 可执行文件同时具备（该扩展仅为客户端，仅安装 clang 编译器的 `clang.exe` 不满足要求），且工程需提供 `compile_commands.json`。\n- **cpptools**：C/C++ 扩展，调用层级经其自身的 RPC 获取。\n\n两者注册在同一个语言 ID 上，VS Code 按注册顺序选用，扩展无法强制指定；本设置仅影响结果取舍与展示标注。若需彻底避免两个引擎互相干扰，建议只启用其中一个：使用 clangd 时将 `C_Cpp.intelliSenseEngine` 设为 `disabled`，或直接禁用 C/C++ 扩展。"
         },
         "cppCallGraph.maxChildrenPerNode": {
           "type": "number",
           "default": 200,
           "minimum": 1,
-          "markdownDescription": "同一层每个函数最多显示多少个调用者/被调用者。"
+          "markdownDescription": "同一层中每个函数最多显示的调用者/被调用者数量。"
         },
         "cppCallGraph.autoReveal": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "点击图形里的函数框时自动打开对应文件并定位到函数声明处。"
+          "markdownDescription": "**双击**图形中的函数方框时，自动打开对应文件并定位到函数声明处（单击只选中该方框）。"
         },
         "cppCallGraph.showEngineWarning": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "检测到 clangd 与 C/C++ 扩展（cpptools）同时可用时，提示如何处理，避免调用关系结果被两个引擎混用。"
+          "markdownDescription": "检测到 clangd 与 C/C++ 扩展（cpptools）同时可用时给出提示，以避免调用关系结果被两个引擎混用。"
+        },
+        "cppCallGraph.stickyParent": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "纵向滚动时，将**所有已经展开了下一层的方框**固定于窗口垂直中央作为参照：子方框自其旁侧滑过，与其相连的箭头同步重绘。每个方框只在自己的子树范围内滑动。关闭后按普通画布方式滚动。"
+        },
+        "cppCallGraph.showLocation": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "是否在方框中显示「文件路径:行号」一行。关闭后仅显示元素名，方框的宽度与**高度**均相应收窄为单行高度。"
         }
       }
     }

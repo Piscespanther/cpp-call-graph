@@ -40,26 +40,48 @@ function createElement(tagName) {
     parentNode: undefined,
     clientWidth: 0,
     clientHeight: 0,
-    classList: {
-      _set: new Set(),
-      add(name) {
-        this._set.add(name);
-      },
-      remove(name) {
-        this._set.delete(name);
-      },
-      contains(name) {
-        return this._set.has(name);
-      },
-      toggle(name, force) {
-        const has = this._set.has(name);
-        const should = force === undefined ? !has : Boolean(force);
-        if (should) {
-          this._set.add(name);
-        } else {
-          this._set.delete(name);
-        }
-      },
+    /**
+     * classList 与 className 在真实 DOM 里是**同一份数据**，桩必须照做。
+     *
+     * 曾经桩里两者各自记账：否定式断言读 className、肯定式断言读 classList，
+     * 于是「高亮忘了加 class」这类问题会被一半断言放行。
+     */
+    get classList() {
+      const element = this;
+      const read = () =>
+        String(element.getAttribute('class') ?? '')
+          .split(/\s+/)
+          .filter(Boolean);
+      const write = (names) => element.setAttribute('class', names.join(' '));
+      return {
+        add(name) {
+          const names = read();
+          if (!names.includes(name)) {
+            names.push(name);
+            write(names);
+          }
+        },
+        remove(name) {
+          write(read().filter((item) => item !== name));
+        },
+        contains(name) {
+          return read().includes(name);
+        },
+        toggle(name, force) {
+          const has = read().includes(name);
+          const should = force === undefined ? !has : Boolean(force);
+          if (should === has) {
+            return;
+          }
+          const names = read();
+          if (should) {
+            names.push(name);
+            write(names);
+          } else {
+            write(names.filter((item) => item !== name));
+          }
+        },
+      };
     },
     // 真实 DOM：设置 textContent 会清空子节点，这里必须一致，否则统计失真
     get textContent() {
@@ -115,18 +137,31 @@ function createElement(tagName) {
     /**
      * 模拟排版后的字形包围盒。
      *
-     * 宽度必须**随文字内容变化**：方框宽度自适应就是靠 getBBox().width 量的，
-     * 若这里永远返回固定值，就测不出「方框贴内容、加减号不压文字」。
-     * 按「字符数 × 字号 × 系数」估算，粗体略宽。
+     * 两条必须与真实浏览器一致的行为：
+     *   ① **未挂进文档**的 SVG 文字 `getBBox()` 返回全 0 —— 生产代码量宽时会把探测节点
+     *      append 到 <svg> 上再摘掉，历史上有一次忘了 append，于是量宽永远失败、
+     *      方框宽度不随内容变。桩若对游离节点也返回宽度，那条 bug 就再也测不出来。
+     *   ② 宽度随文字内容变化，且**系数刻意与生产兜底（0.66 / 0.6）不同**：
+     *      否则「量到了」与「退到估算」数值相同，断言分不清两条路径。
      */
     getBBox() {
       if (this.tagName !== 'text') {
         return { x: 0, y: 0, width: 0, height: 0 };
       }
+      if (
+        String(this.getAttribute('class') ?? '') === 'measure-probe' &&
+        this.parentNode
+      ) {
+        // 统计「真的去量了一次宽」的次数：量宽是强制同步布局，是渲染性能的关键指标
+        measureProbeReads += 1;
+      }
+      if (!this.parentNode) {
+        return { x: 0, y: 0, width: 0, height: 0 };
+      }
       const size = Number.parseFloat(this.getAttribute('font-size') ?? '') || 12;
       const bold = String(this.getAttribute('font-weight') ?? '') === '600';
       const text = String(this.textContent ?? '');
-      const width = text.length * size * (bold ? 0.66 : 0.6);
+      const width = text.length * size * (bold ? 0.62 : 0.56);
       const height = size * 0.66;
       const dy = Number.parseFloat(this.getAttribute('dy') ?? '0') || 0;
       const baseY = Number(this.getAttribute('y') ?? 0);
@@ -155,6 +190,15 @@ function createElement(tagName) {
       return null;
     },
     dispatch(type, event = {}) {
+      // 真实浏览器里合成/派发的鼠标事件 `button` 一律有值（左键 0），
+      // `detail` 也有默认值；桩若缺这两个字段，测试里「只认左键」之类的判断会被绕过。
+      const mouseLike =
+        type === 'mousedown' ||
+        type === 'mouseup' ||
+        type === 'click' ||
+        type === 'dblclick' ||
+        type === 'contextmenu';
+      const defaults = mouseLike ? { button: 0, detail: 0 } : {};
       for (const handler of this.listeners.get(type) ?? []) {
         handler({
           type,
@@ -162,8 +206,15 @@ function createElement(tagName) {
           currentTarget: this,
           preventDefault() {},
           stopPropagation() {},
+          ...defaults,
           ...event,
         });
+      }
+      // 滚动处理是用 requestAnimationFrame 合并的（一次滑动只做一帧的工作），
+      // 桩里的 rAF 是异步排队的 —— 派发完 scroll 立刻把这一帧跑掉，
+      // 后面的断言才看得到「滚动后的位置」，与浏览器里「下一帧生效」一致。
+      if (type === 'scroll') {
+        flushFrames();
       }
     },
     /** 递归统计某标签名出现次数（含自身）。 */
@@ -186,6 +237,8 @@ function createElement(tagName) {
 }
 
 const byId = new Map();
+/** 「真的去量了一次文字宽」的次数：量宽会触发强制同步布局，用它验证缓存是否生效。 */
+let measureProbeReads = 0;
 for (const id of [
   'tabs',
   'toolbar',
@@ -281,6 +334,167 @@ for (const id of expectedButtons) {
   const button = createElement('button');
   button.setAttribute('id', id);
   button.appendChild(createElement('svg'));
+  toolbarEl.appendChild(button);
+  byId.set(id, button);
+}
+
+// ------------------------------------------------------------ 加载遮罩（模板 + 桩元素）
+
+// 与搜索栏同一套路：先断言真实模板里确实有这些元素（缺一个功能就是死的），
+// 再在桩里建出来，让 webview 的 getElementById 能拿到。
+const busyHtml = /<div id="busy"[\s\S]*?<\/div>\s*<\/div>/.exec(htmlSource);
+assert(busyHtml !== null, 'graph.html 里没有 #busy（加载遮罩）');
+for (const id of ['busy', 'busy-label', 'btn-busy-cancel']) {
+  assert(busyHtml[0].includes(`id="${id}"`), `加载遮罩缺少 #${id}`);
+}
+assert(
+  /id="busy"[\s\S]*?class="busy-spinner"/.test(busyHtml[0]),
+  '遮罩里应当有转圈元素（.busy-spinner）'
+);
+assert(/id="btn-busy-cancel"[^>]*>\s*取消\s*</.test(busyHtml[0]), '遮罩里应当有「取消」按钮');
+byId.set('busy', createElement('div'));
+byId.set('busy-label', createElement('p'));
+{
+  const cancelButton = createElement('button');
+  cancelButton.setAttribute('id', 'btn-busy-cancel');
+  cancelButton.textContent = '取消';
+  byId.set('btn-busy-cancel', cancelButton);
+}
+
+// ------------------------------------------------------------ 搜索栏（模板 + 桩元素）
+
+// 搜索栏在真实模板里：先断言 HTML 真的带这些元素（缺一个功能就是死的），
+// 再在桩里建出对应元素，好让 webview 里的 getElementById 能拿到它们。
+const searchHtml = /<div id="search"[\s\S]*?<\/div>/.exec(htmlSource);
+assert(searchHtml !== null, 'graph.html 里没有 #search（工具栏最右侧的搜索栏）');
+for (const id of [
+  'search-input',
+  'btn-search-case',
+  'btn-search-word',
+  'btn-search-regex',
+  'search-count',
+  'btn-search-prev',
+  'btn-search-next',
+]) {
+  assert(searchHtml[0].includes(`id="${id}"`), `搜索栏缺少 #${id}`);
+}
+assert(
+  /id="search-input"[\s\S]*?type="text"/.test(searchHtml[0]),
+  '搜索框应当是 type="text" 的输入框'
+);
+{
+  const searchCss = fs.readFileSync(path.join(ROOT, 'src', 'webview', 'graph.css'), 'utf8');
+  assert(
+    /\.search\s*\{[^}]*margin-left:\s*auto/.test(searchCss),
+    'CSS 里 .search 应当用 margin-left:auto 固定到工具栏最右侧'
+  );
+  // 命中样式：按「白字必须仍然清晰」这个**对比度**问题来断言，而不只是查规则在不在。
+  // 做法：把（半透明的）底纹混到深色主题的默认方框背景上，再算它与主题默认前景色的
+  // WCAG 对比度。之前那种亮黄不透明底 + 浅色字只有 1.1:1，就是这么翻车的。
+  const toLinear = (channel) =>
+    channel <= 0.03928 ? channel / 12.92 : Math.pow((channel + 0.055) / 1.055, 2.4);
+  const luminanceOf = ([r, g, b]) => 0.2126 * toLinear(r) + 0.7152 * toLinear(g) + 0.0722 * toLinear(b);
+  const hexToRgb = (hex) => [0, 2, 4].map((i) => Number.parseInt(hex.slice(i, i + 2), 16) / 255);
+  const contrast = (a, b) => {
+    const sorted = [luminanceOf(a), luminanceOf(b)].sort((x, y) => y - x);
+    return (sorted[0] + 0.05) / (sorted[1] + 0.05);
+  };
+
+  const bgRule = /--search-match-bg:\s*rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*(?:,\s*([\d.]+)\s*)?\)/i.exec(
+    searchCss
+  );
+  assert(bgRule !== null, 'CSS 里应当把 --search-match-bg 定义成 rgb()/rgba() 颜色');
+  const alpha = bgRule[4] === undefined ? 1 : Number.parseFloat(bgRule[4]);
+  assert(alpha <= 0.35, `命中底纹必须够淡（白色文字才压得住），实际 alpha=${alpha}`);
+
+  // 混到默认方框背景 #252526（--node-bg 的兜底值）上，再看与主题默认前景 #cccccc 的对比度
+  const base = hexToRgb('252526');
+  const tinted = [0, 1, 2].map((i) => {
+    const channel = Number.parseFloat(bgRule[i + 1]) / 255;
+    return channel * alpha + base[i] * (1 - alpha);
+  });
+  const tintedRgb = tinted.map((channel) => Math.round(channel * 255));
+  assert(
+    tinted[0] > tinted[2] * 1.5,
+    `命中底纹应当是黄的（红通道要明显高于蓝通道），实际 rgb=${tintedRgb.join(',')}`
+  );
+  const ratio = contrast(tinted, hexToRgb('cccccc'));
+  assert(
+    ratio >= 4.5,
+    `命中处的文字对比度不足：压在底纹上只有 ${ratio.toFixed(1)}:1（要求 ≥4.5:1）`
+  );
+  assert(
+    /\.node\.match \.name-hit\s*\{[^}]*fill:\s*var\(--search-match-bg\)/.test(searchCss),
+    'CSS 里应当有 .node.match .name-hit 的底纹规则（只高亮元素名）'
+  );
+  assert(
+    /\.node\.match \.name-hit\s*\{[^}]*stroke:\s*var\(--search-match-stroke\)/.test(searchCss),
+    'CSS 里命中底纹应当带黄色描边（淡底纹靠描边才醒目）'
+  );
+  assert(
+    !/\.node\.match \.name\s*\{[^}]*fill:/.test(searchCss),
+    '命中时不应覆盖元素名的颜色（按需求仍用主题的白字）'
+  );
+  assert(
+    !/\.node\.match(-current)? \.box\s*\{/.test(searchCss),
+    '按需求只高亮元素名，方框不应再被高亮（.node.match .box 规则应已移除）'
+  );
+  log(`诊断: 命中底纹 alpha=${alpha} → 混色 rgb(${tintedRgb.join(',')})，文字对比度 ${ratio.toFixed(1)}:1`);
+}
+
+// ------------------------------------------------ 设置项三方一致
+//
+// 工作区规则：README 的设置表必须与 package.json 的 configuration 完全对应；
+// 而 webview 读不到 VS Code 设置，必须由宿主下发。三处任何一处漏了就有一条会失败。
+{
+  const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+  const configKeys = Object.keys(pkg.contributes.configuration.properties)
+    .map((key) => key.replace(/^cppCallGraph\./, ''))
+    .sort();
+  const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
+  const readmeKeys = [...readme.matchAll(/^\|\s*`cppCallGraph\.([A-Za-z0-9_]+)`/gm)]
+    .map((match) => match[1])
+    .sort();
+  assert(
+    readmeKeys.join(',') === configKeys.join(','),
+    `README 的设置表必须与 package.json 的 configuration 完全对应：README=[${readmeKeys.join(',')}]，配置=[${configKeys.join(',')}]`
+  );
+
+  const sticky = pkg.contributes.configuration.properties['cppCallGraph.stickyParent'];
+  assert(sticky !== undefined, 'package.json 里应当有 cppCallGraph.stickyParent 设置项');
+  assert(
+    sticky.type === 'boolean' && sticky.default === true,
+    `stickyParent 应当是「默认 true 的布尔项」，实际 ${JSON.stringify(sticky)}`
+  );
+
+  // 宿主读配置 → 以 settings 消息下发；webview 处理 settings 消息。缺一处开关就是死的。
+  const hostSource = fs.readFileSync(path.join(ROOT, 'src', 'views', 'graphView.ts'), 'utf8');
+  assert(
+    /'stickyParent'/.test(hostSource) && /type: 'settings'/.test(hostSource),
+    '宿主应当读 stickyParent 并以 settings 消息下发给 webview'
+  );
+  const webviewSource = fs.readFileSync(path.join(ROOT, 'src', 'webview', 'graph.ts'), 'utf8');
+  assert(/case 'settings'/.test(webviewSource), 'webview 应当处理 settings 消息');
+  assert(
+    /stickyEnabled/.test(webviewSource) && /state\.stickyParent/.test(webviewSource),
+    'webview 应当按设置决定是否启用粘性父框'
+  );
+  log(`诊断: 设置项 ${configKeys.length} 项，package.json / README / 宿主下发 / webview 处理四处一致`);
+}
+
+const searchInputStub = createElement('input');
+searchInputStub.value = '';
+byId.set('search-input', searchInputStub);
+byId.set('search-count', createElement('span'));
+for (const id of [
+  'btn-search-case',
+  'btn-search-word',
+  'btn-search-regex',
+  'btn-search-prev',
+  'btn-search-next',
+]) {
+  const button = createElement('button');
+  button.setAttribute('id', id);
   toolbarEl.appendChild(button);
   byId.set(id, button);
 }
@@ -693,11 +907,14 @@ for (const element of edgePaths) {
 // 而要断言「单击不会触发跳转」——这个更贴近需求，下面单独测。
 assert(
   (nodesGroup.children[0].listeners.get('click') ?? []).length > 0,
-  '方框应当绑定单击事件（用于高亮选中）'
+  '方框应当绑定单击事件（选中 + 双击跳转都走它）'
 );
+// 跳转**不再**用 dblclick 事件：单击会重绘整个 #nodes 子树，浏览器按「两次点击是否命中
+// 同一元素」配对，元素被换掉后 dblclick 根本不会派发（第一次双击只选中、不跳转）。
+// 现在统一在 click 里看 event.detail ≥ 2，下面按真实路径测。
 assert(
-  (nodesGroup.children[0].listeners.get('dblclick') ?? []).length > 0,
-  '方框应当绑定双击事件（用于跳转）'
+  (nodesGroup.children[0].listeners.get('dblclick') ?? []).length === 0,
+  '方框不应再依赖 dblclick 事件（改用 click 的 event.detail）'
 );
 assert(
   (nodesGroup.children[0].listeners.get('contextmenu') ?? []).length > 0,
@@ -869,6 +1086,20 @@ for (const tab of tabsEl.children) {
       ).toFixed(1)}px`
   );
 
+  // ---- 量宽缓存：内容没变时不得再探测 ----
+  // 生产代码每帧要为「每个可见方框的名称 + 路径」各量一次宽，而每次量宽都会触发一次
+  // **强制同步布局**；几百个节点就是上千次。按「文字 + 字号 + 粗细」缓存之后，
+  // 第二次渲染同样内容时的探测次数必须是 0（这是「大图卡不卡」的关键指标）。
+  const measuredBefore = measureProbeReads;
+  assert(measuredBefore > 0, '首次渲染应当真的量过宽（说明桩或生产代码没走到量宽路径）');
+  sendToWebview({ type: 'settings', stickyParent: true, showLocation: true });
+  flushFrames();
+  assert(
+    measureProbeReads === measuredBefore,
+    `量宽缓存没有生效：重发同样数据后又探测了 ${measureProbeReads - measuredBefore} 次`
+  );
+  log(`诊断: 量宽缓存生效 —— 内容不变时重绘不再触发探测（此前累计 ${measuredBefore} 次）`);
+
   // 边必须接在两个方框**各自的**边缘上（宽度不同，不能都用 from 的宽度）。
   // 这条曾是真 bug：宽度自适应后，两个锚点都取 from 的宽度，目标方框就接不上。
   const edge = edgesEl.children.find((child) => String(child.className).includes('edge'));
@@ -1021,6 +1252,15 @@ for (const tab of tabsEl.children) {
 
   const after = idsNow();
   assert(!after.includes('g1'), `折叠 c1 后它的子节点应隐藏，实际仍在：${after.join(',')}`);
+
+  // 收起状态必须下发给宿主：坐标是宿主算的，不收起的子树不占高度（否则空挡会一直留着）
+  {
+    const collapseMessage = [...posted].reverse().find((message) => message.type === 'collapse');
+    assert(
+      collapseMessage !== undefined && (collapseMessage.collapsed ?? []).includes('c1'),
+      `收起 c1 之后应当把「已收起」集合下发给宿主，让它重排收掉空挡，实际 ${JSON.stringify(collapseMessage)}`
+    );
+  }
   for (const id of ['r', 'c1', 'c2']) {
     assert(after.includes(id), `折叠 c1 后 ${id} 应当仍然可见，实际只剩 ${after.join(',')}`);
   }
@@ -1235,7 +1475,7 @@ for (const [buttonId, expectedType] of [
   ['btn-expand-all', 'expandAll'],
   ['btn-settings', 'openSettings'],
   ['btn-copy-tab', 'copyTabText'],
-  ['btn-collapse-all', undefined], // 收起全部是纯前端行为，不发消息
+  ['btn-collapse-all', 'collapse'], // 收起全部要把收起状态下发宿主（坐标由宿主算，漏了就只展开到第二级）
   ['btn-close-all', 'closeAllTabs'],
 ]) {
   const button = byId.get(buttonId);
@@ -1258,7 +1498,7 @@ for (const [buttonId, expectedType] of [
     );
   }
 }
-log('诊断: 工具栏 5 个按钮的点击行为都正确（展开/设置/复制标签/关闭发消息，收起全部纯前端）');
+log('诊断: 工具栏 5 个按钮的点击行为都正确（展开/设置/复制标签/关闭发消息，收起全部下发收起状态）');
 
 // ------------------------------------------------ 单击高亮 + 方框右键菜单
 
@@ -1361,9 +1601,11 @@ log('诊断: 工具栏 5 个按钮的点击行为都正确（展开/设置/复�
   );
   console.log('诊断: 菜单两项分别发出 copyNodeName / copyNodeLocation，且带正确的 nodeId');
 
-  // 双击：既选中（高亮）又跳转
+  // 双击：既选中（高亮）又跳转。按真实路径来 —— 连发两次 click、第二次带 detail=2
+  // （浏览器就是这么把双击报给 click 处理器的；用 dblclick 事件测不出「元素被换掉」那类 bug）。
   const beforeDbl = posted.length;
-  boxOf().dispatch('dblclick', { preventDefault() {}, stopPropagation() {} });
+  boxOf().dispatch('click', { detail: 1, preventDefault() {}, stopPropagation() {} });
+  boxOf().dispatch('click', { detail: 2, preventDefault() {}, stopPropagation() {} });
   const dblMessages = posted.slice(beforeDbl).map((message) => message.type);
   assert(
     dblMessages.includes('openLocation'),
@@ -1556,3 +1798,1558 @@ setTimeout(() => {
     log('OK: 新查询把根方框居中；Ctrl+滚轮不再缩放，SVG 尺寸恒等于内容尺寸');
   }, 20);
 }, 20);
+
+// ------------------------------------------------ 搜索栏：大小写 / 全字 / 正则 + 上下跳
+//
+// 放在文件最后：自己投一帧夹具，不改动前面各段依赖的会话状态。
+{
+  // 夹具起名就是为了让三个模式互相区分得开：
+  //   s0 alpha_one（根） → s1 alpha_two、s2 beta_one
+  sendToWebview({
+    type: 'sessionUpdate',
+    session: {
+      id: 'search-check',
+      title: '搜索检查',
+      description: '',
+      direction: 'callees',
+      engineLabel: 'clangd',
+      rootId: 's0',
+      nodes: {
+        s0: {
+          id: 's0',
+          name: 'alpha_one',
+          file: 'a.c',
+          line: 1,
+          direction: 'callees',
+          depth: 0,
+          isCycle: false,
+          canExpand: true,
+          children: ['s1', 's2'],
+          loaded: true,
+          kind: 'function',
+        },
+        s1: {
+          id: 's1',
+          name: 'alpha_two',
+          file: 'b.c',
+          line: 2,
+          direction: 'callees',
+          depth: 1,
+          isCycle: false,
+          canExpand: false,
+          children: [],
+          parent: 's0',
+          loaded: true,
+          kind: 'function',
+        },
+        s2: {
+          id: 's2',
+          name: 'beta_one',
+          file: 'c.c',
+          line: 3,
+          direction: 'callees',
+          depth: 1,
+          isCycle: false,
+          canExpand: false,
+          children: [],
+          parent: 's0',
+          loaded: true,
+          kind: 'function',
+        },
+      },
+      edges: [
+        { id: 'e1', from: 's0', to: 's1', depth: 1 },
+        { id: 'e2', from: 's0', to: 's2', depth: 1 },
+      ],
+      boxes: {
+        s0: { x: 0, y: 0, width: 200, height: NODE_HEIGHT },
+        s1: { x: 256, y: 0, width: 200, height: NODE_HEIGHT },
+        s2: { x: 256, y: NODE_HEIGHT + 20, width: 200, height: NODE_HEIGHT },
+      },
+      collapsedCount: 0,
+    },
+  });
+
+  const searchInput = byId.get('search-input');
+  const searchCount = byId.get('search-count');
+  const classesOf = (el) => String(el.className).split(/\s+/).filter(Boolean);
+  const idsWithClass = (cls) =>
+    nodesGroup.children
+      .filter((child) => classesOf(child).includes(cls))
+      .map((child) => child.getAttribute('data-node'));
+  const currentId = () => idsWithClass('match-current')[0];
+  const type = (value) => {
+    searchInput.value = value;
+    searchInput.dispatch('input', {});
+  };
+
+  assert(
+    nodesGroup.children.length === 3,
+    `搜索夹具应当画出 3 个方框，实际 ${nodesGroup.children.length}`
+  );
+
+  // ① 默认大小写不敏感：ALPHA 命中两个 alpha_*
+  type('ALPHA');
+  assert(
+    idsWithClass('match').sort().join(',') === 's0,s1',
+    `大小写不敏感时 ALPHA 应命中 s0,s1，实际 ${idsWithClass('match').join(',') || '（无）'}`
+  );
+  assert(currentId() === 's0', '第一处命中应当被标成「当前命中」');
+  assert(searchCount.textContent === '1/2', `命中计数应为 1/2，实际 ${searchCount.textContent}`);
+
+  // 底纹只垫在**命中的元素名**上：没命中的节点不该有 name-hit（也不该动方框）
+  const nameHitCount = (nodeId) => {
+    const group = nodesGroup.children.find((child) => child.getAttribute('data-node') === nodeId);
+    return group ? group.flatten().filter((el) => classesOf(el).includes('name-hit')).length : -1;
+  };
+  assert(
+    nameHitCount('s0') === 1 && nameHitCount('s1') === 1 && nameHitCount('s2') === 0,
+    `只有命中的节点才该有元素名底纹，实际 s0=${nameHitCount('s0')} s1=${nameHitCount('s1')} s2=${nameHitCount('s2')}`
+  );
+
+  // 底纹要真的盖住名字：横向包住文字，纵向覆盖名称墨迹（基线 15，墨迹约 6~18）
+  const findIn = (nodeId, cls) => {
+    const group = nodesGroup.children.find((child) => child.getAttribute('data-node') === nodeId);
+    return group ? group.flatten().find((el) => classesOf(el).includes(cls)) : undefined;
+  };
+  const hitRect = findIn('s0', 'name-hit');
+  const nameEl = findIn('s0', 'name');
+  assert(hitRect !== undefined && nameEl !== undefined, '命中的节点应当同时有 name-hit 底纹与 name 文字');
+  const rectX = Number(hitRect.getAttribute('x'));
+  const rectY = Number(hitRect.getAttribute('y'));
+  const rectW = Number(hitRect.getAttribute('width'));
+  const rectH = Number(hitRect.getAttribute('height'));
+  const nameX = Number(nameEl.getAttribute('x'));
+  const inkW = nameEl.getBBox().width;
+  assert(
+    rectX <= nameX && rectX + rectW >= nameX + inkW,
+    `底纹没包住名字：底纹 ${rectX}~${(rectX + rectW).toFixed(1)}，文字 ${nameX}~${(nameX + inkW).toFixed(1)}`
+  );
+  assert(
+    rectY <= 6 && rectY + rectH >= 18,
+    `底纹没盖住名称墨迹（基线 15，墨迹约 6~18），实际 y=${rectY} h=${rectH}`
+  );
+
+  // ② 打开「区分大小写」：同一个查询不再命中（名字都是小写）
+  byId.get('btn-search-case').dispatch('click', {});
+  assert(idsWithClass('match').length === 0, '区分大小写后 ALPHA 不该再命中');
+  assert(
+    searchCount.textContent === '无命中',
+    `无命中时应提示「无命中」，实际 ${searchCount.textContent}`
+  );
+  byId.get('btn-search-case').dispatch('click', {});
+
+  // ③ 全字：alpha 在 alpha_one 里后面紧挨下划线，不算整词；整名才命中
+  type('alpha');
+  assert(idsWithClass('match').length === 2, '默认模式下 alpha 应命中两个 alpha_*');
+  byId.get('btn-search-word').dispatch('click', {});
+  assert(idsWithClass('match').length === 0, '全字模式下 alpha 不该命中 alpha_*（下划线算词字符）');
+  type('alpha_two');
+  assert(idsWithClass('match').join(',') === 's1', '全字模式下整名 alpha_two 应当命中 s1');
+  byId.get('btn-search-word').dispatch('click', {});
+
+  // ④ 正则匹配 + 上下箭头在三处命中间循环
+  byId.get('btn-search-regex').dispatch('click', {});
+  type('^(alpha|beta)');
+  assert(
+    idsWithClass('match').length === 3,
+    `正则应命中 3 个节点，实际 ${idsWithClass('match').length}`
+  );
+  assert(currentId() === 's0', '初始应停在第一处命中');
+  assert(searchCount.textContent === '1/3', `计数应为 1/3，实际 ${searchCount.textContent}`);
+  byId.get('btn-search-next').dispatch('click', {});
+  assert(currentId() === 's1', `「下一个」应跳到 s1，实际 ${currentId()}`);
+  assert(searchCount.textContent === '2/3', `计数应为 2/3，实际 ${searchCount.textContent}`);
+  byId.get('btn-search-next').dispatch('click', {});
+  assert(currentId() === 's2', `「下一个」应跳到 s2，实际 ${currentId()}`);
+  byId.get('btn-search-next').dispatch('click', {});
+  assert(currentId() === 's0', '连续点「下一个」应当循环回第一处');
+  byId.get('btn-search-prev').dispatch('click', {});
+  assert(currentId() === 's2', `「上一个」应循环到 s2，实际 ${currentId()}`);
+
+  // ⑤ 非法正则：不抛错、输入框描红、计数提示语法错误，图仍然照画
+  type('[');
+  assert(searchInput.classList.contains('invalid'), '正则非法时输入框应当描红');
+  assert(
+    searchCount.textContent === '正则错误',
+    `正则非法时应提示「正则错误」，实际 ${searchCount.textContent}`
+  );
+  assert(nodesGroup.children.length === 3, '正则非法时渲染不能中断（三个方框仍应在）');
+  byId.get('btn-search-regex').dispatch('click', {});
+
+  // ⑥ 清空查询：高亮与计数复位，箭头在没有命中时禁用
+  type('');
+  assert(idsWithClass('match').length === 0, '清空查询后不该还有命中高亮');
+  assert(searchCount.textContent === '', '清空查询后计数应当清空');
+  assert(byId.get('btn-search-next').disabled === true, '没有命中时「下一个」应当禁用');
+
+  log('OK: 搜索栏支持大小写 / 全字 / 正则，命中黄色高亮，上下箭头在命中间循环');
+}
+
+// ------------------------------------------------ 粘性父框（可设置）
+//
+// 夹具用真实布局引擎生成（不手写坐标），并刻意做成「内容比视口高」——
+// 只有这种情形粘性父框才该生效（内容还没视口高时没有可滚动的余地）。
+{
+  const childIds = [];
+  const stickyNodes = {};
+  for (let i = 0; i < 10; i += 1) {
+    const id = `child_${i}`;
+    childIds.push(id);
+    stickyNodes[id] = {
+      id,
+      name: `child_${i}`,
+      file: 'x.c',
+      line: i + 1,
+      direction: 'callers',
+      depth: 1,
+      isCycle: false,
+      children: [],
+      parent: 'root_fn',
+      loaded: true,
+      kind: 'function',
+    };
+  }
+  stickyNodes.root_fn = {
+    id: 'root_fn',
+    name: 'root_fn',
+    file: 'r.c',
+    line: 1,
+    direction: 'callers',
+    depth: 0,
+    isCycle: false,
+    children: childIds,
+    loaded: true,
+    kind: 'function',
+  };
+  const stickyBoxes = createLayout(stickyNodes, 'root_fn').boxes;
+  const contentHeight = Math.max(...Object.values(stickyBoxes).map((box) => box.y + box.height));
+  const boxHeight = stickyBoxes.root_fn.height;
+
+  const sendStickySession = (settings) => {
+    if (settings) {
+      sendToWebview({ type: 'settings', settings });
+    }
+    sendToWebview({
+      type: 'sessionUpdate',
+      session: {
+        id: 'sticky-check',
+        title: '粘性检查',
+        description: '',
+        direction: 'callers',
+        engineLabel: 'clangd',
+        rootId: 'root_fn',
+        nodes: stickyNodes,
+        edges: childIds.map((id, index) => ({ id: `e${index}`, from: id, to: 'root_fn', depth: 1 })),
+        boxes: stickyBoxes,
+        collapsedCount: 0,
+      },
+    });
+  };
+
+  // 视口比内容矮，并让桩的 rect 反映滚动：
+  // 真实 DOM 里容器滚动时，子元素（SVG）的顶边会随 scrollTop 上移。
+  canvasEl.clientHeight = 300;
+  canvasEl.scrollTop = 0;
+  canvasEl.getBoundingClientRect = () => ({
+    left: 0,
+    top: 0,
+    width: canvasEl.clientWidth,
+    height: canvasEl.clientHeight,
+  });
+  svg.getBoundingClientRect = () => ({
+    left: 0,
+    top: -Number(canvasEl.scrollTop || 0),
+    width: 0,
+    height: 0,
+  });
+
+  const groupOf = (nodeId) => nodesGroup.children.find((child) => child.getAttribute('data-node') === nodeId);
+  const rootTop = () => Number(/translate\(([-\d.]+) ([-\d.]+)\)/.exec(groupOf('root_fn').getAttribute('transform'))[2]);
+  /**
+   * 内容坐标 → 视口坐标：屏幕 y = svgRect.top + (内容 y − viewBox 的 y)。
+   * viewBox 的 y 不是 0（内容左上角带 MARGIN_TOP=−10 的边距），漏掉它就会差 10px。
+   */
+  const viewBoxParts = () => String(svg.getAttribute('viewBox')).split(/\s+/).map(Number);
+  /** 根方框中心在「视口坐标系」里的位置（0 = 视口顶边）。 */
+  const rootCenterInViewport = () =>
+    rootTop() + boxHeight / 2 - viewBoxParts()[1] - Number(canvasEl.scrollTop || 0);
+
+  assert(
+    contentHeight > canvasEl.clientHeight,
+    `夹具内容应比视口高（内容 ${contentHeight}，视口 ${canvasEl.clientHeight}）`
+  );
+
+  // ① 默认开启：根方框被钉在视口垂直中央
+  sendStickySession(undefined);
+  canvasEl.dispatch('scroll', {});
+  assert(
+    Math.abs(rootCenterInViewport() - canvasEl.clientHeight / 2) <= 1,
+    `根方框应钉在视口垂直中央（中心 ${rootCenterInViewport().toFixed(1)}，视口中心 ${canvasEl.clientHeight / 2}）`
+  );
+  const rootTopBefore = rootTop();
+  const edgeBefore = String(edgesEl.children[0].getAttribute('d'));
+
+  // ② 向下滚 120：根方框在屏幕上不动（内容坐标里补偿 120），与它相连的连线跟着重画
+  canvasEl.scrollTop = 120;
+  canvasEl.dispatch('scroll', {});
+  assert(
+    Math.abs(rootCenterInViewport() - canvasEl.clientHeight / 2) <= 1,
+    `滚动后根方框仍应钉在中央（中心 ${rootCenterInViewport().toFixed(1)}）`
+  );
+  assert(
+    Math.abs(rootTop() - (rootTopBefore + 120)) <= 1,
+    `滚 120 后根方框的内容坐标应同步下移 120，实际 ${(rootTop() - rootTopBefore).toFixed(1)}`
+  );
+  assert(
+    String(edgesEl.children[0].getAttribute('d')) !== edgeBefore,
+    '与根相连的连线应当随滚动重画，否则箭头会脱节'
+  );
+
+  // ③ 极端滚动：不能把根移出 **viewBox**（裁剪就发生在那里；viewBox 比节点范围多出上下边距）
+  canvasEl.scrollTop = contentHeight * 2;
+  canvasEl.dispatch('scroll', {});
+  {
+    const [, viewY, , viewH] = viewBoxParts();
+    assert(
+      rootTop() >= viewY - 0.5 && rootTop() + boxHeight <= viewY + viewH + 0.5,
+      `极端滚动下根方框也必须留在 viewBox 内（top=${rootTop().toFixed(1)}，viewBox y=${viewY} 高=${viewH}）`
+    );
+  }
+
+  // ④ 关掉设置：不再有任何位移，回到布局里的原位
+  canvasEl.scrollTop = 0;
+  sendStickySession({ stickyParent: false });
+  canvasEl.dispatch('scroll', {});
+  assert(
+    Math.abs(rootTop() - stickyBoxes.root_fn.y) <= 0.5,
+    `设置关掉后根方框应回到布局位置（top=${rootTop().toFixed(1)}，布局 y=${stickyBoxes.root_fn.y}）`
+  );
+
+  // ⑤ 再打开：恢复粘性
+  sendStickySession({ stickyParent: true });
+  canvasEl.dispatch('scroll', {});
+  assert(
+    Math.abs(rootCenterInViewport() - canvasEl.clientHeight / 2) <= 1,
+    '重新打开设置后应恢复粘性居中'
+  );
+
+  // 收尾：关掉设置、视口高度还原，避免影响后面（延后执行的）段落
+  sendToWebview({ type: 'settings', settings: { stickyParent: false } });
+  canvasEl.clientHeight = 0;
+  log('OK: 粘性父框（可设置）—— 根方框钉在视口中央、滚动时连线跟着重画、关掉后回到原位');
+}
+
+// ------------------------------------------------ 粘性父框：推广到任意层（展开谁就钉谁）
+//
+// 场景：第二级有很多个，展开其中一个 a 去看它的第三级；再展开 a 的孩子 a3 去看第四级 ——
+// 钉在中间的应当依次是 a、a3，而不是永远钉根；收起锚点则退回它的父级。
+{
+  const mkNode = (id, depth, parent, children, extra = {}) => ({
+    id,
+    name: id,
+    file: 'x.c',
+    line: 1,
+    direction: 'callers',
+    depth,
+    isCycle: false,
+    children,
+    parent,
+    loaded: false,
+    canExpand: false,
+    kind: 'function',
+    ...extra,
+  });
+  const kids = (prefix, count) => Array.from({ length: count }, (_, index) => `${prefix}${index}`);
+  const A_KIDS = kids('a', 10); // a 的第三级
+  const A3_KIDS = kids('a3_', 10); // a3 的第四级
+
+  /** level 0：只有 root/a/b；1：展开了 a；2：又展开了 a3。 */
+  const nodesOf = (level) => {
+    const nodes = {
+      r0: mkNode('r0', 0, undefined, ['a', 'b'], { loaded: true }),
+      a: mkNode('a', 1, 'r0', level >= 1 ? A_KIDS : [], { canExpand: true, loaded: level >= 1 }),
+      b: mkNode('b', 1, 'r0', [], { canExpand: true }),
+    };
+    if (level >= 1) {
+      for (const id of A_KIDS) {
+        const isA3 = id === 'a3';
+        nodes[id] = mkNode(id, 2, 'a', level >= 2 && isA3 ? A3_KIDS : [], {
+          canExpand: true,
+          loaded: level >= 2 && isA3,
+        });
+      }
+    }
+    if (level >= 2) {
+      for (const id of A3_KIDS) {
+        nodes[id] = mkNode(id, 3, 'a3', [], {});
+      }
+    }
+    return nodes;
+  };
+
+  let boxes = {};
+  let nodes = {};
+  const sendLevel = (level, sessionId = 'anchor-check') => {
+    nodes = nodesOf(level);
+    boxes = createLayout(nodes, 'r0').boxes;
+    const edges = Object.values(nodes)
+      .filter((node) => node.parent)
+      .map((node) => ({ id: `e_${node.id}`, from: node.id, to: node.parent }));
+    sendToWebview({
+      type: 'sessionUpdate',
+      session: {
+        id: sessionId,
+        title: '锚点检查',
+        description: '',
+        direction: 'callers',
+        engineLabel: 'clangd',
+        rootId: 'r0',
+        nodes,
+        edges,
+        boxes,
+        collapsedCount: 0,
+      },
+    });
+  };
+
+  const groupOf = (id) => nodesGroup.children.find((child) => child.getAttribute('data-node') === id);
+  const topOf = (id) => {
+    const group = groupOf(id);
+    if (!group) {
+      return Number.NaN;
+    }
+    return Number(/translate\(([-\d.]+) ([-\d.]+)\)/.exec(group.getAttribute('transform'))[2]);
+  };
+  const viewBoxParts = () => String(svg.getAttribute('viewBox')).split(/\s+/).map(Number);
+  /** 方框中心在视口坐标系里的位置（0 = 视口顶边）。 */
+  const centerInViewport = (id) =>
+    topOf(id) + (boxes[id]?.height ?? 43) / 2 - viewBoxParts()[1] - Number(canvasEl.scrollTop || 0);
+  /** 走真实交互路径点加减号：mousedown 记录 + window mouseup 处理。 */
+  const clickExpander = (id, mode) => {
+    const expander = groupOf(id)?.children.find((child) =>
+      String(child.getAttribute('class') || '').startsWith('expander')
+    );
+    assert(expander !== undefined, `${id} 应当有加减号`);
+    assert(
+      String(expander.getAttribute('class')).includes(mode),
+      `${id} 的加减号模式应为 ${mode}，实际 ${expander.getAttribute('class')}`
+    );
+    expander.dispatch('mousedown', { stopPropagation() {}, preventDefault() {} });
+    for (const handler of windowListeners.mouseup ?? []) {
+      handler({});
+    }
+  };
+
+  canvasEl.clientHeight = 300;
+  canvasEl.scrollTop = 0;
+  sendToWebview({ type: 'settings', settings: { stickyParent: true } });
+  sendLevel(0);
+
+  // ① 点开 a 的加号（此时 a 还没加载过下一层）
+  posted.length = 0;
+  clickExpander('a', 'expand');
+  assert(
+    posted.some((message) => message.type === 'expand' && message.nodeId === 'a'),
+    `点开 a 的加号应当向宿主请求展开 a，实际发了 ${JSON.stringify(posted.map((m) => m.type))}`
+  );
+
+  /**
+   * 新规则（用户 2026-10-10 定）：被钉住的方框在**自己整棵子树那一段**（空挡）里保持居中，
+   * 碰到空挡上下界就停住。空挡递归定义：有可见子框 = 第一个子框的空挡上沿 ~ 最后一个的下沿；
+   * 自己就是叶子 = 自己那一段。判据用「要么在视口中央、要么正好贴住空挡边缘」，不写死坐标。
+   */
+  const slotOf = (id, seen = new Set()) => {
+    const box = boxes[id];
+    if (!box || !groupOf(id) || seen.has(id)) {
+      return box ? { top: box.y, bottom: box.y + box.height } : undefined;
+    }
+    seen.add(id);
+    let top = Number.POSITIVE_INFINITY;
+    let bottom = Number.NEGATIVE_INFINITY;
+    for (const child of nodes[id]?.children ?? []) {
+      if (!boxes[child] || !groupOf(child)) {
+        continue;
+      }
+      const childSlot = slotOf(child, seen);
+      if (childSlot) {
+        top = Math.min(top, childSlot.top);
+        bottom = Math.max(bottom, childSlot.bottom);
+      }
+    }
+    return Number.isFinite(top) ? { top, bottom } : { top: box.y, bottom: box.y + box.height };
+  };
+  const assertSticky = (id, where) => {
+    const slot = slotOf(id);
+    assert(slot !== undefined, `${where}：${id} 应当有可见子框，才有空挡`);
+    const centered = Math.abs(centerInViewport(id) - canvasEl.clientHeight / 2) <= 1;
+    const atTop = Math.abs(topOf(id) - slot.top) <= 0.5;
+    const atBottom = Math.abs(topOf(id) + boxes[id].height - slot.bottom) <= 0.5;
+    assert(
+      centered || atTop || atBottom,
+      `${where}：${id} 既不在中央也没贴住空挡边缘` +
+        `（top=${topOf(id).toFixed(1)}，空挡 ${slot.top.toFixed(1)}~${slot.bottom.toFixed(1)}）`
+    );
+  };
+
+  // ② 宿主把 a 的第三级送回来：根与 a 都进入「在自己的空挡里居中」的状态
+  sendLevel(1);
+  canvasEl.dispatch('scroll', {});
+  assertSticky('a', '展开 a 之后');
+  assertSticky('r0', '展开 a 之后');
+
+  // ③ 滚动之后这条规则依然成立
+  canvasEl.scrollTop = 120;
+  canvasEl.dispatch('scroll', {});
+  assertSticky('a', '滚动 120 之后');
+  assertSticky('r0', '滚动 120 之后');
+
+  // ④ 再展开 a3（第三级里的一个）：根、a、a3 三级同时遵守这条规则
+  clickExpander('a3', 'expand');
+  sendLevel(2);
+  canvasEl.dispatch('scroll', {});
+  for (const id of ['r0', 'a', 'a3']) {
+    assertSticky(id, '展开 a3 之后');
+  }
+
+  // ⑤ 收起 a3：链退回 根 + a，规则仍成立
+  clickExpander('a3', 'collapse');
+  canvasEl.dispatch('scroll', {});
+  assertSticky('a', '收起 a3 之后');
+  assertSticky('r0', '收起 a3 之后');
+
+  // ⑥ 收起全部：只剩根，且不留任何残留位移
+  byId.get('btn-collapse-all').dispatch('click', {});
+  const shifted = nodesGroup.children
+    .map((group) => String(group.getAttribute('data-node')))
+    .filter((id) => Math.abs(topOf(id) - (boxes[id]?.y ?? 0)) > 0.5);
+  assert(
+    shifted.length === 0,
+    `收起全部后不该有任何残留位移，实际被移动的是：${shifted.join(',') || '（无）'}`
+  );
+
+  // 收尾：把 DOM 还原成「多节点可见」的形态，并关掉设置、还原视口尺寸。
+  // 两个坑：① 后面延后执行的段落会在**当前 DOM** 上逐个方框数加减号（要求 ≥2 个），
+  // 而这里最后一步是「收起全部」（只剩根可见）；② 收起标记是**按会话 id** 记的，
+  // 所以必须换一个新会话 id 才会真的重新展开，光重发同一会话的负载没用。
+  sendLevel(2, 'anchor-restore');
+  sendToWebview({ type: 'settings', settings: { stickyParent: false } });
+  canvasEl.clientHeight = 0;
+  canvasEl.scrollTop = 0;
+  log('OK: 粘性父框已推广到任意层 —— 展开谁就钉谁（a → a3），收起后退回父级，收起全部无残留');
+}
+
+// ------------------------------------------------ 粘性父框：只在「自己的空挡」里滑动
+//
+// 实测出来的问题：把第二级的 a2 强制定到视口中央时，它会压到同列的 a1 / a3 上。
+// 正确规则：空挡内可以居中，**碰到空挡边缘就停住**，与相邻方框的最小间距 = 正常行距（12px）。
+{
+  const mkNode = (id, depth, parent, children, extra = {}) => ({
+    id,
+    name: id,
+    file: 'x.c',
+    line: 1,
+    direction: 'callers',
+    depth,
+    isCycle: false,
+    children,
+    parent,
+    loaded: false,
+    canExpand: false,
+    kind: 'function',
+    ...extra,
+  });
+  const A2_KIDS = Array.from({ length: 10 }, (_, index) => `a2_${index}`);
+
+  /** expanded=false：a2 还没展开；true：a2 带着 10 个第三级。 */
+  const nodesOf = (expanded) => {
+    const nodes = {
+      r0: mkNode('r0', 0, undefined, ['a1', 'a2', 'a3'], { loaded: true }),
+      a1: mkNode('a1', 1, 'r0', [], { loaded: true }),
+      a2: mkNode('a2', 1, 'r0', expanded ? A2_KIDS : [], { canExpand: true, loaded: expanded }),
+      a3: mkNode('a3', 1, 'r0', [], { loaded: true }),
+    };
+    if (expanded) {
+      for (const id of A2_KIDS) {
+        nodes[id] = mkNode(id, 2, 'a2', [], {});
+      }
+    }
+    return nodes;
+  };
+
+  let boxes = {};
+  let nodes = {};
+  const sendSlot = (expanded) => {
+    nodes = nodesOf(expanded);
+    boxes = createLayout(nodes, 'r0').boxes;
+    const edges = Object.values(nodes)
+      .filter((node) => node.parent)
+      .map((node) => ({ id: `e_${node.id}`, from: node.id, to: node.parent }));
+    sendToWebview({
+      type: 'sessionUpdate',
+      session: {
+        id: 'slot-check',
+        title: '空挡检查',
+        description: '',
+        direction: 'callers',
+        engineLabel: 'clangd',
+        rootId: 'r0',
+        nodes,
+        edges,
+        boxes,
+        collapsedCount: 0,
+      },
+    });
+  };
+
+  const groupOf = (id) => nodesGroup.children.find((child) => child.getAttribute('data-node') === id);
+  const topOf = (id) => {
+    const group = groupOf(id);
+    if (!group) {
+      return Number.NaN;
+    }
+    return Number(/translate\(([-\d.]+) ([-\d.]+)\)/.exec(group.getAttribute('transform'))[2]);
+  };
+  const viewBoxParts = () => String(svg.getAttribute('viewBox')).split(/\s+/).map(Number);
+  const centerInViewport = (id) =>
+    topOf(id) + (boxes[id]?.height ?? 43) / 2 - viewBoxParts()[1] - Number(canvasEl.scrollTop || 0);
+  const clickExpander = (id, mode) => {
+    const expander = groupOf(id)?.children.find((child) =>
+      String(child.getAttribute('class') || '').startsWith('expander')
+    );
+    assert(expander !== undefined, `${id} 应当有加减号`);
+    assert(
+      String(expander.getAttribute('class')).includes(mode),
+      `${id} 的加减号模式应为 ${mode}，实际 ${expander.getAttribute('class')}`
+    );
+    expander.dispatch('mousedown', { stopPropagation() {}, preventDefault() {} });
+    for (const handler of windowListeners.mouseup ?? []) {
+      handler({});
+    }
+  };
+
+  canvasEl.clientHeight = 300;
+  canvasEl.scrollTop = 0;
+  sendToWebview({ type: 'settings', settings: { stickyParent: true } });
+  sendSlot(false);
+  clickExpander('a2', 'expand');
+  sendSlot(true);
+
+  // 夹具自检：a2 的空挡（按**布局**坐标估）应当明显大于一个方框高，才测得出两种情形
+  const boxHeight = boxes.a2.height;
+  const layoutSlot = boxes.a3.y - 12 - boxHeight - (boxes.a1.y + boxes.a1.height + 12);
+  assert(
+    layoutSlot > 100,
+    `夹具的空挡应当足够大才测得出两种情形（实际 ${layoutSlot.toFixed(1)}）`
+  );
+
+  /** 同列相邻对（用**位移后**的实际位置算）——与后面几段同一套判据。 */
+  const columnPairs = () => {
+    const columns = new Map();
+    for (const id of Object.keys(boxes)) {
+      if (!groupOf(id)) {
+        continue;
+      }
+      const x = Number(/translate\(([-\d.]+)/.exec(groupOf(id).getAttribute('transform'))[1]);
+      const list = columns.get(x) ?? [];
+      list.push({ id, top: topOf(id), bottom: topOf(id) + boxes[id].height });
+      columns.set(x, list);
+    }
+    const pairs = [];
+    for (const list of columns.values()) {
+      list.sort((left, right) => left.top - right.top);
+      for (let index = 1; index < list.length; index += 1) {
+        pairs.push({
+          above: list[index - 1],
+          below: list[index],
+          gap: list[index].top - list[index - 1].bottom,
+        });
+      }
+    }
+    return pairs;
+  };
+  /** 某个方框与同列上/下邻居的实际间距。 */
+  const gapsAround = (id) => {
+    const pairs = columnPairs();
+    return {
+      above: pairs.find((pair) => pair.below.id === id)?.gap ?? Number.POSITIVE_INFINITY,
+      below: pairs.find((pair) => pair.above.id === id)?.gap ?? Number.POSITIVE_INFINITY,
+    };
+  };
+  const assertNoOverlap = (where) => {
+    for (const pair of columnPairs()) {
+      assert(
+        pair.gap >= 12 - 0.5,
+        `${where}：${pair.above.id} 与 ${pair.below.id} 间距只有 ${pair.gap.toFixed(1)}px（应 ≥ 12）`
+      );
+    }
+  };
+
+  // ① 期望位置落在空挡内：钉在视口中央
+  canvasEl.scrollTop = 0;
+  canvasEl.dispatch('scroll', {});
+  assert(
+    Math.abs(centerInViewport('a2') - canvasEl.clientHeight / 2) <= 1,
+    `空挡够用时 a2 应当钉在视口中央（中心 ${centerInViewport('a2').toFixed(1)}）`
+  );
+  assertNoOverlap('空挡内居中时');
+
+  // ② 使劲往下滚：空挡不够用了 → 不再居中，而是**正好贴住下边界**（与下方邻居 12px）
+  canvasEl.scrollTop = 500;
+  canvasEl.dispatch('scroll', {});
+  assert(
+    Math.abs(centerInViewport('a2') - canvasEl.clientHeight / 2) > 1,
+    `空挡不够时 a2 不该还在正中（中心 ${centerInViewport('a2').toFixed(1)}）`
+  );
+  assert(
+    Math.abs(gapsAround('a2').below - 12) <= 0.5,
+    `a2 应当正好贴住下方邻居的空挡边缘，实际间距 ${gapsAround('a2').below.toFixed(1)}px`
+  );
+  assertNoOverlap('向下撞到空挡边缘时');
+
+  // ③ 视口很矮（期望位置在空挡上方）：贴住上边界，不压上方邻居
+  canvasEl.clientHeight = 100;
+  canvasEl.scrollTop = 0;
+  canvasEl.dispatch('scroll', {});
+  assert(
+    Math.abs(gapsAround('a2').above - 12) <= 0.5,
+    `a2 应当正好贴住上方邻居的空挡边缘，实际间距 ${gapsAround('a2').above.toFixed(1)}px`
+  );
+  assertNoOverlap('向上撞到空挡边缘时');
+
+  // ④ 叶子邻居（a1/a3）会各自跟着根走 —— 它们之间隔着已展开的 a2，
+  //    所以属于**两段独立的空挡**，可以各自决定跟多少；只要互不重叠即可
+  assertNoOverlap('叶子跟着父框走之后');
+
+  // 收尾：换一个新会话（无收起标记），保证后面延后执行的段落仍能在当前 DOM 上数到 ≥2 个加减号
+  sendSlot(true);
+  sendToWebview({ type: 'settings', settings: { stickyParent: false } });
+  canvasEl.clientHeight = 0;
+  canvasEl.scrollTop = 0;
+  log(
+    `OK: 粘性父框只在「自己的空挡」里滑动 —— 子树那一段约 ${layoutSlot.toFixed(0)}px 高：` +
+      '空挡内居中、撞到边缘就停住；没有展开下一层的同级标签完全不动，同列间距始终 ≥12px'
+  );
+}
+
+// ------------------------------------------------ 粘性父框：任意深度（五级链一起钉）
+//
+// 「以此类推」要能一直往深走：root → a1 → b3 → c4 → d4 五级全部同时保持居中，
+// 每级各自受自己的空挡限制；并且**任何一层都不许和同列邻居挤到 12px 以内**。
+{
+  const mkNode = (id, depth, parent, children, extra = {}) => ({
+    id,
+    name: id,
+    file: 'x.c',
+    line: 1,
+    direction: 'callers',
+    depth,
+    isCycle: false,
+    children,
+    parent,
+    loaded: false,
+    canExpand: false,
+    kind: 'function',
+    ...extra,
+  });
+  const ids = (prefix, count) => Array.from({ length: count }, (_, index) => `${prefix}${index}`);
+  const B_KIDS = ids('b', 10);
+  const C_KIDS = ids('c', 10);
+  const D_KIDS = ids('d', 10);
+  const E_KIDS = ids('e', 10);
+
+  /** level 0：a1 已展开；1：b3 已展开；2：c4 已展开；3：d4 已展开。 */
+  const nodesOf = (level) => {
+    const nodes = {
+      r0: mkNode('r0', 0, undefined, ['a1', 'a2'], { loaded: true }),
+      a1: mkNode('a1', 1, 'r0', B_KIDS, { loaded: true }),
+      a2: mkNode('a2', 1, 'r0', [], { canExpand: true }),
+    };
+    for (const id of B_KIDS) {
+      const live = id === 'b3' && level >= 1;
+      nodes[id] = mkNode(id, 2, 'a1', live ? C_KIDS : [], { canExpand: true, loaded: live });
+    }
+    if (level >= 1) {
+      for (const id of C_KIDS) {
+        const live = id === 'c4' && level >= 2;
+        nodes[id] = mkNode(id, 3, 'b3', live ? D_KIDS : [], { canExpand: true, loaded: live });
+      }
+    }
+    if (level >= 2) {
+      for (const id of D_KIDS) {
+        const live = id === 'd4' && level >= 3;
+        nodes[id] = mkNode(id, 4, 'c4', live ? E_KIDS : [], { canExpand: true, loaded: live });
+      }
+    }
+    if (level >= 3) {
+      for (const id of E_KIDS) {
+        nodes[id] = mkNode(id, 5, 'd4', [], {});
+      }
+    }
+    return nodes;
+  };
+
+  let boxes = {};
+  let nodes = {};
+  const sendDeep = (level) => {
+    nodes = nodesOf(level);
+    boxes = createLayout(nodes, 'r0').boxes;
+    const edges = Object.values(nodes)
+      .filter((node) => node.parent)
+      .map((node) => ({ id: `e_${node.id}`, from: node.id, to: node.parent }));
+    sendToWebview({
+      type: 'sessionUpdate',
+      session: {
+        id: 'deep-check',
+        title: '深层链检查',
+        description: '',
+        direction: 'callers',
+        engineLabel: 'clangd',
+        rootId: 'r0',
+        nodes,
+        edges,
+        boxes,
+        collapsedCount: 0,
+      },
+    });
+  };
+
+  const groupOf = (id) => nodesGroup.children.find((child) => child.getAttribute('data-node') === id);
+  const topOf = (id) => {
+    const group = groupOf(id);
+    if (!group) {
+      return Number.NaN;
+    }
+    return Number(/translate\(([-\d.]+) ([-\d.]+)\)/.exec(group.getAttribute('transform'))[2]);
+  };
+  const viewBoxParts = () => String(svg.getAttribute('viewBox')).split(/\s+/).map(Number);
+  const centerInViewport = (id) =>
+    topOf(id) + (boxes[id]?.height ?? 43) / 2 - viewBoxParts()[1] - Number(canvasEl.scrollTop || 0);
+  const clickExpander = (id, mode) => {
+    const expander = groupOf(id)?.children.find((child) =>
+      String(child.getAttribute('class') || '').startsWith('expander')
+    );
+    assert(expander !== undefined, `${id} 应当有加减号`);
+    assert(
+      String(expander.getAttribute('class')).includes(mode),
+      `${id} 的加减号模式应为 ${mode}，实际 ${expander.getAttribute('class')}`
+    );
+    expander.dispatch('mousedown', { stopPropagation() {}, preventDefault() {} });
+    for (const handler of windowListeners.mouseup ?? []) {
+      handler({});
+    }
+  };
+
+  /**
+   * 同列的相邻对（用**位移后**的实际位置算），间距 = 下框上沿 − 上框下沿。
+   * 这是独立于实现写出来的判据：需求就是「同列最小间距 = 正常行距」。
+   */
+  const columnPairs = () => {
+    const columns = new Map();
+    for (const id of Object.keys(boxes)) {
+      if (!groupOf(id)) {
+        continue; // 不可见的节点不参与
+      }
+      const x = Number(/translate\(([-\d.]+)/.exec(groupOf(id).getAttribute('transform'))[1]);
+      const list = columns.get(x) ?? [];
+      list.push({ id, top: topOf(id), bottom: topOf(id) + boxes[id].height });
+      columns.set(x, list);
+    }
+    const pairs = [];
+    for (const list of columns.values()) {
+      list.sort((left, right) => left.top - right.top);
+      for (let index = 1; index < list.length; index += 1) {
+        pairs.push({
+          above: list[index - 1],
+          below: list[index],
+          gap: list[index].top - list[index - 1].bottom,
+        });
+      }
+    }
+    return pairs;
+  };
+
+  const CHAIN = ['r0', 'a1', 'b3', 'c4', 'd4'];
+  /** 某个方框的「空挡」= 它整棵子树在布局里占的那一段（递归；与实现同一口径）。 */
+  const slotOf = (id, seen = new Set()) => {
+    const box = boxes[id];
+    if (!box || !groupOf(id) || seen.has(id)) {
+      return box ? { top: box.y, bottom: box.y + box.height } : undefined;
+    }
+    seen.add(id);
+    let top = Number.POSITIVE_INFINITY;
+    let bottom = Number.NEGATIVE_INFINITY;
+    for (const child of nodes[id]?.children ?? []) {
+      if (!boxes[child] || !groupOf(child)) {
+        continue;
+      }
+      const childSlot = slotOf(child, seen);
+      if (childSlot) {
+        top = Math.min(top, childSlot.top);
+        bottom = Math.max(bottom, childSlot.bottom);
+      }
+    }
+    return Number.isFinite(top) ? { top, bottom } : { top: box.y, bottom: box.y + box.height };
+  };
+  /** 五级链 + 全局不重叠，两处都适用（滚动前后各查一次）。 */
+  const checkInvariants = (where) => {
+    const half = canvasEl.clientHeight / 2;
+    const pairs = columnPairs();
+    let centered = 0;
+    let clamped = 0;
+    for (const id of CHAIN) {
+      const slot = slotOf(id);
+      assert(slot !== undefined, `${where}：${id} 应当有可见子框，才有空挡`);
+      if (Math.abs(centerInViewport(id) - half) <= 1) {
+        centered += 1;
+        continue;
+      }
+      // 没在中央 → 只能是被自己的空挡卡住：必须正好贴住空挡的上界或下界
+      const atTop = Math.abs(topOf(id) - slot.top) <= 0.5;
+      const atBottom = Math.abs(topOf(id) + boxes[id].height - slot.bottom) <= 0.5;
+      assert(
+        atTop || atBottom,
+        `${where}：${id} 既不在中央也没贴住空挡边缘` +
+          `（top=${topOf(id).toFixed(1)}，空挡 ${slot.top.toFixed(1)}~${slot.bottom.toFixed(1)}）`
+      );
+      clamped += 1;
+    }
+    // 全局：同列任意相邻两框的间距都不得小于正常行距（= 不许重叠、不许挤在一起）
+    for (const pair of pairs) {
+      assert(
+        pair.gap >= 12 - 0.5,
+        `${where}：${pair.above.id} 与 ${pair.below.id} 间距只有 ${pair.gap.toFixed(1)}px（应 ≥ 12）`
+      );
+    }
+    return { centered, clamped, pairs: pairs.length };
+  };
+
+  canvasEl.clientHeight = 300;
+  canvasEl.scrollTop = 0;
+  sendToWebview({ type: 'settings', settings: { stickyParent: true } });
+
+  // 逐级展开到第五级：每次都走真实交互（点加号 + 宿主回数据）
+  sendDeep(0);
+  clickExpander('b3', 'expand');
+  sendDeep(1);
+  clickExpander('c4', 'expand');
+  sendDeep(2);
+  clickExpander('d4', 'expand');
+  sendDeep(3);
+  canvasEl.dispatch('scroll', {});
+  const atTop = checkInvariants('五级链（视口顶部）');
+
+  // 往下滚一大段：链上各级仍应「在中央或贴住自己的空挡边缘」，且全局不重叠
+  canvasEl.scrollTop = 400;
+  canvasEl.dispatch('scroll', {});
+  const scrolled = checkInvariants('五级链（滚 400 后）');
+
+  log(
+    `OK: 粘性父框在任意深度都成立 —— 五级链（${CHAIN.join(' → ')}）同时生效：` +
+      `顶部时 ${atTop.centered} 级居中 / ${atTop.clamped} 级被同级顶住，` +
+      `滚 400 后 ${scrolled.centered} 级居中 / ${scrolled.clamped} 级被顶住；` +
+      `同列 ${atTop.pairs} 对相邻方框间距始终 ≥12px`
+  );
+
+  // ---- 用户 2026-10-10 重新设计的规则（三条要求同时成立）----
+  //
+  // ① 每个被钉住的父框都在**自己子框那一段**（空挡）里滑动 —— 既不会撞到同列兄弟，
+  //    也不会离自己的子框太远；
+  // ② 于是父子箭头的长度被这一条自然管住（不超过「布局跨度 + 最多能滑多远」）；
+  // ③ 收起之后空出的间隔由宿主重排收拢（另有断言，见「收起重排」与 renderCheck 的收起段）。
+  {
+    let maxLayout = 0;
+    let maxShifted = 0;
+    let maxShift = 0;
+    for (const id of CHAIN) {
+      const slot = slotOf(id);
+      assert(slot !== undefined, `${id} 应当有可见子框（空挡）`);
+      const top = topOf(id);
+      assert(
+        top >= slot.top - 0.5 && top + boxes[id].height <= slot.bottom + 0.5,
+        `${id} 滑出了自己的空挡（top=${top.toFixed(1)}，空挡 ${slot.top.toFixed(1)}~${slot.bottom.toFixed(1)}）`
+      );
+      maxShift = Math.max(maxShift, Math.abs(top - boxes[id].y));
+    }
+    for (const [id, node] of Object.entries(nodes)) {
+      const parent = node.parent;
+      if (!parent || !boxes[id] || !boxes[parent]) {
+        continue;
+      }
+      const center = (nodeId, shifted) =>
+        (shifted ? topOf(nodeId) : boxes[nodeId].y) + boxes[nodeId].height / 2;
+      maxLayout = Math.max(maxLayout, Math.abs(center(id, false) - center(parent, false)));
+      maxShifted = Math.max(maxShifted, Math.abs(center(id, true) - center(parent, true)));
+    }
+    assert(
+      maxShifted <= maxLayout + maxShift + 1,
+      `父子箭头被拉得太长：最长 ${maxShifted.toFixed(0)}px，` +
+        `上限应为布局 ${maxLayout.toFixed(0)}px + 位移 ${maxShift.toFixed(0)}px`
+    );
+    log(
+      `OK: 父框只在「自己整棵子树那一段」里滑 —— 五级链各级都在自己的空挡内；` +
+        `树边最长 ${maxShifted.toFixed(0)}px（布局 ${maxLayout.toFixed(0)}px + 最大位移 ${maxShift.toFixed(0)}px 之内）`
+    );
+  }
+
+  // ---- 第一级也走同一条规则（用户 2026-10-10：「包括第一级也是」）----
+  //
+  // 第一级**没有特例**：它的空挡同样是「整棵子树那一段」（递归得到），于是天然覆盖整个内容 ——
+  // 滚到哪儿它都能居中。这里直接把这一点钉住，免得以后有人给根加一条特殊分支。
+  {
+    const rootSlot = slotOf('r0');
+    const visibleIds = Object.keys(boxes).filter((id) => groupOf(id));
+    const minTop = Math.min(...visibleIds.map((id) => boxes[id].y));
+    const maxBottom = Math.max(...visibleIds.map((id) => boxes[id].y + boxes[id].height));
+    assert(
+      Math.abs(rootSlot.top - minTop) <= 0.5 && Math.abs(rootSlot.bottom - maxBottom) <= 0.5,
+      `第一级的空挡应当覆盖整个内容：` +
+        `空挡 ${rootSlot.top.toFixed(1)}~${rootSlot.bottom.toFixed(1)}，内容 ${minTop.toFixed(1)}~${maxBottom.toFixed(1)}`
+    );
+    for (const scrollTop of [0, 300, 600]) {
+      canvasEl.scrollTop = scrollTop;
+      canvasEl.dispatch('scroll', {});
+      assert(
+        Math.abs(centerInViewport('r0') - canvasEl.clientHeight / 2) <= 1,
+        `第一级在 scrollTop=${scrollTop} 时应当居中（中心 ${centerInViewport('r0').toFixed(1)}）`
+      );
+    }
+    log(
+      `OK: 第一级同样只在自己的空挡里滑 —— 它的空挡 = 整棵子树那一段（覆盖内容 ` +
+        `${minTop.toFixed(0)}~${maxBottom.toFixed(0)}），滚到哪儿都能居中`
+    );
+  }
+
+  // 收尾：还原设置与视口尺寸，保证后面延后执行的段落正常
+  sendToWebview({ type: 'settings', settings: { stickyParent: false } });
+  canvasEl.clientHeight = 0;
+  canvasEl.scrollTop = 0;
+}
+
+// ------------------------------------------------ 粘性父框：同一层展开多个（先展开的不能被丢下）
+//
+// 实测反馈：第二级展开 a1 能正常居中，但隔几个同级标签再展开 a5 之后，a1 就不动了。
+// 规则应当是「**所有展开了下一层的父框**都留在中间」—— 同一列里它们不可能同时精确居中，
+// 于是只能一起往中间聚、彼此保住正常行距；先展开的那个绝不能被放回布局原位。
+{
+  const mkNode = (id, depth, parent, children, extra = {}) => ({
+    id,
+    name: id,
+    file: 'x.c',
+    line: 1,
+    direction: 'callers',
+    depth,
+    isCycle: false,
+    children,
+    parent,
+    loaded: false,
+    canExpand: false,
+    kind: 'function',
+    ...extra,
+  });
+  const ids = (prefix, count) => Array.from({ length: count }, (_, index) => `${prefix}${index}`);
+  const A1_KIDS = ids('a1_', 10);
+  const A5_KIDS = ids('a5_', 10);
+  const SIBLINGS = ['a1', 'a2', 'a3', 'a4', 'a5', 'a6'];
+
+  /** both=false：只展开了 a1；true：a1 与 a5 都展开了。 */
+  const nodesOf = (both) => {
+    const nodes = {
+      r0: mkNode('r0', 0, undefined, SIBLINGS, { loaded: true }),
+      a1: mkNode('a1', 1, 'r0', A1_KIDS, { loaded: true }),
+      a2: mkNode('a2', 1, 'r0', [], { canExpand: true }),
+      a3: mkNode('a3', 1, 'r0', [], { canExpand: true }),
+      a4: mkNode('a4', 1, 'r0', [], { canExpand: true }),
+      a5: mkNode('a5', 1, 'r0', both ? A5_KIDS : [], { canExpand: true, loaded: both }),
+      a6: mkNode('a6', 1, 'r0', [], { canExpand: true }),
+    };
+    for (const id of A1_KIDS) {
+      nodes[id] = mkNode(id, 2, 'a1', [], {});
+    }
+    if (both) {
+      for (const id of A5_KIDS) {
+        nodes[id] = mkNode(id, 2, 'a5', [], {});
+      }
+    }
+    return nodes;
+  };
+
+  let boxes = {};
+  const sendBoth = (both) => {
+    const nodes = nodesOf(both);
+    boxes = createLayout(nodes, 'r0').boxes;
+    const edges = Object.values(nodes)
+      .filter((node) => node.parent)
+      .map((node) => ({ id: `e_${node.id}`, from: node.id, to: node.parent }));
+    sendToWebview({
+      type: 'sessionUpdate',
+      session: {
+        id: 'sibling-check',
+        title: '同级展开检查',
+        description: '',
+        direction: 'callers',
+        engineLabel: 'clangd',
+        rootId: 'r0',
+        nodes,
+        edges,
+        boxes,
+        collapsedCount: 0,
+      },
+    });
+  };
+
+  const groupOf = (id) => nodesGroup.children.find((child) => child.getAttribute('data-node') === id);
+  const topOf = (id) => {
+    const group = groupOf(id);
+    if (!group) {
+      return Number.NaN;
+    }
+    return Number(/translate\(([-\d.]+) ([-\d.]+)\)/.exec(group.getAttribute('transform'))[2]);
+  };
+  const viewBoxParts = () => String(svg.getAttribute('viewBox')).split(/\s+/).map(Number);
+  const centerInViewport = (id) =>
+    topOf(id) + (boxes[id]?.height ?? 43) / 2 - viewBoxParts()[1] - Number(canvasEl.scrollTop || 0);
+  const clickExpander = (id, mode) => {
+    const expander = groupOf(id)?.children.find((child) =>
+      String(child.getAttribute('class') || '').startsWith('expander')
+    );
+    assert(expander !== undefined, `${id} 应当有加减号`);
+    assert(
+      String(expander.getAttribute('class')).includes(mode),
+      `${id} 的加减号模式应为 ${mode}，实际 ${expander.getAttribute('class')}`
+    );
+    expander.dispatch('mousedown', { stopPropagation() {}, preventDefault() {} });
+    for (const handler of windowListeners.mouseup ?? []) {
+      handler({});
+    }
+  };
+  /** 同列相邻对（用位移后的实际位置算）。 */
+  const columnPairs = () => {
+    const columns = new Map();
+    for (const id of Object.keys(boxes)) {
+      if (!groupOf(id)) {
+        continue;
+      }
+      const x = Number(/translate\(([-\d.]+)/.exec(groupOf(id).getAttribute('transform'))[1]);
+      const list = columns.get(x) ?? [];
+      list.push({ id, top: topOf(id), bottom: topOf(id) + boxes[id].height });
+      columns.set(x, list);
+    }
+    const pairs = [];
+    for (const list of columns.values()) {
+      list.sort((left, right) => left.top - right.top);
+      for (let index = 1; index < list.length; index += 1) {
+        pairs.push({
+          above: list[index - 1],
+          below: list[index],
+          gap: list[index].top - list[index - 1].bottom,
+        });
+      }
+    }
+    return pairs;
+  };
+  /** 「被钉住」= 要么在视口中央，要么正好贴着自己的空挡边缘（与同列邻居间距 = 12）。 */
+  const isPinned = (id) => {
+    if (Math.abs(centerInViewport(id) - canvasEl.clientHeight / 2) <= 1) {
+      return true;
+    }
+    const touching = columnPairs().filter((pair) => pair.above.id === id || pair.below.id === id);
+    return touching.some((pair) => Math.abs(pair.gap - 12) <= 0.5);
+  };
+  const assertNoOverlap = (where) => {
+    for (const pair of columnPairs()) {
+      assert(
+        pair.gap >= 12 - 0.5,
+        `${where}：${pair.above.id} 与 ${pair.below.id} 间距只有 ${pair.gap.toFixed(1)}px（应 ≥ 12）`
+      );
+    }
+  };
+
+  canvasEl.clientHeight = 300;
+  canvasEl.scrollTop = 0;
+  sendToWebview({ type: 'settings', settings: { stickyParent: true } });
+
+  // ① 只展开 a1：它居中（= 用户说的「可以正常居中」）
+  sendBoth(false);
+  canvasEl.dispatch('scroll', {});
+  assert(
+    Math.abs(centerInViewport('a1') - canvasEl.clientHeight / 2) <= 1,
+    `只展开 a1 时它应当居中（中心 ${centerInViewport('a1').toFixed(1)}）`
+  );
+
+  // ② 再展开隔几个同级标签的 a5：**a1 不能被丢下**
+  clickExpander('a5', 'expand');
+  sendBoth(true);
+  canvasEl.dispatch('scroll', {});
+  assert(isPinned('a1'), '再展开 a5 之后，先展开的 a1 仍应被钉住（在中央或贴着自己的空挡边缘）');
+  assert(
+    Math.abs(topOf('a1') - boxes.a1.y) > 0.5,
+    `a1 应当仍带位移，而不是被放回布局原位（布局 y=${boxes.a1.y}，实际 ${topOf('a1').toFixed(1)}）`
+  );
+  assert(isPinned('a5'), 'a5 也应当被钉住');
+  assert(
+    Math.abs(topOf('a5') - boxes.a5.y) > 0.5,
+    `a5 应当带位移（布局 y=${boxes.a5.y}，实际 ${topOf('a5').toFixed(1)}）`
+  );
+  // 没有展开下一层的同级标签（a2/a3/a4/a6）完全不动 —— 只有「展开了下一层」的父框才会滑
+  for (const id of ['a2', 'a3', 'a4', 'a6']) {
+    assert(
+      Math.abs(topOf(id) - boxes[id].y) <= 0.5,
+      `${id} 没有展开下一层，不该被移动（布局 y=${boxes[id].y}，实际 ${topOf(id).toFixed(1)}）`
+    );
+  }
+  assertNoOverlap('两个同级展开后');
+
+  // ③ 继续往下滚到 a5 能居中的位置：a5 跟着往中间走，a1 顶到自己的空挡边缘后停在那儿
+  //    （注意：scrollTop=0 时 a5 被顶在空挡上边缘 715，中心目标要滚到 ~900 才追上它）
+  const a5TopBefore = topOf('a5');
+  canvasEl.scrollTop = 900;
+  canvasEl.dispatch('scroll', {});
+  assert(
+    Math.abs(centerInViewport('a5') - canvasEl.clientHeight / 2) <= 1,
+    `滚到空挡内之后 a5 应当居中（中心 ${centerInViewport('a5').toFixed(1)}）`
+  );
+  assert(
+    topOf('a5') > a5TopBefore + 100,
+    `滚下去之后 a5 的内容坐标应当跟着下移（实际只动了 ${(topOf('a5') - a5TopBefore).toFixed(1)}）`
+  );
+  assert(isPinned('a1'), '滚下去之后 a1 仍应停在自己的空挡边缘，不能回原位');
+  assertNoOverlap('滚到 a5 居中后');
+
+  log(
+    `OK: 同一层展开多个都留在中间 —— 只展开 a1 时居中；再展开 a5 后 a1 仍被钉住（未回原位），` +
+      `滚下去 a5 接手居中、a1 顶在空挡边缘；同列间距始终 ≥12px`
+  );
+
+  // 收尾：还原设置与视口尺寸
+  sendToWebview({ type: 'settings', settings: { stickyParent: false } });
+  canvasEl.clientHeight = 0;
+  canvasEl.scrollTop = 0;
+}
+
+// ------------------------------------------------ 收起全部 → 展开全部：收起状态必须同步给宿主
+//
+// 用户实测（关掉「显示路径」与「粘性父框」后）：收起全部 → 展开全部，可能只展开到第二级，
+// 第二级的加号点不开。根因是前端改了收起状态却没告诉宿主 —— 坐标是宿主算的，
+// 它按那份集合决定哪些子树不占高度；集合旧了，被它当成「收起」的子树整棵拿不到坐标，
+// 画面上就只剩前两级（渲染时 `!geometry` 的节点会被跳过），加号自然点不开。
+{
+  const mkNode = (id, depth, parent, children, extra = {}) => ({
+    id,
+    name: id,
+    file: 'x.c',
+    line: 1,
+    direction: 'callers',
+    depth,
+    isCycle: false,
+    children,
+    parent,
+    loaded: false,
+    canExpand: true,
+    kind: 'function',
+    ...extra,
+  });
+  // 三层：r0 → a → b（b 是叶子）。a 与 b 都还没加载，所以加号可点。
+  const nodes = {
+    r0: mkNode('r0', 0, undefined, ['a'], { loaded: true }),
+    a: mkNode('a', 1, 'r0', ['b'], { loaded: true, canExpand: false }),
+    b: mkNode('b', 2, 'a', [], { canExpand: true }),
+  };
+  const boxes = createLayout(nodes, 'r0').boxes;
+  const session = {
+    id: 'collapse-sync',
+    title: '收起同步',
+    description: '',
+    direction: 'callers',
+    engineLabel: 'clangd',
+    rootId: 'r0',
+    nodes,
+    edges: [
+      { id: 'e_a', from: 'a', to: 'r0' },
+      { id: 'e_b', from: 'b', to: 'a' },
+    ],
+    boxes,
+    collapsedCount: 1,
+  };
+
+  // 与用户实测一致：两个开关都关掉
+  sendToWebview({
+    type: 'settings',
+    settings: { stickyParent: false, showLocation: false },
+  });
+  sendToWebview({ type: 'sessionUpdate', session });
+  flushFrames();
+
+  // ① 收起全部：必须把「只有根是收起的」下发宿主
+  posted.length = 0;
+  byId.get('btn-collapse-all').dispatch('click', {});
+  flushFrames();
+  const collapseMsg = posted.filter((message) => message.type === 'collapse').pop();
+  assert(
+    collapseMsg !== undefined,
+    '收起全部必须把收起状态下发宿主，否则宿主坐标不更新（用户实测的「只展开到第二级」由此而来）'
+  );
+  assert(
+    collapseMsg.collapsed.length === 1 && collapseMsg.collapsed[0] === 'r0',
+    `收起全部应当只把根标为收起，实际 ${JSON.stringify(collapseMsg.collapsed)}`
+  );
+
+  // ② 展开全部：必须先把收起状态清空并同步，而且要在请求展开之前
+  posted.length = 0;
+  byId.get('btn-expand-all').dispatch('click', {});
+  flushFrames();
+  const clearIndex = posted.findIndex(
+    (message) => message.type === 'collapse' && message.collapsed.length === 0
+  );
+  const expandIndex = posted.findIndex((message) => message.type === 'expandAll');
+  assert(clearIndex >= 0, '展开全部必须先把「已收起」清空并同步给宿主');
+  assert(expandIndex >= 0, '展开全部应当向宿主请求展开');
+  assert(clearIndex < expandIndex, '清空收起状态必须在请求展开之前下发');
+
+  // ③ 宿主补发完整几何后：三级都在画面里，且第三级的上一级（第二级）加号仍可点
+  sendToWebview({ type: 'sessionUpdate', session });
+  flushFrames();
+  const visible = nodesGroup.children.map((group) => String(group.getAttribute('data-node')));
+  assert(
+    visible.includes('b'),
+    `展开全部之后最深一级也应当在画面里，实际可见 ${visible.join(',')}`
+  );
+  posted.length = 0;
+  const groupOf = (id) =>
+    nodesGroup.children.find((child) => child.getAttribute('data-node') === id);
+  // 走真实交互路径点加减号：mousedown 记录 + window mouseup 处理
+  const clickExpander = (id, mode) => {
+    const expander = groupOf(id)?.children.find((child) =>
+      String(child.getAttribute('class') || '').startsWith('expander')
+    );
+    assert(expander !== undefined, `${id} 应当有加减号`);
+    assert(
+      String(expander.getAttribute('class')).includes(mode),
+      `${id} 的加减号模式应为 ${mode}，实际 ${expander.getAttribute('class')}`
+    );
+    expander.dispatch('mousedown', { stopPropagation() {}, preventDefault() {} });
+    for (const handler of windowListeners.mouseup ?? []) {
+      handler({});
+    }
+  };
+  clickExpander('a', 'collapse');
+  clickExpander('a', 'expand');
+  assert(
+    posted.some((message) => message.type === 'expand' || message.type === 'collapse'),
+    `第二级的加号应当能点开（实际发出 ${JSON.stringify(posted.map((m) => m.type))}）`
+  );
+
+  log(
+    'OK: 收起全部 / 展开全部都会把收起状态同步给宿主 —— 展开后最深一级仍在画面里，第二级加号可点'
+  );
+
+  // 收尾：恢复设置与 DOM，供后面延后执行的段落使用
+  sendToWebview({ type: 'settings', settings: { stickyParent: false, showLocation: true } });
+  sendToWebview({ type: 'sessionUpdate', session: { ...session, id: 'collapse-restore' } });
+}
+
+// ------------------------------------------------ 开关：不显示路径时方框只有元素名
+{
+  const mkNode = (id, depth, parent, children, extra = {}) => ({
+    id,
+    name: id,
+    file: 'demo.cpp',
+    line: 1,
+    direction: 'callers',
+    depth,
+    isCycle: false,
+    children,
+    parent,
+    loaded: false,
+    canExpand: false,
+    kind: 'function',
+    ...extra,
+  });
+  const nodes = {
+    r0: mkNode('r0', 0, undefined, ['c0'], { loaded: true }),
+    c0: mkNode('c0', 1, 'r0', [], {
+      loaded: true,
+      name: 'short',
+      // 路径刻意放长：关掉路径后宽度变窄才看得出来
+      file: 'some/very/long/path/to/a/source/file/named/demo.cpp',
+      line: 123,
+    }),
+  };
+  const boxes = createLayout(nodes, 'r0').boxes;
+  const session = {
+    id: 'location-check',
+    title: '路径开关',
+    description: '',
+    direction: 'callers',
+    engineLabel: 'clangd',
+    rootId: 'r0',
+    nodes,
+    edges: [{ id: 'e_c0', from: 'c0', to: 'r0' }],
+    boxes,
+    collapsedCount: 0,
+  };
+  const groupOf = (id) => nodesGroup.children.find((child) => child.getAttribute('data-node') === id);
+  const boxWidthOf = (id) =>
+    Number(
+      groupOf(id)
+        ?.children.find((child) => String(child.getAttribute('class')) === 'box')
+        ?.getAttribute('width')
+    );
+  const boxHeightOf = (id) =>
+    Number(
+      groupOf(id)
+        ?.children.find((child) => String(child.getAttribute('class')) === 'box')
+        ?.getAttribute('height')
+    );
+  const groupEl = (id) => groupOf(id)?.flatten() ?? [];
+  /** 组内某个 class 的元素是否存在 / 它的文本（方框里的「路径:行号」行就是 .loc）。 */
+  const hasClass = (id, cls) => groupEl(id).some((el) => String(el.getAttribute('class')) === cls);
+  const textOfClass = (id, cls) =>
+    String(groupEl(id).find((el) => String(el.getAttribute('class')) === cls)?.textContent ?? '');
+  const attrOfClass = (id, cls, attr) =>
+    Number(groupEl(id).find((el) => String(el.getAttribute('class')) === cls)?.getAttribute(attr));
+
+  const compactBoxes = createLayout(nodes, 'r0', undefined, undefined, false).boxes;
+
+  sendToWebview({ type: 'sessionUpdate', session });
+  flushFrames();
+  assert(
+    hasClass('c0', 'loc') && /demo\.cpp:123/.test(textOfClass('c0', 'loc')),
+    `默认应当显示「文件路径:行号」那一行，实际 .loc=${textOfClass('c0', 'loc')}`
+  );
+  const wideWidth = boxWidthOf('c0');
+  const wideHeight = boxHeightOf('c0');
+
+  // 关掉路径：宿主先下发设置，再按新设置**重排**（真实扩展里 showLocation 会触发 relayout）
+  sendToWebview({ type: 'settings', settings: { showLocation: false } });
+  sendToWebview({
+    type: 'sessionUpdate',
+    session: { ...session, boxes: compactBoxes },
+  });
+  flushFrames();
+  assert(
+    !hasClass('c0', 'loc'),
+    '关掉「显示路径」后不该再有 .loc 那一行（方框里只剩元素名）'
+  );
+  assert(
+    textOfClass('c0', 'name') === 'short',
+    `关掉后元素名应当照常显示，实际 name=${textOfClass('c0', 'name')}`
+  );
+  const narrowWidth = boxWidthOf('c0');
+  const narrowHeight = boxHeightOf('c0');
+  assert(
+    narrowWidth < wideWidth,
+    `关掉路径后方框应当变窄（关前 ${wideWidth}，关后 ${narrowWidth}）`
+  );
+  assert(
+    narrowHeight < wideHeight,
+    `关掉路径后方框应当变矮（关前 ${wideHeight}，关后 ${narrowHeight}）`
+  );
+  // 单行时那一行要**在框里垂直居中**：13px 粗体墨迹约在基线上方 9、下方 3 → 基线 = 框高/2 + 3
+  const nameY = attrOfClass('c0', 'name', 'y');
+  assert(
+    Math.abs(nameY - (narrowHeight / 2 + 3)) <= 0.5,
+    `单行时元素名应当在框里居中（基线 ${nameY}，框高 ${narrowHeight}，应为 ${narrowHeight / 2 + 3}）`
+  );
+  // 图标也要跟着垂直居中（不能还按两行布局钉在 y=5）
+  const iconY = Number(
+    /translate\([-\d.]+ ([-\d.]+)\)/.exec(
+      String(
+        groupOf('c0')?.children.find((child) => String(child.getAttribute('class')).startsWith('kind-icon'))
+          ?.getAttribute('transform')
+      )
+    )?.[1]
+  );
+  assert(
+    Math.abs(iconY - (narrowHeight - 13) / 2) <= 0.5,
+    `单行时符号图标应当在框里居中（图标 y=${iconY}，框高 ${narrowHeight}）`
+  );
+
+  // 再打开：路径回来、宽高都恢复
+  sendToWebview({ type: 'settings', settings: { showLocation: true } });
+  sendToWebview({ type: 'sessionUpdate', session });
+  flushFrames();
+  assert(
+    hasClass('c0', 'loc') &&
+      boxWidthOf('c0') === wideWidth &&
+      boxHeightOf('c0') === wideHeight,
+    `重新打开后应当恢复路径与宽高（宽 ${boxWidthOf('c0')}/${wideWidth}，高 ${boxHeightOf('c0')}/${wideHeight}）`
+  );
+  log(
+    `OK: 「显示路径」开关有效 —— 关掉后只剩元素名、方框 ${wideWidth}×${wideHeight} → ` +
+      `${narrowWidth}×${narrowHeight}px，名字与图标都在框里居中，打开后恢复`
+  );
+
+  // 收尾：换一个新会话，保证后面延后执行的段落仍能在当前 DOM 上数到 ≥2 个加减号
+  sendToWebview({ type: 'sessionUpdate', session: { ...session, id: 'location-restore' } });
+  sendToWebview({ type: 'settings', settings: { stickyParent: false } });
+}
+
+// ------------------------------------------------ 加载遮罩（转圈 + 取消 + 背景模糊）
+//
+// 宏、结构体、变量这类符号要走引用查找（一串语言服务请求），明显比普通函数慢。
+// 解析较久时在画布正中显示遮罩：转圈 + 文案 + 取消，背景模糊；
+// 快查询不显示（延迟 240ms），否则会闪一下。
+{
+  const css = fs.readFileSync(path.join(ROOT, 'src', 'webview', 'graph.css'), 'utf8');
+  assert(
+    /\.busy\s*\{[^}]*backdrop-filter:\s*blur\(/.test(css),
+    '遮罩应当把背景模糊掉（backdrop-filter: blur）'
+  );
+  // 遮罩必须挂在**不滚动**的 #stage 上：挂在 #canvas（滚动容器）里会随内容滚出可视区，
+  // 「正中」也只是内容盒的正中，而不是眼前这块面板的正中。
+  assert(
+    /<div id="stage"[\s\S]*<div id="canvas"[\s\S]*?<\/div>[\s\S]*<div id="busy"/.test(htmlSource),
+    '加载遮罩应当挂在 #canvas 之外的 #stage 上'
+  );
+  assert(
+    /\.stage\s*\{[^}]*position:\s*relative/.test(css),
+    '#stage 必须是定位祖先，遮罩的 inset:0 才会落在不滚动的那一层上'
+  );
+  assert(/\.busy-spinner\s*\{[^}]*animation:\s*busy-spin/.test(css), '遮罩里应当有转圈动画');
+  assert(/@keyframes\s+busy-spin/.test(css), '转圈动画应当有 @keyframes 定义');
+  assert(/\.busy\[hidden\]\s*\{\s*display:\s*none/.test(css), '遮罩应当支持 hidden 隐藏');
+
+  const busyEl = byId.get('busy');
+  const busyLabel = byId.get('busy-label');
+  const cancelButton = byId.get('btn-busy-cancel');
+  assert(busyEl !== undefined, '画布里应当有加载遮罩元素 #busy');
+  assert(busyLabel !== undefined, '遮罩里应当有文案元素 #busy-label');
+  assert(cancelButton !== undefined, '遮罩里应当有「取消」按钮');
+  assert(
+    String(cancelButton.textContent) === '取消',
+    `按钮文案应当是「取消」，实际 ${cancelButton.textContent}`
+  );
+  assert(busyEl.hidden === true, '默认不应显示遮罩');
+
+  // 快查询：busy 立刻结束，延迟没到就不该显示（这是「不闪一下」的关键）
+  sendToWebview({ type: 'busy', busy: true, label: '正在解析被调用关系图…' });
+  sendToWebview({ type: 'busy', busy: false });
+  setTimeout(() => {
+    assert(busyEl.hidden === true, '较快的解析结束后不应留下遮罩');
+
+    // 慢查询：延迟过后显示遮罩，文案来自宿主
+    posted.length = 0;
+    sendToWebview({ type: 'busy', busy: true, label: '正在解析被调用关系图…' });
+    setTimeout(() => {
+      assert(busyEl.hidden === false, '解析较慢时应当在画布正中显示遮罩');
+      assert(
+        String(busyLabel.textContent).includes('正在解析'),
+        `遮罩文案应当是宿主下发的那句，实际 ${busyLabel.textContent}`
+      );
+
+      // 点「取消」：通知宿主并立刻收起遮罩
+      cancelButton.dispatch('click', {});
+      assert(
+        posted.some((message) => message.type === 'cancelResolve'),
+        `点「取消」应当向宿主发 cancelResolve，实际 ${JSON.stringify(posted.map((m) => m.type))}`
+      );
+      assert(busyEl.hidden === true, '点「取消」后遮罩应当立刻收起');
+
+      // 宿主收尾的 busy:false 不应让遮罩又冒出来
+      sendToWebview({ type: 'busy', busy: false });
+      assert(busyEl.hidden === true, '解析结束后遮罩不应再出现');
+      log('OK: 加载遮罩（转圈 + 取消 + 背景模糊）—— 快查询不闪、慢查询显示、可取消');
+    }, 400);
+  }, 400);
+}

@@ -77,6 +77,12 @@ if (fs.existsSync(lockFile)) {
 }
 
 const parsed = JSON.parse(fs.readFileSync(pkgFile, 'utf8'));
+// 回读校验：脚本是靠正则替换 package.json 里**第一个** "version" 的，
+// 位置一旦不对（结构变化、前面出现别的 version 字段）会静默改错 —— 这里必须拦下来。
+if (parsed.version !== target) {
+  console.error(`package.json 版本同步失败：期望 ${target}，实际 ${parsed.version}`);
+  process.exit(1);
+}
 console.log(`version=${parsed.version}`);
 console.log(`displayName=${parsed.displayName}`);
 console.log(`commands=${parsed.contributes.commands.length}`);

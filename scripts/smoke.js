@@ -27,6 +27,10 @@ const captured = {
   statusItems: [],
   /** 剪贴板写入内容（复制命令的断言用）。 */
   clipboard: [],
+  /** 引用查询次数（宏兜底路径的断言用）。 */
+  referenceCalls: 0,
+  /** 文本搜索兜底发起过的模式串。 */
+  textSearches: [],
   /** 高亮装饰（跳转高亮的断言用）。 */
   decorations: [],
   /** 最后一次打开的编辑器桩。 */
@@ -89,7 +93,7 @@ const callersOf = {
   noCaller: [],
 };
 
-/** 每个函数「调用了谁」（用于「显示调用关系」方向）。 */
+/** 每个函数「调用了谁」（用于「调用关系图」方向）。 */
 const calleesOf = {
   isEven: [{ to: 'isOdd', line: 10, text: 'return n == 0 ? 1 : isOdd(n - 1);' }],
   isOdd: [{ to: 'isEven', line: 11, text: 'return n == 0 ? 0 : isEven(n - 1);' }],
@@ -169,7 +173,26 @@ const vscodeStub = {
       this.range = range;
     }
   },
-  SymbolKind: { Method: 5, Function: 11, Constructor: 8 },
+  /** 引用兜底路径会自造根节点（宏、类型、变量这些没有调用层级的符号）。 */
+  CallHierarchyItem: class CallHierarchyItem {
+    constructor(kind, name, detail, uri, range, selectionRange) {
+      this.kind = kind;
+      this.name = name;
+      this.detail = detail;
+      this.uri = uri;
+      this.range = range;
+      this.selectionRange = selectionRange;
+      this.tags = [];
+    }
+  },
+  SymbolKind: {
+    Method: 5,
+    Function: 11,
+    Constructor: 8,
+    // references.ts 会用到：对象式宏 → Constant；抓不到符号时兜底 → Object
+    Constant: 13,
+    Object: 18,
+  },
   /** 跳转高亮会用 ThemeColor 指定底色 */
   ThemeColor: class ThemeColor {
     constructor(id) {
@@ -222,6 +245,12 @@ const vscodeStub = {
       }
       if (id === 'vscode.prepareCallHierarchy') {
         captured.prepareCalls += 1;
+        // 宏场景：宏定义处（以及任何不是引用点的位置）没有调用层级；
+        // 引用点位置给出**所在函数** —— 这正是引用兜底路径要的那一层。
+        if (referenceScenario !== 'call') {
+          const owner = macroOwnerByLine[args[1]?.line];
+          return owner ? [items[owner]] : [];
+        }
         return [items[currentRootName]];
       }
       if (id === 'vscode.provideIncomingCalls') {
@@ -235,6 +264,16 @@ const vscodeStub = {
       }
       if (id === 'vscode.executeReferenceProvider') {
         captured.referenceCalls += 1;
+        // 场景一：语言服务不给引用（退到文本搜索）；其余按宏引用返回
+        if (referenceScenario === 'macroText') {
+          return [];
+        }
+        if (referenceScenario === 'macro') {
+          return [
+            { uri: vscodeStub.Uri.file('G:\\proj\\macro.cpp'), range: ranges.make(5, 10, 5, 14) },
+            { uri: vscodeStub.Uri.file('G:\\proj\\macro.cpp'), range: ranges.make(10, 10, 10, 14) },
+          ];
+        }
         return [
           // 宏在 demo.cpp 里的三处使用点
           { uri: vscodeStub.Uri.file('G:\\proj\\demo.cpp'), range: ranges.make(19, 4, 19, 20) },
@@ -370,6 +409,13 @@ const vscodeStub = {
       if (arg && typeof arg === 'object' && 'language' in arg) {
         return Promise.resolve({ getText: () => String(arg.content) });
       }
+      if (arg && typeof arg.fsPath === 'string' && arg.fsPath.endsWith('macro.cpp')) {
+        return Promise.resolve({
+          uri: arg,
+          lineCount: macroLines.length,
+          lineAt: (line) => ({ text: macroLines[line] ?? '', lineNumber: line }),
+        });
+      }
       return Promise.resolve({
         uri: arg,
         lineCount: 100,
@@ -378,6 +424,18 @@ const vscodeStub = {
           lineNumber: line,
         }),
       });
+    },
+    /** 文本搜索兜底（语言服务不给宏引用时才会走到）。 */
+    findTextInFiles: (query, options, callback) => {
+      captured.textSearches.push(String(query?.pattern ?? ''));
+      callback({
+        uri: vscodeStub.Uri.file('G:\\proj\\macro.cpp'),
+        matches: [
+          { range: ranges.make(5, 10, 5, 14) },
+          { range: ranges.make(10, 10, 10, 14) },
+        ],
+      });
+      return Promise.resolve({ limitHit: false });
     },
     fs: {
       createDirectory: () => Promise.resolve(),
@@ -406,6 +464,42 @@ ranges = {
 };
 
 let currentRootName = 'leafAdd';
+
+/**
+ * 宏夹具：`#define MAX3(a, b, c) …` 在 compute 与 main 里各用了一次。
+ * 宏没有调用层级 —— 语言服务对宏定义返回空，只能靠引用查找兜底（见 references.ts）。
+ */
+const macroLines = [
+  '#include <stdio.h>',
+  '',
+  '#define MAX3(a, b, c) ((a) > (b) ? (a) : (b))',
+  '',
+  'int compute(int x) {',
+  '  int m = MAX3(x, 1, 2);',
+  '  return m;',
+  '}',
+  '',
+  'int main() {',
+  '  int n = MAX3(3, 4, 5);',
+  '  return compute(n);',
+  '}',
+];
+/** 引用点行号 → 所在函数（在引用点位置问 prepareCallHierarchy 应当给出这个函数）。 */
+const macroOwnerByLine = { 5: 'compute', 10: 'main' };
+/** 引用场景：'call' = 普通调用层级；'macro' = 语言服务给宏引用；'macroText' = 只给文本搜索。 */
+let referenceScenario = 'call';
+
+function makeMacroEditor(line, character) {
+  return {
+    document: {
+      languageId: 'cpp',
+      uri: vscodeStub.Uri.file('G:\\proj\\macro.cpp'),
+      lineCount: macroLines.length,
+      lineAt: (index) => ({ text: macroLines[index] ?? '', lineNumber: index }),
+    },
+    selection: { active: new Position(line, character) },
+  };
+}
 
 // 夹具必须在扩展被 require 之前准备好（激活时的引擎探测就会调用 prepareCallHierarchy）。
 wireCalls();
@@ -873,6 +967,48 @@ async function main() {
     `诊断: 同一标签连点第二次 → 节点 ${Object.keys(afterThird.nodes).length}（不减少即正确）`
   );
 
+  // 回归（用户 2026-10-10 实测）：收起全部 → 展开全部之后，宿主不得留着旧的「已收起」集合。
+  // 宿主按那份集合算坐标，旧集合会让被当成收起的子树整棵没有坐标 ——
+  // 前端渲染时 `!geometry` 的节点会被跳过，画面上就只剩前两级、第二级的加号点不开。
+  {
+    currentRootName = 'leafAdd';
+    await registered.get('cppCallGraph.showCallers')();
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    const fresh = lastSessionPayload();
+    fake.send({ type: 'expandAll', sessionId: fresh.id });
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const expanded = lastSessionPayload();
+    const middle = Object.values(expanded.nodes).find(
+      (node) => node.name === 'compute' && node.children.length > 0
+    );
+    assert(middle !== undefined, '夹具里应当有一个带子节点的中间节点（compute）');
+
+    // 手动收起它：前端会把这个集合下发宿主
+    fake.send({ type: 'collapse', sessionId: expanded.id, collapsed: [middle.id] });
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    const afterCollapse = lastSessionPayload();
+    assert(
+      middle.children.some((id) => afterCollapse.boxes[id] === undefined),
+      '收起一个节点后，宿主的布局必须不再给它的子节点坐标（这是下面断言的前提）'
+    );
+
+    // 「收起全部 → 展开全部」：前端会先清空收起状态（collapsed: []），再请求展开
+    fake.send({ type: 'collapse', sessionId: expanded.id, collapsed: [] });
+    fake.send({ type: 'expandAll', sessionId: expanded.id });
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const afterExpandAll = lastSessionPayload();
+    const missing = Object.keys(afterExpandAll.nodes).filter(
+      (id) => afterExpandAll.boxes[id] === undefined
+    );
+    assert(
+      missing.length === 0,
+      `展开全部之后每个节点都必须有坐标（宿主不得留着旧的收起集合），缺失 ${missing.join(', ') || '（无）'}`
+    );
+    console.log(
+      `诊断: 收起全部 → 展开全部后坐标完整（${Object.keys(afterExpandAll.nodes).length} 个节点，无一缺失）`
+    );
+  }
+
   // 关键回归：宿主不传 progress 对象时，「展开全部」也必须能跑完。
   // 曾经因为直接调 progress.report(...) 而在第一轮就抛错，
   // 表现为「点了没反应」——这是用户实际报过的问题。
@@ -958,6 +1094,84 @@ async function main() {
       '「关闭全部标签」后应当把整个「调用关系图」视图收起来（hasSessions=false）'
     );
     console.log('诊断: 关闭全部标签 → 标签清空且视图收起');
+  }
+
+  // 12) 宏：没有调用层级 → 走引用查找（只有「被调用关系图」这一侧有意义）
+  {
+    vscodeStub.window.activeTextEditor = makeMacroEditor(2, 9);
+    referenceScenario = 'macro';
+    currentRootName = 'MAX3';
+    await registered.get('cppCallGraph.showCallers')();
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    const payload = lastSessionPayload();
+    assert(payload !== undefined, '宏的「被调用关系图」应当新建标签页');
+    assert(payload.title === 'MAX3', `标签标题应当是宏名，实际 ${JSON.stringify(payload.title)}`);
+    assert(payload.direction === 'callers', '宏走的是被调用关系方向');
+    const rootNode = payload.nodes[payload.rootId];
+    assert(rootNode !== undefined, '宏的根节点应当存在');
+    assert(
+      rootNode.kind === 'function',
+      `函数式宏应当与函数同款图标（kind=${rootNode.kind}）`
+    );
+    const kids = Object.values(payload.nodes).filter((node) => node.depth === 1);
+    assert(kids.length === 2, `应当有两个引用者（compute / main），实际 ${kids.length}`);
+    assert(
+      kids.map((node) => node.name).sort().join(',') === 'compute,main',
+      `引用者应当是 compute 与 main，实际 ${kids.map((node) => node.name).join(',')}`
+    );
+    assert(
+      kids.every((node) => node.callSite && typeof node.callSite.line === 'number'),
+      '引用者应当带上引用发生的行号'
+    );
+    assert(
+      kids.some((node) => node.loaded === false),
+      '引用者是普通函数：应当仍标记为可继续展开（下面照旧走调用层级）'
+    );
+    console.log(
+      `诊断: 宏 MAX3 → 引用查找得到 ${kids.length} 个引用者（${kids
+        .map((node) => `${node.name}@${node.callSite.line}`)
+        .join(', ')}），来源 ${payload.engineLabel}`
+    );
+
+    // 13) 语言服务不给引用时退回文本搜索，并把来源标注出来
+    referenceScenario = 'macroText';
+    await registered.get('cppCallGraph.showCallers')();
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const textPayload = lastSessionPayload();
+    assert(textPayload !== undefined, '文本搜索兜底也应当建出标签页');
+    assert(
+      String(textPayload.engineLabel ?? '').includes('文本搜索'),
+      `来源应当标注为文本搜索，实际 ${textPayload.engineLabel}`
+    );
+    assert(captured.textSearches.length >= 1, '应当发起过文本搜索');
+
+    referenceScenario = 'call';
+    vscodeStub.window.activeTextEditor = editor;
+    console.log(
+      `OK: 宏（无调用层级）改走引用查找 —— 根 ${payload.title}，第一层是引用点所在的函数；` +
+        `语言服务无引用时退到文本搜索并标注来源`
+    );
+  }
+
+  // 14) 加载遮罩的宿主侧信号：一次查询应当「开始时 busy=true、结束时 busy=false」
+  {
+    captured.posted.length = 0;
+    currentRootName = 'leafAdd';
+    await registered.get('cppCallGraph.showCallers')();
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const busyFlags = captured.posted
+      .filter((message) => message.type === 'busy')
+      .map((message) => message.busy);
+    assert(
+      busyFlags.length >= 2 && busyFlags[0] === true && busyFlags[busyFlags.length - 1] === false,
+      `查询应当以 busy=true 开始、busy=false 结束，实际 ${JSON.stringify(busyFlags)}`
+    );
+    // 「取消」在没有进行中的解析时也必须安全（只置位，不抛错）
+    fake.send({ type: 'cancelResolve' });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    console.log(`诊断: 加载遮罩的宿主侧信号 ${JSON.stringify(busyFlags)}`);
+    console.log('OK: 慢查询期间 webview 会收到 busy 信号，「取消」消息安全');
   }
 
   console.log('--- 引擎探测 ---');

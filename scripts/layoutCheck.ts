@@ -2,7 +2,7 @@
  * 图布局的几何验证：列方向、同行不重叠、父节点垂直居中、连线端点顺序。
  * 单独运行：node scripts/layoutCheck.js（由 npm run smoke 一并构建执行）
  */
-import { GraphNode, collectEdges, createLayout } from '../src/hierarchy/graphLayout';
+import { GraphNode, collectEdges, createLayout, estimateBoxWidth } from '../src/hierarchy/graphLayout';
 
 function node(
   id: string,
@@ -158,6 +158,95 @@ export function report(): string[] {
           `方框会越过列边界并互相重叠（表现为箭头被盖住）`
       );
     }
+  }
+
+  // ---- 收起的子树不再占高度（否则同级之间会永远留一段「空挡」）----
+  // 用户 2026-10-10 实测反馈：第二级展开第三级后有大空挡，把第三级折叠后空挡还在。
+  // 原因是折叠只在 webview 本地生效，宿主仍按「子树已展开」算高度。现在 webview 会把
+  // 收起集合下发，宿主用 createLayout(..., collapsed) 重算。
+  {
+    const nodes: Record<string, GraphNode> = {
+      root: node('root', 'callers', 0, ['a', 'b']),
+      a: node('a', 'callers', 1, ['a1', 'a2', 'a3'], 'root'),
+      a1: node('a1', 'callers', 2, [], 'a'),
+      a2: node('a2', 'callers', 2, [], 'a'),
+      a3: node('a3', 'callers', 2, [], 'a'),
+      b: node('b', 'callers', 1, [], 'root'),
+    };
+    const full = createLayout(nodes, 'root');
+    const folded = createLayout(nodes, 'root', undefined, new Set(['a']));
+    if (folded.boxes.a1 || folded.boxes.a2 || folded.boxes.a3) {
+      throw new Error('被收起的子树不该拿到坐标（它已经不占了，留着坐标就会撑出空挡）');
+    }
+    if (!(folded.boxes.b.y < full.boxes.b.y)) {
+      throw new Error(
+        `收起 a 之后 b 应当上移、把空挡收掉：折叠后 b.y=${folded.boxes.b.y} vs 展开时 ${full.boxes.b.y}`
+      );
+    }
+    // 收起后 a 自己变成叶子，于是与 b 之间正好是正常行距
+    const gap = folded.boxes.b.y - (folded.boxes.a.y + folded.boxes.a.height);
+    if (Math.abs(gap - 12) > 0.001) {
+      throw new Error(`收起 a 之后 a 与 b 之间应当是正常行距 12px，实际 ${gap}`);
+    }
+    lines.push(
+      `收起重排: b.y ${full.boxes.b.y} → ${folded.boxes.b.y}（空挡收掉 ${(full.boxes.b.y - folded.boxes.b.y).toFixed(0)}px）`
+    );
+  }
+
+  // ---- 「不显示路径」开关：宿主的估宽必须跟着变小 ----
+  //
+  // webview 会把**实测宽度**报回来，宿主优先用它；但第一帧还没有实测宽度，
+  // 靠 estimateBoxWidth 估。关掉路径时如果还按带路径的宽度估，列位置会先宽后窄地跳一下。
+  {
+    const long: GraphNode = {
+      ...node('longpath', 'callers', 1, [], 'root'),
+      name: 'f',
+      file: 'some/very/long/path/to/a/source/file/named/demo.cpp',
+      line: 123,
+    };
+    const withLoc = estimateBoxWidth(long, true);
+    const withoutLoc = estimateBoxWidth(long, false);
+    if (!(withoutLoc < withLoc)) {
+      throw new Error(
+        `关掉「显示路径」时估宽应当变小：带路径 ${withLoc} vs 不带 ${withoutLoc}`
+      );
+    }
+    // 只剩名字时，宽度应贴近「名字宽 + 加减号预留」这一档，而不是路径那一档
+    const nameOnly = estimateBoxWidth({ ...long, name: 'a'.repeat(40) }, false);
+    if (nameOnly <= withoutLoc) {
+      throw new Error(`关掉路径后宽度应当由名字决定（长名 ${nameOnly} 应当比短名 ${withoutLoc} 宽）`);
+    }
+    lines.push(`路径开关估宽: ${withLoc} → ${withoutLoc}（长名时 ${nameOnly}）`);
+
+    // 方框**高度**也要跟着变：显示路径时两行（43），关掉后单行（26）——
+    // 并且整幅内容的高度要跟着缩，否则滚动范围里会留一片空白。
+    const tall: Record<string, GraphNode> = {
+      root: node('root', 'callers', 0, ['a', 'b']),
+      a: node('a', 'callers', 1, [], 'root'),
+      b: node('b', 'callers', 1, [], 'root'),
+    };
+    const twoLine = createLayout(tall, 'root');
+    const oneLine = createLayout(tall, 'root', undefined, undefined, false);
+    if (!(oneLine.boxes.root.height < twoLine.boxes.root.height)) {
+      throw new Error(
+        `关掉路径后方框应当变矮：两行 ${twoLine.boxes.root.height} vs 单行 ${oneLine.boxes.root.height}`
+      );
+    }
+    if (!(oneLine.height < twoLine.height)) {
+      throw new Error(
+        `关掉路径后整幅内容应当变矮：两行 ${twoLine.height} vs 单行 ${oneLine.height}`
+      );
+    }
+    // 单行的两个方框之间仍是正常行距（高度变了，间距不能被吃掉）
+    const compactGap =
+      oneLine.boxes.b.y - (oneLine.boxes.a.y + oneLine.boxes.a.height);
+    if (Math.abs(compactGap - 12) > 0.001) {
+      throw new Error(`单行布局里同级之间仍应是 12px 行距，实际 ${compactGap}`);
+    }
+    lines.push(
+      `路径开关框高: ${twoLine.boxes.root.height} → ${oneLine.boxes.root.height}` +
+        `（内容高 ${twoLine.height} → ${oneLine.height}）`
+    );
   }
 
   return lines;

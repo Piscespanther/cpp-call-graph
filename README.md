@@ -6,8 +6,8 @@
 
 扩展通过编辑器右键菜单提供两个查询命令：
 
-- **显示被调用关系** —— 查询谁调用了当前函数
-- **显示调用关系** —— 查询当前函数调用了谁
+- **被调用关系图** —— 查询当前函数的调用者
+- **调用关系图** —— 查询当前函数所调用的函数
 
 每次查询在面板中新建一个标签页，各标签页可独立关闭；关闭最后一个标签页时，面板视图自动收起。
 
@@ -48,3 +48,5 @@ code --install-extension .\cpp-call-graph-<版本>.vsix
 | `cppCallGraph.maxChildrenPerNode` | `200`  | 同一层级最多显示的结果数量                         |
 | `cppCallGraph.autoReveal`         | `true` | 双击方框时是否打开文件并定位                       |
 | `cppCallGraph.showEngineWarning`  | `true` | 是否提示两个语言服务同时可用                       |
+| `cppCallGraph.stickyParent`       | `true` | 纵向滚动时是否把第一级方框钉在窗口垂直中央          |
+| `cppCallGraph.showLocation`       | `true` | 方框里是否显示「文件路径:行号」那一行（关闭后只剩元素名，方框变窄变矮） |

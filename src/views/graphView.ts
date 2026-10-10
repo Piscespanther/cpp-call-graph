@@ -1,7 +1,7 @@
 /**
  * 方案 B 的宿主侧：底部面板里的 WebviewView 承载所有调用关系标签页。
  *
- * - 每次「显示被调用关系 / 显示调用关系」产生一个 CallSession，对应 webview 里的一个标签页；
+ * - 每次「被调用关系图 / 调用关系图」产生一个 CallSession，对应 webview 里的一个标签页；
  * - 标签可以逐个关闭；全部关闭后把整个面板视图一起收起来；
  * - 布局在宿主侧算（graphLayout），webview 只负责画与交互。
  *
@@ -25,6 +25,8 @@ const CONTEXT_KEY = 'cppCallGraph.hasSessions';
 const STORAGE_KEY = 'cppCallGraph.sessions';
 /** 跳转后高亮停留时长（毫秒）。够看清位置，又不至于挡视线。 */
 const FLASH_MS = 1200;
+/** 持久化合流窗口（毫秒）：连续展开时只在停下来之后写一次快照。 */
+const PERSIST_DELAY_MS = 400;
 /** 「展开全部」的层数上限与节点总量上限（防止在巨大工程上拖死语言服务）。 */
 const MAX_EXPAND_ROUNDS = 5;
 const MAX_EXPAND_NODES = 800;
@@ -54,9 +56,16 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
   private readonly sessions: CallSession[] = [];
   private activeId?: string;
   private engineLabel = '';
+  /**
+   * 当前正在进行的「可能较慢」的解析（`beginResolve()` 建立，`endResolve()` 清除）。
+   * token 用来让过期的取消请求失效，cancelled 由 webview 的「取消」按钮置位。
+   */
+  private busy: { token: number; cancelled: boolean } | undefined;
   /** 跳转后短暂高亮用的装饰与定时器（同一时刻只保留一个）。 */
   private flashDecoration?: vscode.TextEditorDecorationType;
   private flashTimer?: ReturnType<typeof setTimeout>;
+  /** 待写的持久化快照（合并连续展开，见 schedulePersist）。 */
+  private persistTimer?: ReturnType<typeof setTimeout>;
   /** 每个会话里用户最后选中的节点（供复制命令使用）。 */
   private readonly selectedIds = new Map<string, string>();
   /**
@@ -67,6 +76,15 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
    * 列间距才严格等于 COLUMN_GAP。
    */
   private readonly measuredWidths = new Map<string, Map<string, number>>();
+
+  /**
+   * 每个标签里**被收起**的节点（webview 每次改变收起状态都会整份下发）。
+   *
+   * 为什么宿主必须知道：坐标是宿主算的。收起的子树如果照样占高度，同级的兄弟之间
+   * 就会一直留着一段空荡荡的「空挡」——用户 2026-10-10 实测反馈：
+   * 把第三级折叠之后，第二级的空挡还在。
+   */
+  private readonly collapsedNodes = new Map<string, Set<string>>();
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -85,6 +103,12 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
     }
     this.flashDecoration?.dispose();
     this.flashDecoration = undefined;
+    // 还有没写盘的快照：停用前补写一次，否则最后几次展开会丢
+    if (this.persistTimer) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = undefined;
+      void this.persist();
+    }
   }
 
   // ---------------------------------------------------------- 会话管理
@@ -169,14 +193,21 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
     await this.persist();
   }
 
+  /** 忘掉某个会话的所有按 id 索引的缓存（关闭标签时统一走这里）。 */
+  private forgetSession(id: string): void {
+    this.measuredWidths.delete(id);
+    this.collapsedNodes.delete(id);
+    this.selectedIds.delete(id);
+  }
+
   closeSession(id: string): void {
     const index = this.sessions.findIndex((session) => session.id === id);
     if (index < 0) {
       return;
     }
     this.sessions.splice(index, 1);
-    // 一并清掉该会话的实测宽度缓存，避免长期占用
-    this.measuredWidths.delete(id);
+    // 一并清掉该会话的缓存，避免长期占用（也免得恢复同名会话时套用旧状态）
+    this.forgetSession(id);
     if (this.activeId === id) {
       const next = this.sessions[Math.min(index, this.sessions.length - 1)];
       this.activeId = next?.id;
@@ -197,7 +228,10 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
   closeAll(): void {
     this.sessions.length = 0;
     this.activeId = undefined;
+    // 三份按会话 id 索引的表都要清（曾经只清了实测宽度）
     this.measuredWidths.clear();
+    this.collapsedNodes.clear();
+    this.selectedIds.clear();
     this.postSummaries();
     void this.setViewVisible(false);
     logInfo('已关闭全部标签，收起面板视图');
@@ -338,6 +372,23 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
         await this.expandAll(message.sessionId);
         break;
       }
+      case 'collapse': {
+        // 收起状态变了：记下来并重新布局（收起的子树不占高度，兄弟之间的空挡随之收掉）
+        this.collapsedNodes.set(message.sessionId, new Set(message.collapsed));
+        const session = this.sessions.find((item) => item.id === message.sessionId);
+        if (session) {
+          this.postSession(session);
+        }
+        break;
+      }
+      case 'cancelResolve': {
+        // 用户在加载遮罩上点了「取消」：让正在进行的多步解析尽快收尾
+        if (this.busy) {
+          this.busy.cancelled = true;
+          logInfo('收到「取消」：停止当前解析。');
+        }
+        break;
+      }
       case 'openLocation': {
         await this.openLocation(message.sessionId, message.nodeId);
         break;
@@ -370,11 +421,13 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
         if (previous && sameWidths(previous, next)) {
           break;
         }
-        this.measuredWidths.set(message.sessionId, next);
+        // 先确认会话还在，再落缓存 —— 否则已关闭的会话 id 也会留下一条永不清理的条目
         const session = this.getSession(message.sessionId);
-        if (session) {
-          this.postSession(session);
+        if (!session) {
+          break;
         }
+        this.measuredWidths.set(message.sessionId, next);
+        this.postSession(session);
         break;
       }
       case 'copyTabText': {
@@ -419,7 +472,8 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
       this.onError(`展开调用关系失败：${error instanceof Error ? error.message : String(error)}`);
     }
     this.postSession(session);
-    await this.persist();
+    // 每次展开都全量序列化所有会话是明显的开销，这里合并成一次写（停下 400ms 后落盘）
+    this.schedulePersist();
   }
 
   /** 反复展开未展开的节点，最多两轮，避免在大工程上一次拉爆。 */
@@ -490,6 +544,8 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
     const session = this.getSession(sessionId);
     const item = session?.item(nodeId);
     if (!item) {
+      // 静默返回会让「双击没反应」变成无迹可查：恢复出来的旧快照可能缺 item
+      logWarn(`跳转失败：找不到节点 ${nodeId} 的语言服务项（会话 ${sessionId}）。`);
       return;
     }
     // 记录「当前元素」，供「复制元素 / 复制地址」使用（无论 autoReveal 是否开启）
@@ -532,7 +588,11 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
       this.flashTimer = undefined;
     }
     if (this.flashDecoration) {
-      editor.setDecorations(this.flashDecoration, []);
+      // ⚠️ 必须 dispose 而不是只对当前 editor 清空：setDecorations 只作用于传入的 editor，
+      // 上一次跳到别的文件时留下的装饰挂在那个 editor 上，只清当前这个会让它永久留在
+      // 先前文件里；而且旧 type 的引用被覆盖后再也没人 dispose 它（每次跳转泄漏一个）。
+      this.flashDecoration.dispose();
+      this.flashDecoration = undefined;
     }
 
     const decoration = vscode.window.createTextEditorDecorationType({
@@ -555,6 +615,91 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
 
   // ---------------------------------------------------------- 消息下发
 
+  /**
+   * 下发给 webview 的设置项。
+   *
+   * webview 读不到 VS Code 的设置，只能由宿主读好再随消息送过去。
+   * ⚠️ 新增设置项时，**三处要一起改**：`package.json` 的 `configuration`、
+   * 这里的方法、以及 `README.md` 的设置表（工作区规则里明写了这条）。
+   */
+  private settingsPayload(): { stickyParent: boolean; showLocation: boolean } {
+    const config = vscode.workspace.getConfiguration('cppCallGraph');
+    return {
+      stickyParent: config.get<boolean>('stickyParent', true),
+      showLocation: config.get<boolean>('showLocation', true),
+    };
+  }
+
+  /**
+   * 开始一次「可能较慢」的解析：让 webview 在延迟一小会儿后显示加载遮罩
+   * （转圈 + 取消 + 背景模糊）。
+   *
+   * 返回的句柄用来查询是否已被用户取消 —— 引用查找是一串语言服务请求，
+   * 每个请求之间都可以检查一次，于是「取消」是真的能停下，而不是只把遮罩藏起来。
+   * ⚠️ 必须把句柄里的 `token` 原样交给 `endResolve(token)`（放在 finally 里），
+   * 否则遮罩会一直挂着、而且关错别人的窗口。
+   */
+  beginResolve(label: string): { token: number; isCancelled: () => boolean } {
+    const token = (this.busy?.token ?? 0) + 1;
+    this.busy = { token, cancelled: false };
+    void this.view?.webview.postMessage({ type: 'busy', busy: true, label });
+    return {
+      token,
+      // ⚠️ 两种「已结束」要区分开：
+      //   · 被别人顶掉（`this.busy.token !== token`）→ 视为已取消，让旧的那次尽快收尾；
+      //   · 自己的窗口已经正常结束（`this.busy === undefined`）→ **不算取消**，
+      //     否则 `endResolve()` 之后随手再判一次就会误判成「用户点了取消」而中止流程。
+      isCancelled: () =>
+        this.busy !== undefined && (this.busy.token !== token || this.busy.cancelled),
+    };
+  }
+
+  /**
+   * 结束一次解析。
+   *
+   * ⚠️ 必须校验 token：命令是可以重入的（用户连点两次右键菜单），先开始的那一次结束时
+   * 不能把后开始的那一次的 busy 一起清掉 —— 否则后一次会被判成「已取消」而静默不出图，
+   * 遮罩也会提前消失、取消按钮随之失效。
+   */
+  endResolve(token: number): void {
+    if (this.busy?.token !== token) {
+      return;
+    }
+    this.busy = undefined;
+    void this.view?.webview.postMessage({ type: 'busy', busy: false });
+  }
+
+  /** 换一句遮罩文案（解析进入下一阶段时用，例如从「解析」变成「查找引用」）。 */
+  setResolveLabel(label: string): void {
+    if (!this.busy) {
+      return;
+    }
+    void this.view?.webview.postMessage({ type: 'busy', busy: true, label });
+  }
+
+  /**
+   * 设置变了：把 webview 需要的那几项重新下发一次。
+   *
+   * @param relayout 这个设置是否影响**布局几何**（`showLocation` 会影响方框高度）。
+   *   影响的话只下发设置是不够的 —— 坐标是宿主算的，webview 手里还是旧盒子（高度 43），
+   *   方框不会变矮。所以要把每个会话都按新设置重排一遍再发过去。
+   */
+  postSettings(relayout = false): void {
+    if (!this.view) {
+      return;
+    }
+    const settings = this.settingsPayload();
+    void this.view.webview.postMessage({ type: 'settings', settings }).then(
+      (ok) => logInfo(`设置已下发：${JSON.stringify(settings)}，postMessage=${ok}`),
+      (error) => logError('设置下发失败', error)
+    );
+    if (relayout) {
+      for (const session of this.sessions) {
+        this.postSession(session);
+      }
+    }
+  }
+
   /** 全量同步：标签摘要 + 当前活动会话的图。 */
   private postInit(): void {
     if (!this.view) {
@@ -575,6 +720,7 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
         sessions: payloads,
         summaries,
         activeId: active ? active.id : '',
+        settings: this.settingsPayload(),
       })
       .then(
         (ok) => logInfo(`postInit 已下发：${summaries.length} 个标签，postMessage=${ok}`),
@@ -585,6 +731,13 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
   private postSession(session: CallSession): void {
     if (!this.view) {
       logWarn('postSession：视图对象还不存在，跳过一次同步');
+      return;
+    }
+    // ⚠️ 必须校验归属：展开/展开全部都是 await 之后才回到这里，期间用户可能已经关掉该标签。
+    // 不校验的话会下发一个摘要里已不存在的会话，前端会把它当成新会话重新插回标签栏
+    // （表现是「关不掉的标签」）。
+    if (!this.sessions.includes(session)) {
+      logInfo(`postSession：会话「${session.title}」已被关闭，丢弃这次下发。`);
       return;
     }
     let payload: SessionPayload;
@@ -644,7 +797,13 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
     const { nodes, edges } = session.graph();
     // 用 webview 上一帧回传的实测宽度排布列位置；没有时 createLayout 自己估宽。
     const measured = this.measuredWidths.get(session.id);
-    const layout = createLayout(nodes, session.rootId, measured);
+    const layout = createLayout(
+      nodes,
+      session.rootId,
+      measured,
+      this.collapsedNodes.get(session.id),
+      this.settingsPayload().showLocation
+    );
     const payloadNodes: SessionPayload['nodes'] = {};
     for (const [id, node] of Object.entries(nodes)) {
       payloadNodes[id] = {
@@ -668,11 +827,33 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
 
   // ---------------------------------------------------------- 持久化
 
+  /**
+   * 写一次持久化快照。
+   *
+   * 每次展开都会调用它，而它要把**所有**会话全量序列化，多标签大图上是明显的同步开销。
+   * 所以热路径走 `schedulePersist()`（合并成一次写），只有关闭标签/新增标签这类
+   * 低频且不该丢的操作才直接 `persist()`。
+   */
   private async persist(): Promise<void> {
+    if (this.persistTimer) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = undefined;
+    }
     await this.context.workspaceState.update(
       STORAGE_KEY,
       this.sessions.map((session) => session.serialize())
     );
+  }
+
+  /** 合并式持久化：连续展开多个节点只在停下来之后写一次。 */
+  private schedulePersist(): void {
+    if (this.persistTimer) {
+      return;
+    }
+    this.persistTimer = setTimeout(() => {
+      this.persistTimer = undefined;
+      void this.persist();
+    }, PERSIST_DELAY_MS);
   }
 
   private restore(): void {
@@ -723,9 +904,11 @@ type WebviewMessage =
   | { type: 'closeAllTabs' }
   | { type: 'expand'; sessionId: string; nodeId: string }
   | { type: 'expandAll'; sessionId: string }
+  | { type: 'collapse'; sessionId: string; collapsed: string[] }
   | { type: 'openLocation'; sessionId: string; nodeId: string }
   | { type: 'selectNode'; sessionId: string; nodeId: string }
   | { type: 'openSettings' }
+  | { type: 'cancelResolve' }
   | { type: 'copyTabText'; sessionId: string }
   | { type: 'reportWidths'; sessionId: string; widths: Array<{ id: string; width: number }> }
   | { type: 'copyNodeName'; sessionId: string; nodeId: string }

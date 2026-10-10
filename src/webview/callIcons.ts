@@ -41,7 +41,7 @@ export function directionCodicon(direction: CallDirectionLike): string {
 
 /** 方向对应的悬停文案。 */
 export function directionTitle(direction: CallDirectionLike): string {
-  return direction === 'callers' ? '被调用关系（谁调用了它）' : '调用关系（它调用了谁）';
+  return direction === 'callers' ? '被调用关系（该函数的调用者）' : '调用关系（该函数调用的函数）';
 }
 
 /**
