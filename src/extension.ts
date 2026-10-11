@@ -18,25 +18,30 @@
  */
 import * as vscode from 'vscode';
 import {
-  EngineChoice,
   EngineLabel,
+  badgeFor,
   clangdExecutable,
   describeEngine,
+  engineProfiles,
   explainUnavailable,
   hasCompileDatabase,
   invalidateClangdCache,
+  isExtensionActiveOrInstalled,
+  isProfileAvailable,
   isSupportedLanguage,
   lastPrepareDiagnostic,
   listAvailableEngines,
+  matchesProfile,
   pickByChoice,
+  pickPolicy,
   preferredEngine,
   probeCalls,
   probeEngines,
   probePosition,
   resolveAt,
-  resolveEngineChoice,
+  selectedProfile,
 } from './hierarchy/callHierarchy';
-import { CallSession } from './hierarchy/session';
+import { CallSession, baseKeyOf } from './hierarchy/session';
 import { resolveByReferences } from './hierarchy/references';
 import { Direction, DIRECTION_LABEL } from './hierarchy/graphTypes';
 import {
@@ -45,6 +50,8 @@ import {
   MARGIN_LEFT as layoutMarginLeft,
   MARGIN_TOP as layoutMarginTop,
   createLayout as layoutCreateLayout,
+  displayPathText as layoutDisplayPathText,
+  DEFAULT_PATH_OPTIONS as layoutDefaultPathOptions,
 } from './hierarchy/graphLayout';
 import { GraphViewProvider } from './views/graphView';
 import { renderGraphHtml } from './webview/webviewHtml';
@@ -64,28 +71,24 @@ export function activate(context: vscode.ExtensionContext): void {
     })
   );
 
-  const readChoice = (): EngineChoice =>
-    vscode.workspace
-      .getConfiguration('cppCallGraph')
-      .get<EngineChoice>('languageService', 'auto');
+  const readChoice = (): string =>
+    String(
+      vscode.workspace.getConfiguration('cppCallGraph').get<string>('languageService', 'auto') ??
+        'auto'
+    );
 
   // -------------------------------------------------------- 语言服务
 
   const detectEngine = async (): Promise<EngineLabel> => {
     invalidateClangdCache();
-    const choice = readChoice();
-    const installed = listAvailableEngines();
-
-    if (choice !== 'auto') {
-      const chosen = resolveEngineChoice(choice);
-      if (chosen !== 'unknown') {
-        return chosen;
-      }
-      const reason = explainUnavailable(choice) ?? '该语言服务当前不可用';
-      logWarn(`设置里选择了 ${choice}，但不可用：${reason}；已回退为自动。`);
-      return installed[0] ?? 'unknown';
+    const { profile, warning } = selectedProfile();
+    if (warning) {
+      logWarn(warning);
     }
-
+    if (profile) {
+      return profile.id;
+    }
+    const installed = listAvailableEngines();
     if (installed.length === 0) {
       return 'unknown';
     }
@@ -112,9 +115,11 @@ export function activate(context: vscode.ExtensionContext): void {
     }
     const active = preferredEngine();
     const message =
-      installed.join(' 与 ') +
+      installed.map((id) => describeEngine(id)).join(' 与 ') +
       ' 都会提供调用层级，两者注册在同一个语言 ID 上，结果可能混用。' +
-      (active === 'unknown' ? '' : `当前按 ${active} 的结果展示。`);
+      (active === 'unknown'
+        ? ''
+        : `当前按 ${describeEngine(active)} 的结果展示；可用 cppCallGraph.enginePickPolicy 改变挑选方式。`);
     const choice = await vscode.window.showInformationMessage(
       message,
       '查看处理建议',
@@ -156,8 +161,13 @@ export function activate(context: vscode.ExtensionContext): void {
       `收到命令「${label}」：${document.uri.fsPath} 光标 ${cursor.line + 1}:${cursor.character + 1}（languageId=${document.languageId}）`
     );
 
-    const choice = readChoice();
-    const expected = resolveEngineChoice(choice);
+    const { profile: selected, warning: choiceWarning } = selectedProfile();
+    if (choiceWarning) {
+      logWarn(choiceWarning);
+    }
+    const policy = pickPolicy();
+    // 不认领时用探测到的引擎名标注会话；认领成功时会话会标成选中的那个。
+    const expected = selected ? selected.id : preferredEngine();
     // 较慢的查询（宏、结构体、变量这类要走引用查找的符号）会让 webview 显示加载遮罩：
     // 转圈 + 取消 + 背景模糊；「取消」能真的中断引用查找那一串语言服务请求。
     // busy 窗口必须覆盖「解析 + 引用兜底」两段 —— 提前结束的话，兜底阶段收到的取消
@@ -169,12 +179,21 @@ export function activate(context: vscode.ExtensionContext): void {
     try {
       resolved = await vscode.window.withProgress(
         { location: vscode.ProgressLocation.Window, title: `正在解析${label}…` },
-        () => resolveAt(document, cursor, choice, expected)
+        () => resolveAt(document, cursor, selected, policy, expected)
       );
       cancelled = busy.isCancelled();
 
       // 解析不出函数属于正常的“没找到”，不弹右下角 Toast，只在状态栏和日志里说明。
       if (!resolved) {
+        // 若是「只认选中引擎」档导致没有结果，先把原因写进输出通道 ——
+        // 否则用户只看到"退回引用查找"，不知道是自己选的档位造成的（本扩展不使用打扰式提示）。
+        if (selected && policy === 'onlySelected') {
+          logWarn(
+            `本次查询没有结果。当前 enginePickPolicy 为 onlySelected（只认选中引擎）；` +
+              `若该引擎未配置 matchName / matchDetail，或此处没有它认领的结果，就会如此。` +
+              `如需在认不到时自动退回「按光标就近」，请把该设置改为 preferSelected。`
+          );
+        }
         // 宏、typedef/using 别名、结构体/类/枚举名、枚举成员、字段、变量这些符号**没有调用层级**
         // （语言服务只对可调用符号给调用层级），改走引用查找：根 = 该符号，
         // 第一层 = 引用点所在的函数；之后照常可以继续展开。
@@ -188,9 +207,7 @@ export function activate(context: vscode.ExtensionContext): void {
               `s${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
               'callers',
               byReference.root,
-              byReference.source === 'textSearch'
-                ? '文本搜索'
-                : describeEngine(expected)
+              byReference.source === 'textSearch' ? '文本搜索' : expected
             );
             session.seedRoot(byReference.answers);
             if (session.hasContent) {
@@ -211,7 +228,7 @@ export function activate(context: vscode.ExtensionContext): void {
         const position = `${cursor.line + 1}:${cursor.character + 1}`;
         const reason = hasCompileDatabase()
           ? '当前光标位置没有解析出函数（请把光标放在函数名上，或等索引完成）'
-          : '工作区缺少 compile_commands.json / compile_flags.txt，clangd 拿不到编译参数';
+          : '工作区缺少 compile_commands.json / compile_flags.txt，clangd 无法获取编译参数';
         logWarn(`解析${label}失败：${document.uri.fsPath} @ ${position} —— ${reason}`);
         return;
       }
@@ -237,7 +254,9 @@ export function activate(context: vscode.ExtensionContext): void {
       `s${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
       direction,
       item,
-      describeEngine(engine)
+      // 存的**是引擎 id**（不是展示名）—— 角标与文案都由它派生；
+      // 旧快照里存的是展示名，describeEngine/badgeFor 都会原样兜底。
+      engine
     );
     // 首次加载也走一次遮罩窗口：这一步才是「取第一层调用关系」，
     // 大工程上它可能比解析本身还慢；先前只有解析阶段有反馈，用户会觉得「点了没反应」。
@@ -337,17 +356,27 @@ export function activate(context: vscode.ExtensionContext): void {
       }`
     );
     add(`语言服务设置: ${readChoice()}`);
-    add(
-      `clangd 扩展: ${vscode.extensions.getExtension('llvm-vs-code-extensions.vscode-clangd') ? '已安装' : '未安装'}`
-    );
-    add(
-      `cpptools 扩展: ${vscode.extensions.getExtension('ms-vscode.cpptools') ? '已安装' : '未安装'}`
-    );
-    add(`clangd 可执行文件: ${clangdExecutable() ?? '(未找到)'}`);
+    // 引擎相关的诊断**遍历配置档表**（内置 + 用户自定义），不再写死两个扩展 ID ——
+    // 这样接了新引擎之后，诊断里也能看到它。
+    for (const profile of engineProfiles()) {
+      const installed = profile.extensionId
+        ? isExtensionActiveOrInstalled(profile.extensionId)
+        : undefined;
+      const parts = [
+        installed === undefined ? '不依赖扩展' : installed ? '已安装' : '未安装',
+        profile.requiresExecutable === 'clangd'
+          ? `可执行文件 ${clangdExecutable() ?? '(未找到)'}`
+          : '',
+        listAvailableEngines().includes(profile.id) ? '可用' : '不可用',
+        explainUnavailable(profile.id) ?? '',
+      ].filter(Boolean);
+      add(`引擎 ${profile.id}（${profile.label}）: ${parts.join(' · ')}`);
+    }
     add(
       `编译数据库: ${hasCompileDatabase() ? '有 compile_commands.json / compile_flags.txt' : '没有（clangd 无法获取编译参数）'}`
     );
     add(`可用引擎: ${listAvailableEngines().join(', ') || '(无)'}`);
+    add(`挑选策略: ${pickPolicy()}`);
     add(`最近一次 prepare 结果: ${lastPrepareDiagnostic()}`);
     add(`面板标签数: ${graphPanel.sessionCount}`);
 
@@ -365,7 +394,8 @@ export function activate(context: vscode.ExtensionContext): void {
         add(`  · ${name}`);
       }
       if (result.count > 0) {
-        const resolved = await resolveAt(editor.document, cursor, readChoice(), 'unknown');
+        // 诊断用的探测不认领任何引擎：只看"这个位置到底有没有结果"。
+        const resolved = await resolveAt(editor.document, cursor, undefined, 'nearest', 'unknown');
         if (resolved) {
           const calls = await probeCalls(resolved.item);
           add(
@@ -433,14 +463,31 @@ export function activate(context: vscode.ExtensionContext): void {
         graphPanel.postSettings(true);
         return;
       }
+      // 路径显示方式同样改变方框宽度（文字变长/变短）→ 必须重排，
+      // 否则 webview 手里还是按旧路径宽度排出来的列位置。
+      if (
+        event.affectsConfiguration('cppCallGraph.pathDisplay') ||
+        event.affectsConfiguration('cppCallGraph.pathTailLevels') ||
+        event.affectsConfiguration('cppCallGraph.pathAnchors')
+      ) {
+        graphPanel.postSettings(true);
+        return;
+      }
       if (event.affectsConfiguration('cppCallGraph.stickyParent')) {
         graphPanel.postSettings();
         return;
       }
-      if (event.affectsConfiguration('cppCallGraph.languageService')) {
+      // 引擎相关设置变了（含自定义引擎表与挑选策略）：重新探测并刷新标签上的引擎名。
+      if (
+        event.affectsConfiguration('cppCallGraph.languageService') ||
+        event.affectsConfiguration('cppCallGraph.customEngineId') ||
+        event.affectsConfiguration('cppCallGraph.customEngines') ||
+        event.affectsConfiguration('cppCallGraph.enginePickPolicy')
+      ) {
         void detectEngine().then(applyEngine);
         return;
       }
+      // clangd 的可执行文件位置变了：丢缓存重探。
       if (event.affectsConfiguration('clangd.path')) {
         invalidateClangdCache();
         void detectEngine().then(applyEngine);
@@ -469,6 +516,9 @@ export const __layout = {
   NODE_HEIGHT: layoutNodeHeight,
   MARGIN_LEFT: layoutMarginLeft,
   MARGIN_TOP: layoutMarginTop,
+  /** 路径显示逻辑：让 renderCheck 能把它与 webview 渲染出来的文字做跨侧等值比对。 */
+  displayPathText: layoutDisplayPathText,
+  DEFAULT_PATH_OPTIONS: layoutDefaultPathOptions,
 };
 
 /**
@@ -478,6 +528,24 @@ export const __layout = {
 export const __hierarchy = {
   pickByChoice,
   resolveAt,
+  /** 节点 id 的 key 反解（`operator>` 这类含 `>` 的名字曾经被切错，见 session.ts）。 */
+  baseKeyOf,
+};
+
+/**
+ * 仅用于测试：把引擎配置档这一层暴露出来，供 scripts/smoke.js 断言
+ * 「自定义引擎被识别 / 未知 id 退回 / 认领规则 / 角标 / 挑选策略」。
+ */
+export const __engines = {
+  engineProfiles,
+  selectedProfile,
+  badgeFor,
+  matchesProfile,
+  pickPolicy,
+  describeEngine,
+  explainUnavailable,
+  isProfileAvailable,
+  listAvailableEngines,
 };
 
 function explainEmpty(direction: Direction, name: string): string {

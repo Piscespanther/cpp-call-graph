@@ -25,14 +25,19 @@
       文案在 title 里做悬停提示。
     -->
     <div id="toolbar" class="toolbar" role="toolbar">
-      <button id="btn-close-all" type="button" title="关闭全部标签并收起调用关系图">
+      <button id="btn-close-all" type="button" title="关闭全部标签并收起视图">
         <svg viewBox="0 0 16 16" aria-hidden="true">
           <path d="M13.87 13.17 Q14.03 13.28 14.03 13.49 Q13.71 14.03 13.49 14.03 L13.17 13.87 L8 8.69 L2.83 13.87 Q2.72 14.03 2.51 14.03 Q2.03 13.71 2.03 13.49 L2.13 13.17 L7.31 8 L2.13 2.83 Q2.03 2.72 2.03 2.51 Q2.29 1.97 2.51 1.97 L2.88 2.13 L8 7.31 L13.17 2.13 Q13.33 1.97 13.52 1.97 Q14.03 2.29 14.03 2.51 L13.87 2.83 L8.75 8 L13.87 13.17 L13.87 13.17 Z" />
         </svg>
       </button>
-      <button id="btn-expand-all" type="button" title="展开全部（逐层加载，受设置项的上限约束）">
+      <button id="btn-expand-all" type="button" title="展开全部（受 maxExpandRounds 层数上限约束）">
         <svg viewBox="0 0 16 16" aria-hidden="true">
           <path d="M14.99 5.97 L14.99 10.99 Q14.99 12.11 14.45 13.01 Q12.11 14.99 10.99 14.99 L10.99 14.99 L6.03 14.99 Q5.44 14.99 4.99 14.72 L4.27 13.97 L10.99 13.97 Q12.21 13.97 13.12 13.09 L14.03 10.99 L14.03 4.27 Q14.45 4.53 14.72 4.99 L14.99 5.97 Z M10.99 13.01 L4 13.01 Q3.15 13.01 2.59 12.43 L1.97 10.99 L1.97 4 Q2.03 3.15 2.59 2.56 L4 2.03 L10.99 2.03 Q11.84 1.97 12.43 2.56 L13.01 4 L13.01 10.99 Q13.01 11.84 12.43 12.43 L10.99 13.01 Z M4 12 L10.99 12 Q11.41 12 11.71 11.71 L12 10.99 L12 4 Q12 3.57 11.71 3.28 L10.99 2.99 L4 2.99 Q3.57 2.99 3.28 3.28 L2.99 4 L2.99 10.99 Q2.99 11.41 3.28 11.71 L4 12 Z M9.49 6.99 L8 6.99 L8 5.49 Q8 5.28 7.87 5.15 Q7.31 5.01 7.15 5.15 L6.99 5.49 L6.99 6.99 L5.49 6.99 Q5.28 6.99 5.15 7.15 Q5.01 7.73 5.15 7.87 L5.49 8 L6.99 8 L6.99 9.49 Q6.99 9.71 7.15 9.87 Q7.73 9.97 7.87 9.84 L8 9.49 L8 8 L9.49 8 Q9.71 8 9.84 7.87 Q10.03 7.31 9.87 7.15 L9.49 6.99 Z" />
+        </svg>
+      </button>
+      <button id="btn-expand-full" type="button" title="完全展开（不受层数上限约束）">
+        <svg viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M11.84 10.13 Q12 10.29 12 10.51 L11.84 10.83 L8.37 14.35 Q8.21 14.51 8 14.51 L7.63 14.35 L4.16 10.83 Q4 10.72 4 10.51 Q4.27 9.97 4.48 9.97 L4.85 10.13 L8 13.28 L11.15 10.13 Q11.31 9.97 11.52 9.97 L11.84 10.13 L11.84 10.13 Z M4.85 5.87 L8 2.72 L11.15 5.87 Q11.31 6.03 11.52 6.03 Q12 5.71 12 5.49 L11.84 5.17 L8.37 1.65 Q8.21 1.49 8 1.49 L7.63 1.65 L4.16 5.17 Q4 5.28 4 5.49 Q4.27 6.03 4.48 6.03 L4.85 5.87 Z" />
         </svg>
       </button>
       <button id="btn-collapse-all" type="button" title="收起全部（仅保留根节点）">
@@ -40,7 +45,7 @@
           <path d="M14.03 4.27 Q14.45 4.53 14.72 4.99 L14.99 6.03 L14.99 10.99 Q14.99 12.11 14.45 13.01 Q12.11 14.99 10.99 14.99 L10.99 14.99 L6.03 14.99 Q5.44 14.99 4.99 14.72 L4.27 13.97 L10.99 13.97 Q12.21 13.97 13.12 13.09 L14.03 10.99 L14.03 4.27 Z M9.49 6.99 Q9.71 6.99 9.84 7.15 Q10.03 7.73 9.87 7.87 L9.49 8 L5.49 8 Q5.28 8 5.15 7.87 Q5.01 7.31 5.15 7.15 L5.49 6.99 L9.49 6.99 Z M10.99 1.97 Q11.84 1.97 12.43 2.56 L13.01 4 L13.01 10.99 Q13.01 11.84 12.43 12.43 L10.99 13.01 L4 13.01 Q3.15 13.01 2.59 12.43 L1.97 10.99 L1.97 4 Q2.03 3.15 2.59 2.56 L4 2.03 L10.99 2.03 L10.99 1.97 Z M4 2.99 Q3.57 2.99 3.28 3.28 L2.99 4 L2.99 10.99 Q2.99 11.41 3.28 11.71 L4 12 L10.99 12 Q11.41 12 11.71 11.71 L12 10.99 L12 4 Q12 3.57 11.71 3.28 L10.99 2.99 L4 2.99 Z" />
         </svg>
       </button>
-      <button id="btn-copy-tab" type="button" title="复制当前标签为文本（已展开的完整关系树）">
+      <button id="btn-copy-tab" type="button" title="复制当前标签为文本">
         <svg viewBox="0 0 16 16" aria-hidden="true">
           <path d="M2.99 5.01 L2.99 12.75 Q2.56 12.48 2.29 12 L2.03 10.99 L2.03 5.01 Q2.03 3.89 2.56 2.99 Q4.91 1.01 6.03 1.01 L6.03 1.01 L9.01 1.01 Q9.55 1.01 10 1.28 L10.72 1.97 L6.03 1.97 Q4.75 1.97 3.87 2.88 L2.99 5.01 Z M10.99 14.99 L6.03 14.99 Q5.17 14.99 4.59 14.4 L4 13.01 L4 5.01 Q4 4.16 4.59 3.57 L5.97 2.99 L10.99 2.99 Q11.84 2.99 12.43 3.57 L13.01 5.01 L13.01 13.01 Q13.01 13.81 12.43 14.4 L10.99 14.99 Z M12 5.01 Q12 4.59 11.71 4.29 L10.99 4 L6.03 4 Q5.6 4 5.31 4.29 L5.01 5.01 L5.01 13.01 Q5.01 13.44 5.31 13.71 L6.03 13.97 L10.99 13.97 Q11.41 13.97 11.71 13.71 L12 13.01 L12 5.01 Z" />
         </svg>
@@ -68,10 +73,10 @@
           spellcheck="false"
           autocomplete="off"
         />
-        <button id="btn-search-case" class="search-toggle" type="button" title="区分大小写">Aa</button>
-        <button id="btn-search-word" class="search-toggle" type="button" title="全字匹配（仅匹配完整单词）">全字</button>
-        <button id="btn-search-regex" class="search-toggle" type="button" title="正则匹配">.*</button>
-        <span id="search-count" class="search-count"></span>
+        <button id="btn-search-case" class="search-toggle" type="button" title="区分大小写" aria-label="区分大小写" aria-pressed="false">Aa</button>
+        <button id="btn-search-word" class="search-toggle" type="button" title="全字匹配" aria-label="全字匹配" aria-pressed="false">全字</button>
+        <button id="btn-search-regex" class="search-toggle" type="button" title="正则匹配" aria-label="正则匹配" aria-pressed="false">.*</button>
+        <span id="search-count" class="search-count" role="status" aria-live="polite"></span>
         <button id="btn-search-prev" class="search-step" type="button" title="上一个命中（Shift+Enter）">↑</button>
         <button id="btn-search-next" class="search-step" type="button" title="下一个命中（Enter）">↓</button>
       </div>

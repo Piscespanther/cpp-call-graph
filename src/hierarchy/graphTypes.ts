@@ -80,6 +80,8 @@ export interface GraphNode {
   name: string;
   /** 函数签名 / 宏定义体等补充信息。 */
   detail?: string;
+  /** 展开时按 `maxChildrenPerNode` 省略掉的条数（>0 时在悬停提示里说明）。 */
+  omitted?: number;
   file: string;
   line: number;
   /** 关系发生点：谁在第几行引用了/调用了谁。 */

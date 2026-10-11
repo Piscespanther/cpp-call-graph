@@ -27,11 +27,44 @@ const attributes = new Map();
 function makeElement(key, clientWidth = 0, clientHeight = 0) {
   const element = {
     __key: key,
+    /** 本元素自己的属性表（不再与同标签的其它元素共用一张表）。 */
+    __attributes: new Map(),
     tagName: key,
     children: [],
     _textContent: '',
     style: {},
-    classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+    // ⚠️ classList 与 className 必须是**同一份数据**（都落在 class 属性上）：
+    // 以前这里是空实现 + contains 恒 false，任何与 class 有关的否定式断言都会假通过。
+    classList: {
+      add: (name) => {
+        const current = String(element.getAttribute('class') ?? '').split(/\s+/).filter(Boolean);
+        if (!current.includes(name)) {
+          element.setAttribute('class', [...current, name].join(' '));
+        }
+      },
+      remove: (name) => {
+        const current = String(element.getAttribute('class') ?? '')
+          .split(/\s+/)
+          .filter((item) => item && item !== name);
+        element.setAttribute('class', current.join(' '));
+      },
+      toggle: (name, force) => {
+        const has = String(element.getAttribute('class') ?? '')
+          .split(/\s+/)
+          .includes(name);
+        const on = force ?? !has;
+        if (on) {
+          element.classList.add(name);
+        } else {
+          element.classList.remove(name);
+        }
+        return on;
+      },
+      contains: (name) =>
+        String(element.getAttribute('class') ?? '')
+          .split(/\s+/)
+          .includes(name),
+    },
     clientWidth,
     clientHeight,
     listeners: {},
@@ -66,23 +99,42 @@ function makeElement(key, clientWidth = 0, clientHeight = 0) {
       if (this.tagName !== 'text') {
         return { x: 0, y: 0, width: 0, height: 0 };
       }
+      // ⚠️ 未挂进文档（无 parentNode）时必须返回 0 —— 真实浏览器如此。
+      // 桩若照样返回宽度，「探测节点忘了 append」这类历史 bug 在本脚本里永远测不出来。
+      if (!this.parentNode) {
+        return { x: 0, y: 0, width: 0, height: 0 };
+      }
       const size = Number.parseFloat(String(this.getAttribute('font-size') ?? '')) || 12;
       const bold = String(this.getAttribute('font-weight') ?? '') === '600';
       const text = String(this._textContent ?? '');
       return {
         x: 0,
         y: Number(this.getAttribute('y') ?? 0) - size * 0.72,
-        width: text.length * size * (bold ? 0.66 : 0.6),
+        // ⚠️ 系数必须与生产兜底（0.66 / 0.6）**不同**：这样「量到了」与「退到估算」两条路径
+        // 才能被区分开（否则量宽失败也看不出来）。
+        width: text.length * size * (bold ? 0.62 : 0.56),
         height: size * 0.66,
       };
     },
+    /** 生产代码首选 `getComputedTextLength()`，桩也提供，别让最准的那条路在测试里从不执行。 */
+    getComputedTextLength() {
+      const size = Number.parseFloat(String(this.getAttribute('font-size') ?? '')) || 12;
+      const bold = String(this.getAttribute('font-weight') ?? '') === '600';
+      return String(this._textContent ?? '').length * size * (bold ? 0.6 : 0.54);
+    },
     setAttribute(name, value) {
+      // ⚠️ 属性**按元素**存。以前只按「标签名:属性名」存进一张全局表，
+      // 同一种标签的多个元素会互相覆盖 —— getAttribute 读到的其实是**最后写**的那一个，
+      // 于是「这个元素上没有该属性」这类否定式断言会假通过。
+      this.__attributes.set(name, String(value));
+      // 兼容旧的按标签归档的全局表（本文件与 renderCheck 里还有 attributes.get('svg:viewBox') 之类读法）
       attributes.set(`${this.__key}:${name}`, value);
     },
     getAttribute(name) {
-      return attributes.get(`${this.__key}:${name}`);
+      return this.__attributes.has(name) ? this.__attributes.get(name) : null;
     },
     removeAttribute(name) {
+      this.__attributes.delete(name);
       attributes.delete(`${this.__key}:${name}`);
     },
     addEventListener(type, handler) {

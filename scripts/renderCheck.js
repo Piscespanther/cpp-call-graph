@@ -292,6 +292,7 @@ const toolbarButtons = [...toolbarHtml[0].matchAll(/<button id="([^"]+)"/g)].map
 const expectedButtons = [
   'btn-close-all',
   'btn-expand-all',
+  'btn-expand-full',
   'btn-collapse-all',
   'btn-copy-tab',
   'btn-settings',
@@ -479,7 +480,228 @@ assert(
     /stickyEnabled/.test(webviewSource) && /state\.stickyParent/.test(webviewSource),
     'webview 应当按设置决定是否启用粘性父框'
   );
+
+  // ---- 路径显示方式的四项设置：四处都要通 ----
+  // package.json（有这项）→ 宿主读并发下发 → webview 应用 → 改动后**必须重排**
+  // （文字长度变了，列宽与箭头位置都要重算；只下发设置不重排，webview 手里还是旧宽度）
+  const extensionSource = fs.readFileSync(path.join(ROOT, 'src', 'extension.ts'), 'utf8');
+  for (const key of ['pathDisplay', 'pathTailLevels', 'pathAnchors']) {
+    assert(
+      pkg.contributes.configuration.properties[`cppCallGraph.${key}`] !== undefined,
+      `package.json 里应当有 cppCallGraph.${key} 设置项`
+    );
+    assert(new RegExp(`'${key}'`).test(hostSource), `宿主应当读取 ${key} 并随 settings 下发`);
+    assert(
+      new RegExp(`affectsConfiguration\\('cppCallGraph\\.${key}'\\)`).test(extensionSource),
+      `改动 cppCallGraph.${key} 之后必须触发重排（它改变路径文字长度 → 方框宽度 → 列宽）`
+    );
+  }
+  assert(
+    /applyPathSettings/.test(webviewSource) && /state\.pathOptions/.test(webviewSource),
+    'webview 应当把下发的路径设置应用进 state.pathOptions'
+  );
+  const layoutSourceForPath = fs.readFileSync(
+    path.join(ROOT, 'src', 'hierarchy', 'graphLayout.ts'),
+    'utf8'
+  );
+  assert(
+    /displayPathText/.test(layoutSourceForPath) && /displayPathText/.test(webviewSource),
+    '路径显示逻辑必须在宿主与 webview 两侧各有一份（估宽与渲染同一口径）'
+  );
   log(`诊断: 设置项 ${configKeys.length} 项，package.json / README / 宿主下发 / webview 处理四处一致`);
+
+  // ---- 跨侧常量必须相等 ----
+  // 布局常量在宿主（graphLayout.ts）与 webview（graph.ts）各有一份，改错一侧时几何会真的错位
+  // 而所有断言照样全绿。这里直接把两份源码里的数值抽出来比对。
+  {
+    const layoutSource = fs.readFileSync(
+      path.join(ROOT, 'src', 'hierarchy', 'graphLayout.ts'),
+      'utf8'
+    );
+    const numericConst = (source, name) => {
+      const match = new RegExp(`(?:export )?const ${name}\\s*=\\s*(\\d+)`).exec(source);
+      return match ? Number(match[1]) : undefined;
+    };
+    // 这 6 个是两侧都有的（COLUMN_GAP / ROW_GAP 只在宿主侧：webview 只用宿主下发的坐标）
+    for (const name of [
+      'MAX_BOX_WIDTH',
+      'MIN_BOX_WIDTH',
+      'NAME_MAX_CHARS',
+      'LOC_MAX_CHARS',
+      'NODE_HEIGHT',
+      'NODE_HEIGHT_COMPACT',
+    ]) {
+      const hostValue = numericConst(layoutSource, name);
+      const webviewValue = numericConst(webviewSource, name);
+      assert(hostValue !== undefined, `宿主侧找不到常量 ${name}`);
+      assert(
+        webviewValue !== undefined,
+        `webview 侧找不到常量 ${name}（两侧必须各有一份，缺一侧就是几何口径分叉）`
+      );
+      assert(
+        hostValue === webviewValue,
+        `${name} 两侧不一致：宿主 ${hostValue} vs webview ${webviewValue}`
+      );
+    }
+    // 字号与估算系数的关系：宿主的估宽必须**不小于** webview 的估算回退（否则列会排窄、方框互相压住）
+    const hostMilli = Number(
+      new RegExp(/const CHAR_WIDTH_MILLI\s*=\s*(\d+)/).exec(layoutSource)?.[1] ?? 0
+    );
+    const webviewBold = Number(
+      new RegExp(/bold \? ([\d.]+) : ([\d.]+)/).exec(webviewSource)?.[1] ?? '0'
+    );
+    assert(hostMilli > 0, '宿主侧找不到 CHAR_WIDTH_MILLI');
+    assert(webviewBold > 0, 'webview 侧找不到估算回退系数');
+    assert(
+      hostMilli / 1000 >= webviewBold,
+      `宿主估宽系数 ${hostMilli / 1000} 必须不小于 webview 的估算回退 ${webviewBold}（否则列宽会估窄）`
+    );
+    log(
+      `诊断: 跨侧常量一致（6 个布局常量相等；宿主估宽 ${hostMilli / 1000} ≥ webview 估算 ${webviewBold}）`
+    );
+
+    // 布局上限必须 ≥ 宿主的「展开全部」节点预算：否则展开全部抓回 800 个节点，
+    // 布局却只画 500 个 → 用户看到方框凭空消失（压测时就是这样发现的）。
+    const layoutCap = numericConst(layoutSource, 'MAX_LAYOUT_NODES');
+    const graphViewSource = fs.readFileSync(
+      path.join(ROOT, 'src', 'views', 'graphView.ts'),
+      'utf8'
+    );
+    const expandBudget = Number(
+      /const MAX_EXPAND_NODES\s*=\s*(\d+)/.exec(graphViewSource)?.[1] ?? 0
+    );
+    assert(layoutCap !== undefined, '宿主布局里找不到 MAX_LAYOUT_NODES');
+    assert(expandBudget > 0, 'graphView 里找不到 MAX_EXPAND_NODES');
+    assert(
+      layoutCap >= expandBudget,
+      `布局上限 ${layoutCap} 小于「展开全部」预算 ${expandBudget}：展开全部会有一部分方框拿不到坐标而消失`
+    );
+    log(`诊断: 布局上限 ${layoutCap} ≥ 展开预算 ${expandBudget}`);
+  }
+
+  // ---- 消息协议护栏：两侧的 type 集合必须互相覆盖 ----
+  //
+  // 之前只 grep 关键字（例如 /case 'settings'/），新增或改名一个消息时看不出问题：
+  // 少了一个 case、或写了宿主 union 里没有的类型，都是**运行期静默失效**。
+  // 这里把两侧的 type 字面量都抓出来，双向比对。
+  const unionOf = (source, name) => {
+    const marker = `type ${name} =`;
+    const declared = source.indexOf(marker);
+    if (declared < 0) {
+      return undefined;
+    }
+    // 联合类型**没有外层花括号**，成员各自是 `{ ... }`。所以不能从第一个 `{` 起配平，
+    // 要一路扫到「深度为 0 的分号」为止（成员内部的 `;` 深度 ≥ 1，会被跳过）。
+    let depth = 0;
+    let end = declared;
+    for (; end < source.length; end += 1) {
+      const ch = source[end];
+      if (ch === '{') {
+        depth += 1;
+      } else if (ch === '}') {
+        depth -= 1;
+      } else if (ch === ';' && depth === 0) {
+        break;
+      }
+    }
+    const body = source.slice(declared, end);
+    // 两种写法都要认：内联字面量 `| { type: 'x' }`，以及具名成员
+    // （webview 的 HostMessage 就是 `| InitMessage | UpdateMessage …`，类型写在接口里）。
+    const types = new Set(
+      [...body.matchAll(/type:\s*'([a-zA-Z]+)'/g)].map((match) => match[1])
+    );
+    const named = [...body.matchAll(/^\s*\|\s*([A-Za-z_$][\w$]*)\s*$/gm)].map(
+      (match) => match[1]
+    );
+    for (const member of named) {
+      const declaration = new RegExp(
+        `(?:interface|type)\\s+${member}\\b[\\s\\S]{0,800}?type:\\s*'([a-zA-Z]+)'`
+      ).exec(source);
+      if (declaration) {
+        types.add(declaration[1]);
+      }
+    }
+    return types;
+  };
+  const casesOf = (source) =>
+    new Set([...source.matchAll(/case\s*'([a-zA-Z]+)'/g)].map((match) => match[1]));
+  const literalsOf = (source, pattern) =>
+    new Set([...source.matchAll(pattern)].map((match) => match[1]));
+
+  const hostUnion = unionOf(hostSource, 'WebviewMessage');
+  const webviewUnion = unionOf(webviewSource, 'HostMessage');
+  assert(hostUnion !== undefined, '找不到宿主的 WebviewMessage 联合类型（协议护栏失效）');
+  assert(webviewUnion !== undefined, '找不到 webview 的 HostMessage 联合类型（协议护栏失效）');
+
+  // webview → 宿主：post({ type: 'x' ... })
+  const posted = literalsOf(webviewSource, /post\(\{[\s\S]{0,160}?type:\s*'([a-zA-Z]+)'/g);
+  assert(posted.size >= 10, `webview 发出的消息类型只抓到 ${posted.size} 种，护栏可能失效`);
+  const undeclared = [...posted].filter((type) => !hostUnion.has(type));
+  assert(
+    undeclared.length === 0,
+    `webview 发出的这些类型不在宿主 WebviewMessage 联合类型里：${undeclared.join(', ')}`
+  );
+  // 宿主处理分支有两种写法：switch 的 `case 'x':`，以及提前返回的 `if (message.type === 'x')`
+  // （`error` 走的就是后者），两种都要算作"已处理"。
+  const hostCases = new Set([
+    ...casesOf(hostSource),
+    ...literalsOf(hostSource, /message\.type\s*===\s*'([a-zA-Z]+)'/g),
+  ]);
+  const unhandled = [...posted].filter((type) => !hostCases.has(type));
+  assert(
+    unhandled.length === 0,
+    `webview 发出的这些类型宿主没有处理：${unhandled.join(', ')}`
+  );
+
+  // 宿主 → webview：postMessage({ type: 'x' ... })
+  const pushed = new Set([
+    ...literalsOf(hostSource, /postMessage\(\{\s*type:\s*'([a-zA-Z]+)'/g),
+    ...literalsOf(hostSource, /post\(\{\s*type:\s*'([a-zA-Z]+)'/g),
+  ]);
+  assert(pushed.size >= 4, `宿主发出的消息类型只抓到 ${pushed.size} 种，护栏可能失效`);
+  const notDeclared = [...pushed].filter((type) => !webviewUnion.has(type));
+  assert(
+    notDeclared.length === 0,
+    `宿主发出的这些类型不在 webview 的 HostMessage 联合类型里：${notDeclared.join(', ')}`
+  );
+  const webviewCases = casesOf(webviewSource);
+  const notHandled = [...pushed].filter((type) => !webviewCases.has(type));
+  assert(
+    notHandled.length === 0,
+    `宿主发出的这些类型 webview 没有处理：${notHandled.join(', ')}`
+  );
+  log(
+    `诊断: 消息协议 —— webview → 宿主 ${posted.size} 种、宿主 → webview ${pushed.size} 种，联合类型与处理分支双向覆盖`
+  );
+
+  // ---- 无障碍：键盘可达与状态可读 ----
+  // 「看得见的状态」必须同时暴露给辅助技术，否则屏幕阅读器只能读出"按钮"。
+  const htmlSource = fs.readFileSync(path.join(ROOT, 'src', 'webview', 'graph.html'), 'utf8');
+  for (const id of ['btn-search-case', 'btn-search-word', 'btn-search-regex']) {
+    const tag = new RegExp(`<button id="${id}"[^>]*>`).exec(htmlSource)?.[0] ?? '';
+    assert(
+      /aria-pressed="(true|false)"/.test(tag),
+      `${id} 应当带 aria-pressed（开关状态要能被读出），实际：${tag || '(找不到该按钮)'}`
+    );
+  }
+  assert(
+    /<span id="search-count"[^>]*aria-live=/.test(htmlSource),
+    '搜索命中计数应当 aria-live，键盘/读屏用户才能知道命中变化'
+  );
+  assert(
+    /'aria-label'/.test(webviewSource) && /tabindex: '0'/.test(webviewSource),
+    '方框应当可聚焦（tabindex）并有 aria-label'
+  );
+  assert(
+    /setAttribute\('aria-selected'/.test(webviewSource) &&
+      /setAttribute\('role', 'tab'\)/.test(webviewSource),
+    '标签应当有 role=tab 与 aria-selected'
+  );
+  assert(
+    /setAttribute\('aria-pressed'/.test(webviewSource),
+    '搜索开关的 aria-pressed 应当随状态更新（不能只在 HTML 里写死）'
+  );
+  log('诊断: 无障碍 —— 方框可聚焦且有 aria-label，标签 role=tab/aria-selected，开关 aria-pressed 同步');
 }
 
 const searchInputStub = createElement('input');
@@ -553,6 +775,8 @@ function flushFrames() {
 }
 
 // extension.js 需要 require('vscode')，注入最小桩
+/** 输出通道收到的内容（logInfo / logWarn / logError），供断言检查。 */
+const outputLines = [];
 const Module = require('node:module');
 const originalLoad = Module._load;
 Module._load = function patched(request, parent, isMain) {
@@ -563,7 +787,18 @@ Module._load = function patched(request, parent, isMain) {
 };
 global.__vscodeStub = {
   workspace: { getConfiguration: () => ({ get: (_key, fallback) => fallback }) },
-  window: {},
+  // 输出通道必须收集内容、不能是空壳：生产代码用 logWarn 报「图太大、有节点没排布」，
+  // 桩里没有这个函数时那句话会直接抛 TypeError —— 而它恰好发生在压测块里，
+  // 被「不影响断言」的 catch 吞掉后表现为「压测数字不见了、退出码还是 0」。
+  window: {
+    createOutputChannel: () => ({
+      info: (message) => outputLines.push({ level: 'info', message }),
+      warn: (message) => outputLines.push({ level: 'warn', message }),
+      error: (message) => outputLines.push({ level: 'error', message }),
+      show() {},
+      dispose() {},
+    }),
+  },
   commands: { executeCommand: () => Promise.resolve(), registerCommand: () => ({ dispose() {} }) },
   extensions: { getExtension: () => undefined },
   Uri: {
@@ -716,9 +951,12 @@ function makeSession(direction) {
 
 // ------------------------------------------------------------ ① 初始会话
 
+// 夹具留着引用：下面的期望值都从这份 payload 推导，不写死数字
+// （写死数字会在夹具变化时变成「断言还是绿的、但已经和夹具无关」的空断言）。
+const fixtureSessions = [makeSession('callers')];
 sendToWebview({
   type: 'init',
-  sessions: [makeSession('callers')],
+  sessions: fixtureSessions,
   summaries: [],
   activeId: 's-callers',
 });
@@ -749,6 +987,9 @@ log(
   `诊断: DOM 里 rect=${rects.length}（其中方框 ${boxRects.length}）path=${paths.length} text=${texts.length}`
 );
 
+// ⚠️ 这三条**刻意**用 `>=`，不是"松阈值"：此处是在**累积了前面所有用例**的整棵 SVG 上做体检，
+// 元素总数取决于此前跑过哪些场景，写死具体数字只会变成一改夹具就红的脆断言。
+// 真正编码行为语义的判据在各自的小节里（方框数、连线数、命中底纹、坐标等），那里才该用等值。
 assert(boxRects.length >= 2, `方框数不足：期望至少 2 个，实际 ${boxRects.length}`);
 assert(paths.length >= 1, `连线数不足：期望至少 1 个，实际 ${paths.length}`);
 assert(texts.length >= 4, `文字不足：期望至少 4 个，实际 ${texts.length}`);
@@ -895,7 +1136,21 @@ assert(minusChecked >= 1, '没有检查到减号（collapse 模式）');
 // 箭头必须是 90° 折线（只含 L），不能是曲线。
 // 注意：图标也是 path，且字形本身就用 Q 二次贝塞尔，所以这里必须先按 class 过滤出连线。
 const edgePaths = paths.filter((element) => element.className.split(/\s+/).includes('edge'));
-assert(edgePaths.length >= 1, `连线路径数为 ${edgePaths.length}，应该至少 1 条`);
+// 期望条数由夹具推导：两端都能定位（节点与方框几何都存在）的边才会画出路径。
+// 夹具里没有收起的节点（collapsedCount = 0），所以不必再考虑被折叠祖先隐藏的情形。
+const fixtureSession = fixtureSessions[0];
+const fixtureEdgeCount = fixtureSession.edges.filter(
+  (edge) =>
+    fixtureSession.nodes[edge.from] !== undefined &&
+    fixtureSession.nodes[edge.to] !== undefined &&
+    fixtureSession.boxes[edge.from] !== undefined &&
+    fixtureSession.boxes[edge.to] !== undefined
+).length;
+assert(fixtureEdgeCount >= 1, `夹具里没有可画的边（${fixtureEdgeCount} 条），下面的断言会变成空断言`);
+assert(
+  edgePaths.length === fixtureEdgeCount,
+  `连线路径数应等于夹具里可定位的边数 ${fixtureEdgeCount}，实际 ${edgePaths.length}`
+);
 for (const element of edgePaths) {
   const d = String(element.getAttribute('d') ?? '');
   assert(d.includes('L'), `箭头应当是折线，实际 d=${d}`);
@@ -936,7 +1191,16 @@ log(`诊断: 方框边框色 = ${borderHex}（紫色且偏深）；方框 ${boxW
 
 // 标签栏：标题只有元素名（方向由图标表达）＋ 一个方向图标
 const tabsEl = byId.get('tabs');
-assert(tabsEl.children.length >= 1, `应当渲染出标签，实际 ${tabsEl.children.length} 个`);
+// 标签数 = 已下发的会话数（这一步只发过一次 init）。不写死 1：改夹具时断言会跟着走。
+// 另外「选中的标签有且只有一个」是真实不变式，与夹具大小无关。
+assert(
+  tabsEl.children.length === fixtureSessions.length,
+  `标签数应等于会话数 ${fixtureSessions.length}，实际 ${tabsEl.children.length} 个`
+);
+assert(
+  tabsEl.children.filter((tab) => tab.getAttribute('aria-selected') === 'true').length === 1,
+  '应当有且只有一个标签处于选中状态（aria-selected="true"）'
+);
 for (const tab of tabsEl.children) {
   const label = tab.children.find((child) => child.className.includes('tab-label'));
   assert(label !== undefined, '标签里缺少文字（.tab-label）');
@@ -1078,6 +1342,30 @@ for (const tab of tabsEl.children) {
       `加减号压到文字了：加减号左边 ${signLeft.toFixed(1)}，文字到 ${textEnd.toFixed(1)}`
     );
   }
+
+  // 列间隙：**按 DOM 里真正画出来的方框**量一遍，而不是只读布局算出来的数。
+  // 布局 → 负载 → 渲染这条链上任何一环把宽度或列位置弄错，这里都会露出来
+  // （只断言 relaid.boxes 的话，等于用布局自己的常量验证它自己）。
+  {
+    const boxX = (info) => {
+      const match = /translate\(\s*(-?[\d.]+)/.exec(String(info.group.getAttribute('transform') ?? ''));
+      return match ? Number(match[1]) : Number.NaN;
+    };
+    const shortRight = boxX(short) + short.width;
+    const longLeft = boxX(long);
+    assert(
+      Number.isFinite(shortRight) && Number.isFinite(longLeft),
+      `读不到方框的 x（DOM 里应当有 translate 变换）：short=${boxX(short)} long=${boxX(long)}`
+    );
+    const domGap = longLeft - shortRight;
+    assert(
+      domGap >= 52 - 0.5,
+      `DOM 实测的列间隙只有 ${domGap.toFixed(1)}px（应 ≥ COLUMN_GAP=52，否则方框会互相压住）`
+    );
+    log(
+      `诊断: DOM 实测列间隙 ${domGap.toFixed(1)}px（短框右边 ${shortRight.toFixed(1)} → 长框左边 ${longLeft.toFixed(1)}）`
+    );
+  }
   log(
     `诊断: 方框宽度自适应 短名 ${short.width} / 长名 ${long.width}；` +
       `加减号与文字最小间距 ${Math.min(
@@ -1092,7 +1380,7 @@ for (const tab of tabsEl.children) {
   // 第二次渲染同样内容时的探测次数必须是 0（这是「大图卡不卡」的关键指标）。
   const measuredBefore = measureProbeReads;
   assert(measuredBefore > 0, '首次渲染应当真的量过宽（说明桩或生产代码没走到量宽路径）');
-  sendToWebview({ type: 'settings', stickyParent: true, showLocation: true });
+  sendToWebview({ type: 'settings', settings: { stickyParent: true, showLocation: true } });
   flushFrames();
   assert(
     measureProbeReads === measuredBefore,
@@ -1430,6 +1718,8 @@ for (const tab of tabsEl.children) {
   });
 
   const reports = posted.slice(before).filter((m) => m.type === 'reportWidths');
+  // 这里只判"到底报没报"（存在性）。**不要**收紧成 `=== 1`：webview 会合并/去抖回传，
+  // 发几次属于允许的实现细节；真正编码语义的判据在下面两行（条目数 = 方框数、数值 = 实测宽度）。
   assert(reports.length >= 1, 'webview 渲染后没有回传实测宽度（宿主会一直用偏大的估宽排列）');
   const widths = reports[reports.length - 1].widths;
   assert(Array.isArray(widths) && widths.length === 2, `回传的宽度条目数不对：${JSON.stringify(widths)}`);
@@ -1473,6 +1763,7 @@ log('OK: 真实消息流下 DOM 里有方框、连线、文字、符号角标，
 
 for (const [buttonId, expectedType] of [
   ['btn-expand-all', 'expandAll'],
+  ['btn-expand-full', 'expandFull'], // 递归到底：与 expandAll 是两种消息，宿主那边不再受层数上限约束
   ['btn-settings', 'openSettings'],
   ['btn-copy-tab', 'copyTabText'],
   ['btn-collapse-all', 'collapse'], // 收起全部要把收起状态下发宿主（坐标由宿主算，漏了就只展开到第二级）
@@ -1498,7 +1789,10 @@ for (const [buttonId, expectedType] of [
     );
   }
 }
-log('诊断: 工具栏 5 个按钮的点击行为都正确（展开/设置/复制标签/关闭发消息，收起全部下发收起状态）');
+log(
+  `诊断: 工具栏 ${expectedButtons.length} 个按钮的点击行为都正确` +
+    '（展开全部发 expandAll、完全展开发 expandFull、设置/复制标签/关闭发消息，收起全部下发收起状态）'
+);
 
 // ------------------------------------------------ 单击高亮 + 方框右键菜单
 
@@ -1895,7 +2189,10 @@ setTimeout(() => {
     `大小写不敏感时 ALPHA 应命中 s0,s1，实际 ${idsWithClass('match').join(',') || '（无）'}`
   );
   assert(currentId() === 's0', '第一处命中应当被标成「当前命中」');
-  assert(searchCount.textContent === '1/2', `命中计数应为 1/2，实际 ${searchCount.textContent}`);
+  assert(
+    searchCount.textContent === '第 1/2 处',
+    `命中计数应写成「第 1/2 处」（明确是"第几处/共几处"，读屏也听得懂），实际 ${searchCount.textContent}`
+  );
 
   // 底纹只垫在**命中的元素名**上：没命中的节点不该有 name-hit（也不该动方框）
   const nameHitCount = (nodeId) => {
@@ -1956,10 +2253,16 @@ setTimeout(() => {
     `正则应命中 3 个节点，实际 ${idsWithClass('match').length}`
   );
   assert(currentId() === 's0', '初始应停在第一处命中');
-  assert(searchCount.textContent === '1/3', `计数应为 1/3，实际 ${searchCount.textContent}`);
+  assert(
+    searchCount.textContent === '第 1/3 处',
+    `计数应写成「第 1/3 处」，实际 ${searchCount.textContent}`
+  );
   byId.get('btn-search-next').dispatch('click', {});
   assert(currentId() === 's1', `「下一个」应跳到 s1，实际 ${currentId()}`);
-  assert(searchCount.textContent === '2/3', `计数应为 2/3，实际 ${searchCount.textContent}`);
+  assert(
+    searchCount.textContent === '第 2/3 处',
+    `计数应写成「第 2/3 处」，实际 ${searchCount.textContent}`
+  );
   byId.get('btn-search-next').dispatch('click', {});
   assert(currentId() === 's2', `「下一个」应跳到 s2，实际 ${currentId()}`);
   byId.get('btn-search-next').dispatch('click', {});
@@ -2434,13 +2737,23 @@ setTimeout(() => {
   sendSlot(false);
   clickExpander('a2', 'expand');
   sendSlot(true);
-
   // 夹具自检：a2 的空挡（按**布局**坐标估）应当明显大于一个方框高，才测得出两种情形
   const boxHeight = boxes.a2.height;
   const layoutSlot = boxes.a3.y - 12 - boxHeight - (boxes.a1.y + boxes.a1.height + 12);
   assert(
     layoutSlot > 100,
     `夹具的空挡应当足够大才测得出两种情形（实际 ${layoutSlot.toFixed(1)}）`
+  );
+
+  // 夹具基线锚点：下面的绝对锚点全部建立在「布局原样」之上，先把基线钉住 ——
+  // 基线一变（行高或行距改了），那几个手算值就必须重算，这里会直接给出提示。
+  //
+  // 绝对锚点与本节其它判据（居中 / 间距恰好 12 / 不重叠）的关系：后者是**相对**判据，
+  // 判据本身不钉住绝对位置 —— 例如整列一起平移后「间距恰好 12」依然成立。绝对锚点补的正是
+  // 这一段：相邻方框的落点、行高、行距这些常量一旦漂移，相对判据看不出来，字面量会立刻红。
+  assert(
+    boxes.a1.y === 0 && boxes.a2.y === 302.5 && boxes.a3.y === 605,
+    `夹具布局基线变了（a1=${boxes.a1.y} a2=${boxes.a2.y} a3=${boxes.a3.y}），下面的绝对锚点需要重新手算`
   );
 
   /** 同列相邻对（用**位移后**的实际位置算）——与后面几段同一套判据。 */
@@ -2492,6 +2805,10 @@ setTimeout(() => {
     Math.abs(centerInViewport('a2') - canvasEl.clientHeight / 2) <= 1,
     `空挡够用时 a2 应当钉在视口中央（中心 ${centerInViewport('a2').toFixed(1)}）`
   );
+  // 绝对锚点（由一次性探针实测，可手工复核）：视口 300、滚动 0、viewBox.y = −10
+  //   a2 中心 = viewBox.y + 视口半高 = −10 + 150 = 140 → 顶边 = 140 − 21.5 = 118.5
+  // 写成字面量而不是「照实现的公式再算一遍」：规则若整体写错，公式会跟着一起错，只有写死才会红。
+  assert(topOf('a2') === 118.5, `① 居中时 a2 顶边应当钉在 118.5，实际 ${topOf('a2')}`);
   assertNoOverlap('空挡内居中时');
 
   // ② 使劲往下滚：空挡不够用了 → 不再居中，而是**正好贴住下边界**（与下方邻居 12px）
@@ -2505,6 +2822,11 @@ setTimeout(() => {
     Math.abs(gapsAround('a2').below - 12) <= 0.5,
     `a2 应当正好贴住下方邻居的空挡边缘，实际间距 ${gapsAround('a2').below.toFixed(1)}px`
   );
+  // 绝对锚点：空挡下沿 = a2 子树的底端 = 末个孙框 a2_9 底边 593（= a3 顶边 605 − 行距 12）
+  assert(
+    topOf('a2') === 550,
+    `② 撞到下沿时 a2 顶边应当是 550（空挡下沿 593 − 框高 43），实际 ${topOf('a2')}`
+  );
   assertNoOverlap('向下撞到空挡边缘时');
 
   // ③ 视口很矮（期望位置在空挡上方）：贴住上边界，不压上方邻居
@@ -2514,6 +2836,11 @@ setTimeout(() => {
   assert(
     Math.abs(gapsAround('a2').above - 12) <= 0.5,
     `a2 应当正好贴住上方邻居的空挡边缘，实际间距 ${gapsAround('a2').above.toFixed(1)}px`
+  );
+  // 绝对锚点：空挡上沿 = a2 子树的顶端 = 首个孙框 a2_0 顶边 55（= a1 底边 43 + 行距 12）
+  assert(
+    topOf('a2') === 55,
+    `③ 撞到上沿时 a2 顶边应当是 55（空挡上沿，即 a1 底边 43 + 行距 12），实际 ${topOf('a2')}`
   );
   assertNoOverlap('向上撞到空挡边缘时');
 
@@ -3134,9 +3461,23 @@ setTimeout(() => {
   };
   clickExpander('a', 'collapse');
   clickExpander('a', 'expand');
+  // ⚠️ 判据不能写成 `expand || collapse`：上一步刚发过 collapse，后半支恒真，断言等于没写。
+  // 这里改为检查**同步给宿主的收起集合**：收起时含 a，展开时不含 a —— 这才是"加号点得开"。
+  const collapseMessages = posted.filter((message) => message.type === 'collapse');
   assert(
-    posted.some((message) => message.type === 'expand' || message.type === 'collapse'),
-    `第二级的加号应当能点开（实际发出 ${JSON.stringify(posted.map((m) => m.type))}）`
+    collapseMessages.length >= 2,
+    `两次点击都应把收起状态同步给宿主，实际发出 ${JSON.stringify(posted.map((m) => m.type))}`
+  );
+  const lastCollapse = collapseMessages[collapseMessages.length - 1];
+  assert(
+    Array.isArray(lastCollapse.collapsed),
+    `collapse 消息必须带 collapsed 数组，实际 ${JSON.stringify(lastCollapse)}`
+  );
+  assert(
+    !lastCollapse.collapsed.includes('a'),
+    `第二次点击（展开）后，「a」不应再出现在同步给宿主的收起集合里（实际 ${JSON.stringify(
+      lastCollapse.collapsed
+    )}）`
   );
 
   log(
@@ -3352,4 +3693,686 @@ setTimeout(() => {
       log('OK: 加载遮罩（转圈 + 取消 + 背景模糊）—— 快查询不闪、慢查询显示、可取消');
     }, 400);
   }, 400);
+}
+
+// ------------------------------------------------ 渲染路径数量级压测（只出数字，不判成败）
+//
+// 为什么放在这里：renderCheck 已经有完整的 DOM 桩与消息通道，直接用它放大节点数量最省事。
+// 量的是**我们自己的算法开销**（遍历、建元素、量宽缓存命中），不含浏览器的真实布局/绘制 ——
+// 后者在桩里没有。所以这里看的是「是否出现超线性的增长」，不是绝对帧时。
+{
+  try {
+    const { createLayout: buildLayout } = require(path.join(ROOT, 'dist', 'extension.js')).__layout;
+    console.log('=== 渲染路径数量级压测（DOM 桩，不含真实布局/绘制） ===');
+    for (const count of [200, 800, 1600]) {
+      const nodes = {};
+      const children = [];
+      for (let index = 0; index < count; index += 1) {
+        const id = `p${index}`;
+        children.push(id);
+        nodes[id] = {
+          id,
+          name: `func_${index}`,
+          file: `src/m${index % 40}/f${index}.cpp`,
+          line: 1 + (index % 500),
+          direction: 'callees',
+          depth: 1,
+          isCycle: false,
+          children: [],
+          parent: 'proot',
+          loaded: true,
+          kind: 'function',
+        };
+      }
+      nodes.proot = {
+        id: 'proot',
+        name: 'perf_root',
+        file: 'src/perf/root.cpp',
+        line: 1,
+        direction: 'callees',
+        depth: 0,
+        isCycle: false,
+        children,
+        loaded: true,
+        kind: 'function',
+      };
+      const layout = buildLayout(nodes, 'proot');
+      const boxes = layout.boxes;
+      const edges = children.slice(0, 40).map((id, index) => ({
+        id: `pe${index}`,
+        from: 'proot',
+        to: id,
+        depth: 1,
+      }));
+      const payload = {
+        type: 'sessionUpdate',
+        session: {
+          id: `perf-${count}`,
+          title: `压测 ${count}`,
+          description: '',
+          direction: 'callees',
+          engineLabel: 'clangd',
+          badge: 'clangd',
+          rootId: 'proot',
+          nodes,
+          edges,
+          boxes,
+          collapsedCount: 0,
+        },
+      };
+      const readsBefore = measureProbeReads;
+      const started = process.hrtime.bigint();
+      sendToWebview(payload);
+      const ms = Number(process.hrtime.bigint() - started) / 1e6;
+      const reads = measureProbeReads - readsBefore;
+      console.log(
+        `  ${String(count).padStart(5)} 节点：渲染 ${ms.toFixed(1)} ms（${((ms / count) * 1000).toFixed(1)} µs/节点），` +
+          `量宽探测 ${reads} 次`
+      );
+      // 第二次同数据：量宽缓存应当几乎不再探测（这是"大图不卡"的关键）
+      const readsBefore2 = measureProbeReads;
+      const started2 = process.hrtime.bigint();
+      sendToWebview(payload);
+      const ms2 = Number(process.hrtime.bigint() - started2) / 1e6;
+      console.log(
+        `        重复渲染：${ms2.toFixed(1)} ms，量宽探测 ${measureProbeReads - readsBefore2} 次（缓存生效时应接近 0）`
+      );
+    }
+  } catch (error) {
+    // ⚠️ 必须**判失败**，不能只打印：这一块本来就不做断言（只出数字），一旦它自己抛错，
+    // 表现是「压测数字凭空消失、退出码仍是 0」。本轮就踩过：生产代码新起的 logWarn 需要
+    // 桩里没有的 createOutputChannel，异常被这里吞掉，整段压测静默停摆。
+    console.error('渲染压测块出错（这是失败，不是跳过）：', error && error.stack);
+    process.exit(1);
+  }
+}
+
+// ------------------------------------------------ 截断必须出声（超过布局上限时）
+//
+// 以前这段警告写在排布循环**内部**，判据是「已经有节点被跳过 且 刚好排满上限」——
+// 排满的那一瞬间还没有任何节点被跳过，此后 placement 分支再也不进入，
+// 于是这条警告从来没打印过（「截断不能静默」等于没兑现）。这里直接钉住它真的出声。
+{
+  const EXTRA = 900;
+  const nodes = {};
+  const children = [];
+  for (let index = 0; index < EXTRA; index += 1) {
+    const id = `t${index}`;
+    children.push(id);
+    nodes[id] = {
+      id,
+      name: `t_${index}`,
+      file: 'x.c',
+      line: 1,
+      direction: 'callees',
+      depth: 1,
+      isCycle: false,
+      children: [],
+      parent: 'troot',
+      loaded: true,
+      kind: 'function',
+    };
+  }
+  nodes.troot = {
+    id: 'troot',
+    name: 'troot',
+    file: 'x.c',
+    line: 1,
+    direction: 'callees',
+    depth: 0,
+    isCycle: false,
+    children,
+    loaded: true,
+    kind: 'function',
+  };
+  const before = outputLines.length;
+  const layout = createLayout(nodes, 'troot');
+  const placed = Object.keys(layout.boxes).length;
+  // 800 = MAX_LAYOUT_NODES（另一处已有「MAX_LAYOUT_NODES ≥ MAX_EXPAND_NODES」的跨侧断言钉住它）
+  assert(placed === 800, `超过上限时方框数应当恰好是 800，实际 ${placed}`);
+  const warned = outputLines
+    .slice(before)
+    .filter((line) => line.level === 'warn' && line.message.includes('图过大'));
+  assert(
+    warned.length === 1,
+    `被截断时必须写一条日志说明（截断不能静默），实际新增 ${JSON.stringify(outputLines.slice(before))}`
+  );
+  assert(
+    warned[0].message.includes(`${EXTRA + 1 - 800} 个节点未显示`),
+    `日志要如实报出未显示的节点数（应为 ${EXTRA + 1 - 800}），实际「${warned[0].message}」`
+  );
+  log(`OK: 超过布局上限会明说 —— ${warned[0].message}`);
+}
+
+// ------------------------------------------------ 单击 / 步进的实测探针（只出数字；点击若不可用则跳过）
+//
+// 上一轮把「选中」与「上下键切换命中」改成只改 class（refreshStateClasses），不再重建 #nodes。
+// 这里派发真实点击，量出该路径耗时，并断言它**不触发量宽探测** —— 不重建 DOM 就不该量宽。
+{
+  try {
+    const container = document.getElementById('nodes');
+    // ⚠️ 不能写死某个 id：布局上限 800 且栈是 LIFO，实际渲染的是编号靠后的那些节点
+    // （实测容器里有 proot,p1599,p1598…），硬点 p5 会点到不存在的节点。
+    const target = container
+      ? [...container.children].find((child) => {
+          const id = child.getAttribute('data-node');
+          return Boolean(id) && id !== 'proot';
+        })
+      : undefined;
+    if (!target || typeof target.dispatch !== 'function') {
+      // 具体说明缺什么，避免"取不到"这种含糊结论（上一轮就是被它耽误的）
+      console.log(
+        '=== 单击探针跳过 === ' +
+          '容器=' +
+          (container ? `有（子节点 ${container.children.length} 个）` : '无') +
+          '，目标节点=' +
+          (target ? '有' : '无') +
+          '，dispatch=' +
+          (target && typeof target.dispatch === 'function' ? '有' : '无') +
+          (container && container.children.length > 0
+            ? `，前几个 data-node=${[...container.children]
+                .slice(0, 5)
+                .map((child) => child.getAttribute('data-node'))
+                .join(',')}`
+            : '')
+      );
+    } else {
+      const readsBefore = measureProbeReads;
+      const started = process.hrtime.bigint();
+      const clicks = 20;
+      for (let index = 0; index < clicks; index += 1) {
+        target.dispatch('click', { button: 0, detail: 1 });
+      }
+      const ms = Number(process.hrtime.bigint() - started) / 1e6;
+      const reads = measureProbeReads - readsBefore;
+      const selected = String(target.getAttribute('class') ?? '').includes('selected');
+      console.log('=== 单击 / 步进实测探针 ===');
+      console.log(
+        `  ${clicks} 次单击：${ms.toFixed(1)} ms（${(ms / clicks).toFixed(2)} ms/次），量宽探测 ${reads} 次；` +
+          `节点是否已选中：${selected ? '是' : '否'}`
+      );
+      if (selected) {
+        assert(
+          reads === 0,
+          `只改 class 的选中路径不该触发量宽探测（实际 ${reads} 次）——说明它又在重建 DOM`
+        );
+      } else {
+        console.log('  （点击没有改变选中态，说明桩的事件路径与实现不同，未做断言）');
+      }
+    }
+  } catch (error) {
+    console.error('单击探针出错（不影响断言）：', error && error.message);
+  }
+}
+
+// ------------------------------------------------ 搜索框打字实测探针（只出数字 + 两条不变式）
+//
+// 以前每敲一个字符都 render() 全量重建 #nodes（800 个方框约 40 ms）。现在走 refreshSearchMarks()
+// 就地增删 class 与底纹。这里量出耗时，并钉住两条不变式：不重建、不量宽。
+{
+  try {
+    const input = document.getElementById('search-input');
+    const container = document.getElementById('nodes');
+    if (!input || !container || typeof input.dispatch !== 'function') {
+      console.log('=== 打字探针跳过：桩里取不到搜索框或节点容器 ===');
+    } else {
+      const before = container.children.length;
+      const readsBefore = measureProbeReads;
+      const keys = ['f', 'fu', 'fun', 'func', 'func_', 'func_1', 'func_15', 'func_159', 'func_1599'];
+      const started = process.hrtime.bigint();
+      for (const key of keys) {
+        input.value = key;
+        input.dispatch('input', {});
+      }
+      const ms = Number(process.hrtime.bigint() - started) / 1e6;
+      const reads = measureProbeReads - readsBefore;
+      const after = container.children.length;
+      console.log('=== 搜索框打字实测探针 ===');
+      console.log(
+        `  连打 ${keys.length} 个字符：${ms.toFixed(1)} ms（${(ms / keys.length).toFixed(2)} ms/字符），` +
+          `量宽探测 ${reads} 次`
+      );
+      console.log(`  #nodes 元素数：${before} → ${after}（不变才说明没有重建 DOM）`);
+      assert(
+        after === before,
+        `打字改变了 #nodes 的元素数（${before} → ${after}）——说明又走了全量重建`
+      );
+      assert(reads === 0, `打字触发了 ${reads} 次量宽探测，底纹宽度本应命中缓存`);
+    }
+  } catch (error) {
+    console.error('打字探针出错（不影响断言）：', error && error.message);
+  }
+}
+
+
+
+// ------------------------------------------------ 路径显示方式（省略几层 / 完整 / 锚点）
+//
+// 需求来自真实场景：一个目录下并列很多 chip / board，每个 chip 下又有同名文件，
+// 只显示末尾几层无法区分是哪个 chip。这里把三种口径都钉住，并做**跨侧等值**检查 ——
+// 宿主（估宽）与 webview（渲染）各有一份同样的逻辑，一旦漂移，列宽就会与文字对不上。
+{
+  const layoutApi = extensionBundle.__layout;
+  assert(
+    typeof layoutApi.displayPathText === 'function',
+    '产物没有导出 __layout.displayPathText，跨侧一致性无法验证'
+  );
+
+  // ⚠️ 歧义只在「区分用的那一段落到了预算窗口之外」时才出现：短路径（33 字符）整体放得下、
+  // 本来就能区分，所以这里**必须用足够深的路径**才能复现用户报的场景。
+  const BOARD_A = 'components/BSP/board_a/src/drivers/display/lcd/lcd_init.c';
+  const BOARD_B = 'components/BSP/board_b/src/drivers/display/lcd/lcd_init.c';
+  const BOARD_A_SHORT = 'components/BSP/board_a/src/main.c';
+  const BOARD_B_SHORT = 'components/BSP/board_b/src/main.c';
+  const DEEP = 'src/modules/display/driver/lcd/lcd_init.c';
+  const SHORT = 'main/main.c';
+  // 目录名里带连字符：用来钉住「整串名字优先于偏移解析」这条规则
+  const HYPHEN = 'components/BSP/chip-01/main.c';
+  const paths = [BOARD_A, BOARD_B, DEEP, SHORT, BOARD_A_SHORT, BOARD_B_SHORT, HYPHEN];
+  const ids = [];
+  const nodes = {};
+  for (const [index, file] of paths.entries()) {
+    const id = `pd${index}`;
+    ids.push(id);
+    nodes[id] = {
+      id,
+      name: `pd_${index}`,
+      file,
+      line: index + 1,
+      direction: 'callers',
+      depth: 1,
+      isCycle: false,
+      children: [],
+      parent: 'pdroot',
+      loaded: true,
+      kind: 'function',
+    };
+  }
+  nodes.pdroot = {
+    id: 'pdroot',
+    name: 'pdroot',
+    file: 'pdroot.c',
+    line: 1,
+    direction: 'callers',
+    depth: 0,
+    isCycle: false,
+    children: ids,
+    loaded: true,
+    kind: 'function',
+  };
+
+  /** 把当前设置下的图发下去，并取回每个节点方框里那行「路径:行号」。 */
+  const renderWith = (settings) => {
+    sendToWebview({ type: 'settings', settings: { showLocation: true, ...settings } });
+    const boxes = createLayout(nodes, 'pdroot').boxes;
+    sendToWebview({
+      type: 'sessionUpdate',
+      session: {
+        id: 'path-display',
+        title: '路径显示',
+        description: '',
+        direction: 'callers',
+        engineLabel: 'clangd',
+        rootId: 'pdroot',
+        nodes,
+        edges: [],
+        boxes,
+        collapsedCount: 0,
+      },
+    });
+    const read = (id) => {
+      const group = nodesGroup.children.find((child) => child.getAttribute('data-node') === id);
+      const loc = group?.children.find((child) => child.getAttribute('class') === 'loc');
+      return String(loc?.textContent ?? '');
+    };
+    return read;
+  };
+
+  /** 同一份设置给宿主函数与 webview 各算一遍，逐条比对（跨侧漂移就会红）。 */
+  const assertCrossSide = (options, label) => {
+    const read = renderWith({
+      pathDisplay: options.mode,
+      pathTailLevels: options.tailLevels,
+      pathAnchors: options.anchors,
+    });
+    for (const [index, file] of paths.entries()) {
+      const expected = `${layoutApi.displayPathText(file, options)}:${index + 1}`;
+      const actual = read(`pd${index}`);
+      assert(
+        actual === expected,
+        `${label}：${file} 的显示文字两侧不一致 —— webview=「${actual}」，宿主=「${expected}」`
+      );
+    }
+    return read;
+  };
+
+  // ① 默认口径必须**等于 0.20 的行为**（按宽度自动）：深路径保留末尾若干段，短路径原样
+  const defaultOptions = { ...layoutApi.DEFAULT_PATH_OPTIONS };
+  const readDefault = assertCrossSide(defaultOptions, '默认（按宽度自动）');
+  // ⚠️ 样例必须**当场取**：read* 读的是当前 DOM，等最后再读就只剩最后一次渲染的结果，
+  // 日志会显示成「五种模式一模一样」，看着像功能没生效。
+  const sampleDefault = readDefault('pd0');
+  assert(
+    readDefault('pd2') === `…/modules/display/driver/lcd/lcd_init.c:3`,
+    `默认口径应当与 0.20 一致（40 字符内尽量多留末尾段），实际「${readDefault('pd2')}」`
+  );
+  assert(readDefault('pd3') === 'main/main.c:4', `短路径应当原样显示，实际「${readDefault('pd3')}」`);
+  // 用户报的场景：深路径下两个 board 的同名文件**完全无法区分**（只差行号）
+  const pathPart = (text) => text.replace(/:\d+$/, '');
+  assert(
+    pathPart(readDefault('pd0')) === pathPart(readDefault('pd1')),
+    `默认口径下两条 board 路径应当长得一样（这正是要解决的问题），实际「${readDefault('pd0')}」「${readDefault('pd1')}」`
+  );
+
+  // ② 只在末尾留 2 层：仍是同名，形状变成 `…/lcd/lcd_init.c`
+  const tailTwo = { ...defaultOptions, tailLevels: 2 };
+  const readTail = assertCrossSide(tailTwo, '末尾 2 层');
+  const sampleTail = readTail('pd0');
+  assert(
+    readTail('pd0') === '…/lcd/lcd_init.c:1' && pathPart(readTail('pd0')) === pathPart(readTail('pd1')),
+    `末尾 2 层应当显示成「…/lcd/lcd_init.c:1」且两条仍相同，实际「${readTail('pd0')}」「${readTail('pd1')}」`
+  );
+
+  // ③ 纯偏移锚点：`+3` = 从根数第 3 段（board_a / board_b 就在第 3 段）→ 两条终于分得开
+  const byLevel = { ...tailTwo, anchors: ['+3'] };
+  const readLevel = assertCrossSide(byLevel, '锚点 +3');
+  const sampleLevel = readLevel('pd0');
+  assert(
+    readLevel('pd0') === '…/board_a/…/lcd/lcd_init.c:1',
+    `锚点 +3 应当显示成「…/board_a/…/lcd/lcd_init.c:1」，实际「${readLevel('pd0')}」`
+  );
+  assert(
+    readLevel('pd1') === '…/board_b/…/lcd/lcd_init.c:2',
+    `另一条应当显示成「…/board_b/…/lcd/lcd_init.c:2」，实际「${readLevel('pd1')}」`
+  );
+
+  // ④ 名字锚点：`BSP` 保留该段本身
+  const byName = { ...tailTwo, anchors: ['BSP'] };
+  const readName = assertCrossSide(byName, '名字锚点 BSP');
+  const sampleName = readName('pd0');
+  assert(
+    readName('pd0') === '…/BSP/…/lcd/lcd_init.c:1',
+    `名字锚点应当显示成「…/BSP/…/lcd/lcd_init.c:1」，实际「${readName('pd0')}」`
+  );
+
+  // ⑤ 相对偏移且**基准段不显示**：`BSP+1` 只保留下一级（board_a），正是「只显示偏移出来的目录」
+  const byOffset = { ...tailTwo, anchors: ['BSP+1'] };
+  const readOffset = assertCrossSide(byOffset, '锚点 BSP+1（基准不显示）');
+  const sampleOffset = readOffset('pd0');
+  assert(
+    readOffset('pd0') === '…/board_a/…/lcd/lcd_init.c:1',
+    `BSP+1 应当只显示偏移出来的那一段（…/board_a/…），实际「${readOffset('pd0')}」`
+  );
+  assert(
+    readOffset('pd1') === '…/board_b/…/lcd/lcd_init.c:2',
+    `另一条应当是 board_b，实际「${readOffset('pd1')}」`
+  );
+
+  // ⑥ 多层组合：基准与偏移各单列一条 → 两者都显示，且相邻段连在一起（中间不加省略号）
+  const combined = { ...tailTwo, anchors: ['BSP', 'BSP+1'] };
+  const readCombined = assertCrossSide(combined, '锚点 BSP + BSP+1');
+  const sampleCombined = readCombined('pd0');
+  assert(
+    readCombined('pd0') === '…/BSP/board_a/…/lcd/lcd_init.c:1',
+    `组合锚点应当显示成「…/BSP/board_a/…/lcd/lcd_init.c:1」，实际「${readCombined('pd0')}」`
+  );
+
+  // ⑦ 从文件名往上数：`-1` = 文件所在目录
+  const byTail = { ...tailTwo, anchors: ['-1'] };
+  const readTailAnchor = assertCrossSide(byTail, '锚点 -1');
+  assert(
+    readTailAnchor('pd0') === '…/lcd/lcd_init.c:1',
+    `-1 应当取到文件所在目录，实际「${readTailAnchor('pd0')}」`
+  );
+
+  // ⑧ 目录名本身带 `-` 时不能被当成偏移（解析顺序：整串名字优先）
+  const hyphen = { ...defaultOptions, tailLevels: 1, anchors: ['chip-01'] };
+  const readHyphen = assertCrossSide(hyphen, '锚点 chip-01（含连字符的目录名）');
+  const sampleHyphen = readHyphen('pd6');
+  assert(
+    readHyphen('pd6') === '…/chip-01/main.c:7',
+    `含连字符的目录名应当被整串匹配，实际「${readHyphen('pd6')}」`
+  );
+
+  // ⑨ 完整显示：放得下就给整条路径（两条 board 路径自然也能区分）
+  const fullMode = { ...defaultOptions, mode: 'full' };
+  const readFull = assertCrossSide(fullMode, '完整显示');
+  const sampleFull = readFull('pd4');
+  assert(
+    readFull('pd4') === `${BOARD_A_SHORT}:5`,
+    `放得下的路径应当整条显示，实际「${readFull('pd4')}」`
+  );
+  assert(
+    readFull('pd4') !== readFull('pd5'),
+    `完整显示下两条短 board 路径必须不同，实际「${readFull('pd4')}」「${readFull('pd5')}」`
+  );
+  // 放不下的长路径：保留首尾（含文件名）且不超长 —— 完整路径的承诺由**悬停提示**兜底
+  assert(
+    readFull('pd2').length <= 45 && readFull('pd2').includes('lcd_init.c'),
+    `放不下的长路径应当保留首尾（含文件名）且不超长，实际「${readFull('pd2')}」`
+  );
+  {
+    const group = nodesGroup.children.find((child) => child.getAttribute('data-node') === 'pd0');
+    const tip = group?.children.find((child) => child.tagName === 'title');
+    assert(
+      String(tip?.textContent ?? '').includes(BOARD_A),
+      `悬停提示里必须始终有完整路径，实际「${String(tip?.textContent ?? '').replace(/\n/g, ' / ')}」`
+    );
+  }
+
+  // 收尾：把设置恢复成默认，免得影响后面的用例
+  sendToWebview({
+    type: 'settings',
+    settings: { showLocation: true, pathDisplay: 'tail', pathTailLevels: 0, pathAnchors: [] },
+  });
+  log(
+    `诊断: 路径显示 —— 默认「${sampleDefault}」、末尾 2 层「${sampleTail}」、` +
+      `层号锚点「${sampleLevel}」、名字锚点「${sampleName}」、完整「${sampleFull}」`
+  );
+  console.log('OK: 路径显示方式 —— 三种口径与两种锚点都生效，且宿主与 webview 两侧文字完全一致');
+}
+
+// ------------------------------------------------ 标签切换：点得动，且 relayout 不许抢活动标签
+//
+// 用户实测：多个标签时只有最新那个点得动。原因是两个方向各有一半 —— 宿主只补发内容、
+// 不下发 selectTab；而 webview 只在**新会话**的 sessionUpdate 里认领活动标签
+// （否则 relayout 逐个重发时标签会自己跳到最后）。这里把两半都钉住。
+{
+  const mkTabSession = (id, rootName) => {
+    const session = makeSession('callers');
+    session.id = id;
+    session.title = rootName;
+    session.nodes = {
+      root: { ...session.nodes.root, name: rootName, detail: `void ${rootName}(void)` },
+      child: { ...session.nodes.child },
+    };
+    return session;
+  };
+  const sessionA = mkTabSession('tab-a', 'switchA');
+  const sessionB = mkTabSession('tab-b', 'switchB');
+  const tabLabel = (tab) =>
+    String(tab.children.find((child) => child.className.includes('tab-label'))?.textContent ?? '');
+  const activeLabel = () =>
+    tabLabel(byId.get('tabs').children.find((tab) => tab.getAttribute('aria-selected') === 'true'));
+  const renderedNames = () =>
+    nodesEl
+      .flatten()
+      .filter((element) => element.tagName === 'text')
+      .map((element) => String(element.textContent));
+
+  sendToWebview({ type: 'sessionUpdate', session: sessionA });
+  sendToWebview({ type: 'sessionUpdate', session: sessionB });
+  assert(
+    activeLabel() === 'switchB',
+    `新会话应当抢到活动标签（期望 switchB，实际 ${activeLabel()}）`
+  );
+  assert(
+    renderedNames().includes('switchB') && !renderedNames().includes('switchA'),
+    `画布上应当只画活动会话的图（实际 ${renderedNames().join(',')}）`
+  );
+
+  posted.length = 0;
+  const tabA = byId
+    .get('tabs')
+    .children.find((tab) => tabLabel(tab) === 'switchA');
+  assert(tabA !== undefined, '标签栏里找不到 switchA 的标签');
+  tabA.dispatch('click', {});
+  // webview → 宿主：点标签只发请求，切不切由宿主说了算（这也是分叉的源头）
+  const requested = posted.filter((message) => message.type === 'selectTab');
+  assert(
+    requested.length === 1 && requested[0].id === 'tab-a',
+    `点标签应当发出 selectTab(tab-a)，实际 ${JSON.stringify(requested)}`
+  );
+  assert(
+    activeLabel() === 'switchB',
+    `只发请求、还没收到宿主回执时不应自行切换（实际 ${activeLabel()}）`
+  );
+
+  // 宿主 → webview：显式回执才是切换动作
+  sendToWebview({ type: 'selectTab', id: 'tab-a' });
+  assert(activeLabel() === 'switchA', `收到回执后活动标签应当切到 switchA，实际 ${activeLabel()}`);
+  assert(
+    renderedNames().includes('switchA') && !renderedNames().includes('switchB'),
+    `切换后画布应当换成 switchA 的图（实际 ${renderedNames().join(',')}）`
+  );
+
+  // 键盘也要能切：div[role=tab] 不会因回车自动产生 click，而漫游 tabindex 把非活动标签
+  // 移出了 Tab 序列 —— 不接键盘的话，唯一能聚焦的标签反而按不动。
+  posted.length = 0;
+  tabA.dispatch('keydown', { key: 'Enter', preventDefault() {} });
+  assert(
+    posted.some((message) => message.type === 'selectTab' && message.id === 'tab-a'),
+    `在标签上按回车应当切换，实际发出 ${JSON.stringify(posted)}`
+  );
+  posted.length = 0;
+  const activeTab = byId
+    .get('tabs')
+    .children.find((tab) => tab.getAttribute('aria-selected') === 'true');
+  activeTab.dispatch('keydown', { key: 'ArrowRight', preventDefault() {} });
+  assert(
+    posted.some((message) => message.type === 'selectTab' && message.id !== 'tab-a'),
+    `方向键应当在标签之间移动并切换，实际发出 ${JSON.stringify(posted)}`
+  );
+  // 回到 switchA，保持后面的断言前提不变
+  sendToWebview({ type: 'selectTab', id: 'tab-a' });
+
+  // 反向守卫：relayout（把非活动会话重发一遍）绝不能把活动标签抢走 ——
+  // 这正是「只在**新会话**的 sessionUpdate 里认领活动标签」那条规则的用途。
+  sendToWebview({ type: 'sessionUpdate', session: sessionB });
+  assert(
+    activeLabel() === 'switchA',
+    `重发非活动会话不应抢走活动标签（实际 ${activeLabel()}）`
+  );
+  console.log(
+    'OK: 标签切换 —— 点标签发 selectTab、宿主回执后才切换，且重发其它会话不会抢走活动标签'
+  );
+}
+
+// ------------------------------------------------ 新查询：根方框必须被摆到视口中央
+//
+// 真实的消息顺序是「先 update（标签摘要）→ 再 sessionUpdate（内容）」：宿主 addSession 里先把
+// 会话 push 进 sessions，紧接着 setViewVisible() 就会带着这个新标签发一次 update，前端于是
+// **先建了一个没有内容的占位会话**。若「要不要把根摆到中央」按 isNew（有没有听说过这个会话）判，
+// 内容到达时 isNew 已经是 false，居中就永远不会发生 —— 新图停在内容左上角，调用者多的时候
+// 连被查询的那个符号都看不见。这里按真实顺序复现一次，钉住「首次拿到内容才居中」。
+{
+  const CALLER_COUNT = 40;
+  const callerIds = Array.from({ length: CALLER_COUNT }, (_, index) => `caller${index}`);
+  const nodes = {};
+  for (const [index, id] of callerIds.entries()) {
+    nodes[id] = {
+      id,
+      name: `caller_${index}`,
+      file: 'x.c',
+      line: index + 1,
+      direction: 'callers',
+      depth: 1,
+      isCycle: false,
+      children: [],
+      parent: 'centerRoot',
+      loaded: true,
+      canExpand: false,
+      kind: 'function',
+    };
+  }
+  nodes.centerRoot = {
+    id: 'centerRoot',
+    name: 'centerRoot',
+    detail: 'void centerRoot(void)',
+    file: 'x.c',
+    line: 1,
+    direction: 'callers',
+    depth: 0,
+    isCycle: false,
+    children: callerIds,
+    loaded: true,
+    canExpand: false,
+    kind: 'function',
+  };
+  const boxes = createLayout(nodes, 'centerRoot').boxes;
+  const centerSession = {
+    id: 'center-check',
+    title: 'centerRoot',
+    description: 'x.c:1',
+    direction: 'callers',
+    engineLabel: 'clangd',
+    rootId: 'centerRoot',
+    nodes,
+    edges: callerIds.map((id) => ({ id: `e_${id}`, from: id, to: 'centerRoot', depth: 1 })),
+    boxes,
+    collapsedCount: 0,
+  };
+  // ⚠️ 必须等**其它小节注册的定时器全部跑完**再动手：本文件靠 setTimeout 串起好几段
+  // 异步小节（遮罩 400ms、宽会话 20ms…），它们会在主脚本结束后依次醒来、各自切换活动会话。
+  // 早先这个用例只等 50ms，醒来时看到的活动会话已经被别人换掉了（viewBox 与方框数都不是
+  // 自己那张图），等于在别人的画布上断言。900ms 覆盖掉所有更早的定时器。
+  setTimeout(() => {
+    canvasEl.clientWidth = 800;
+    canvasEl.clientHeight = 400;
+    canvasEl.scrollLeft = 0;
+    canvasEl.scrollTop = 0;
+    // 真实顺序：先摘要（前端建占位），再内容
+    sendToWebview({
+      type: 'update',
+      sessions: [
+        {
+          id: centerSession.id,
+          title: centerSession.title,
+          description: centerSession.description,
+          direction: 'callers',
+        },
+      ],
+      activeId: centerSession.id,
+    });
+    sendToWebview({ type: 'sessionUpdate', session: centerSession });
+
+    setTimeout(() => {
+      assert(
+        Object.keys(boxes).length === CALLER_COUNT + 1,
+        `居中用例的图应当有 ${CALLER_COUNT + 1} 个方框，实际 ${Object.keys(boxes).length}`
+      );
+      assert(
+        nodesGroup.children.some((child) => child.getAttribute('data-node') === 'centerRoot'),
+        `居中用例醒来时画布上应当是它自己的图，实际 viewBox=${svg.getAttribute('viewBox')}、` +
+          `方框数=${nodesGroup.children.length}`
+      );
+      const rootBox = boxes.centerRoot;
+      // 内容比视口高得多，夹具才区分得出「居中」与「停在左上角」
+      const contentHeight = Math.max(...Object.values(boxes).map((box) => box.y + box.height));
+      assert(
+        contentHeight > canvasEl.clientHeight * 2,
+        `居中用例的内容高度应当明显超过视口（内容 ${contentHeight}，视口 ${canvasEl.clientHeight}）`
+      );
+      // 屏幕位置按**实际 viewBox** 反解（与粘性小节同一套算法），不照搬实现里的公式
+      const viewBoxY = Number(String(svg.getAttribute('viewBox')).split(/\s+/)[1]);
+      const rootCenter = rootBox.y + rootBox.height / 2;
+      const screenCenter = rootCenter - viewBoxY - Number(canvasEl.scrollTop || 0);
+      assert(
+        Math.abs(screenCenter - canvasEl.clientHeight / 2) <= 1,
+        `新查询应把根方框摆到视口中央：根中心 ${rootCenter}、viewBox.y ${viewBoxY}、` +
+          `滚动 ${canvasEl.scrollTop} → 屏幕位置 ${screenCenter}（应约等于 ${canvasEl.clientHeight / 2}）`
+      );
+      log('OK: 新查询把根方框摆到视口中央 —— 在「先摘要、后内容」的真实顺序下也成立');
+    }, 30);
+  }, 900);
 }

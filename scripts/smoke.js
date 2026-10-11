@@ -698,6 +698,50 @@ async function main() {
     captured.posted.some((message) => message.type === 'init'),
     '未收到 init 消息'
   );
+  // 路径显示方式必须真的随 init 下发（webview 读不到 VS Code 设置）：
+  // 宿主漏发时四项设置全都不生效，而界面上不会有任何报错。
+  {
+    const initMessage = [...captured.posted].reverse().find((message) => message.type === 'init');
+    const settings = initMessage?.settings ?? {};
+    for (const key of ['pathDisplay', 'pathTailLevels', 'pathAnchors']) {
+      assert(
+        Object.prototype.hasOwnProperty.call(settings, key),
+        `init 的 settings 里应当带 ${key}，实际 ${JSON.stringify(settings)}`
+      );
+    }
+    assert(
+      settings.pathDisplay === 'tail' && settings.pathTailLevels === 0,
+      `路径显示默认应当是「按宽度自动省略」，实际 ${JSON.stringify({
+        pathDisplay: settings.pathDisplay,
+        pathTailLevels: settings.pathTailLevels,
+      })}`
+    );
+    assert(
+      Array.isArray(settings.pathAnchors) && settings.pathAnchors.length === 0,
+      `锚点默认应当是空数组，实际 ${JSON.stringify(settings.pathAnchors)}`
+    );
+    // 锚点设置的两种写法都要能用：逗号分隔的字符串，以及「数组里塞一条逗号串」
+    // （后者是用户实际写出来的形式，早期版本会把它当成**一个**模式而静默失效）
+    const anchorsAfterReady = async (value) => {
+      configStore['cppCallGraph.pathAnchors'] = value;
+      captured.posted.length = 0;
+      fake.send({ type: 'ready' });
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      const message = [...captured.posted].reverse().find((item) => item.type === 'init');
+      return message?.settings?.pathAnchors;
+    };
+    const fromString = await anchorsAfterReady('chip,chip+1');
+    assert(
+      Array.isArray(fromString) && fromString.join('|') === 'chip|chip+1',
+      `"chip,chip+1" 应当被拆成两个模式，实际 ${JSON.stringify(fromString)}`
+    );
+    const fromArray = await anchorsAfterReady(['chip,chip+1']);
+    assert(
+      Array.isArray(fromArray) && fromArray.join('|') === 'chip|chip+1',
+      `["chip,chip+1"] 这种写法也应当被拆成两个模式，实际 ${JSON.stringify(fromArray)}`
+    );
+    delete configStore['cppCallGraph.pathAnchors'];
+  }
   console.log(
     `诊断: 视图已解析，HTML 长度 ${html.length}，脚本 src=${scriptMatch[1]}，localResourceRoots=${roots
       .map((root) => root.fsPath)
@@ -732,12 +776,22 @@ async function main() {
     `标签标题应当只有元素名（不带方向前缀），实际 ${JSON.stringify(payload.title)}`
   );
   assert(payload.direction === 'callers', `方向不对: ${payload.direction}`);
-  assert(Object.keys(payload.nodes).length >= 3, '根节点 + 两个调用者应有至少 3 个节点');
+  // 这个场景的节点是确定的：根 + 两个调用者。写等值断言，让"夹具多出节点"变成**必须显式改**的动作，
+  // 而不是被 `>=` 悄悄放过去（松阈值正是前几轮埋掉真实回归的原因）。
+  assert(
+    Object.keys(payload.nodes).length === 3,
+    `本场景应当是「根 + 两个调用者」共 3 个节点，实际 ${Object.keys(payload.nodes).length}`
+  );
   const firstSessionId = payload.id;
 
   // 4) 调用点信息（谁在第几行调用了谁）
   const withCallSite = Object.values(payload.nodes).filter((node) => node.callSite);
-  assert(withCallSite.length >= 1, '节点缺少调用点信息');
+  // 语义不变式：**除根以外**每个节点都带调用点信息（根是查询起点，本来就没有调用点）。
+  // 比 `>= 1` 强得多：漏掉任何一个调用者的调用点都会立刻红。
+  assert(
+    withCallSite.length === Object.keys(payload.nodes).length - 1,
+    `应当除根以外都有调用点信息：期望 ${Object.keys(payload.nodes).length - 1} 个，实际 ${withCallSite.length} 个`
+  );
   assert(
     withCallSite.every((node) => typeof node.callSite.line === 'number' && node.callSite.file),
     '调用点信息不完整'
@@ -955,17 +1009,28 @@ async function main() {
     `第二次「展开全部」没有生效：${Object.keys(reopened.nodes).length} → ${secondCount}`
   );
 
-  // 同一个标签上连点两次也必须有效果（第一次已展开完，第二次至少不能报错）
+  // 同一个标签上连点两次：第二次**本就应当什么都不做**
+  // （节点不变，也不再向语言服务发请求 —— 已经全部展开了）。
+  // ⚠️ 原来的判据是"节点数不减少（>= secondCount）"，那对任何实现都恒真，
+  // 等于什么都没验证；现在同时钉住"节点数不变"与"零新请求"。
+  const callsBeforeSecondClick = captured.incomingCalls + captured.prepareCalls;
   fake.send({ type: 'expandAll', sessionId: afterSecond.id });
   await new Promise((resolve) => setTimeout(resolve, 200));
   const afterThird = lastSessionPayload();
+  const thirdCount = Object.keys(afterThird.nodes).length;
+  const callsAfterSecondClick = captured.incomingCalls + captured.prepareCalls;
   assert(
-    Object.keys(afterThird.nodes).length >= secondCount,
-    '同一标签上再点一次「展开全部」不应让节点变少'
+    thirdCount === secondCount,
+    `已完全展开后再点「展开全部」不应改变节点数：${secondCount} → ${thirdCount}`
+  );
+  assert(
+    callsAfterSecondClick === callsBeforeSecondClick,
+    `已完全展开后再点「展开全部」不应再向语言服务发请求：${callsBeforeSecondClick} → ${callsAfterSecondClick}`
   );
   console.log(
-    `诊断: 同一标签连点第二次 → 节点 ${Object.keys(afterThird.nodes).length}（不减少即正确）`
+    `诊断: 同一标签连点第二次 → 节点仍 ${thirdCount}，语言服务请求 ${callsBeforeSecondClick} → ${callsAfterSecondClick}（两者都应不变）`
   );
+  console.log('OK: 「展开全部」连点安全 —— 新标签上生效，已展开的标签上不再重复请求');
 
   // 回归（用户 2026-10-10 实测）：收起全部 → 展开全部之后，宿主不得留着旧的「已收起」集合。
   // 宿主按那份集合算坐标，旧集合会让被当成收起的子树整棵没有坐标 ——
@@ -1060,6 +1125,61 @@ async function main() {
     afterExpand2 >= afterExpand1,
     `第二次「展开全部」让节点变少了：${afterExpand1} → ${afterExpand2}`
   );
+
+  // 「完全展开」：递归到底（不受 maxExpandRounds 约束），且**每个节点都必须有坐标** ——
+  // 宿主侧的节点总数上限与布局上限不一致时，超出的节点会既无方框也无连线（静默消失）。
+  {
+    currentRootName = 'leafAdd';
+    await registered.get('cppCallGraph.showCallers')();
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    const fullSessionId = lastSessionPayload().id;
+    const beforeFull = Object.keys(lastSessionPayload().nodes).length;
+    fake.send({ type: 'expandFull', sessionId: fullSessionId });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const fullPayload = lastSessionPayload();
+    const fullNodes = Object.keys(fullPayload.nodes).length;
+    const fullBoxes = Object.keys(fullPayload.boxes).length;
+    console.log(`诊断: 完全展开 → ${beforeFull} → ${fullNodes} 个节点，出坐标 ${fullBoxes} 个`);
+    assert(
+      fullNodes >= beforeFull,
+      `「完全展开」让节点变少了：${beforeFull} → ${fullNodes}`
+    );
+    assert(
+      fullBoxes === fullNodes,
+      `「完全展开」后每个节点都要有坐标（节点 ${fullNodes} 个、坐标 ${fullBoxes} 个）——` +
+        '不一致说明有节点没有方框，用户看不到它'
+    );
+
+    // 层数上限来自设置：两次都从**同样的新会话**出发，只改设置，比展开后的节点数
+    // （⚠️ 不能拿「没展开过的新会话」当默认档基准 —— 那是 3 个节点的初始图，
+    //   与「展开 1 层得到的 5 个」不是同一件事，本用例第一版就是这么比错的）
+    const expandWith = async (rounds) => {
+      currentRootName = 'leafAdd';
+      await registered.get('cppCallGraph.showCallers')();
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      if (rounds === undefined) {
+        delete configStore['cppCallGraph.maxExpandRounds'];
+      } else {
+        configStore['cppCallGraph.maxExpandRounds'] = rounds;
+      }
+      fake.send({ type: 'expandAll', sessionId: lastSessionPayload().id });
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      return Object.keys(lastSessionPayload().nodes).length;
+    };
+    const fiveRoundNodes = await expandWith(undefined);
+    const oneRoundNodes = await expandWith(1);
+    delete configStore['cppCallGraph.maxExpandRounds'];
+    console.log(
+      `诊断: 展开全部 层数上限 1 层 → ${oneRoundNodes} 个节点（默认档 ${fiveRoundNodes} 个）`
+    );
+    assert(
+      oneRoundNodes < fiveRoundNodes,
+      `层数上限设为 1 时应当比默认档展开得少：1 层 ${oneRoundNodes} 个、默认 ${fiveRoundNodes} 个`
+    );
+    // 收尾：把这条会话也展开完全，别让后面的用例继承一棵半开的树
+    fake.send({ type: 'expandFull', sessionId: lastSessionPayload().id });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
 
   // 工具栏最左的按钮（原「关闭当前标签」）按需求改为「关闭全部标签并收起视图」：
   // 等价于面板标题栏原来的 closeAllTabs。这里验证它确实关掉所有标签并收起视图。
@@ -1172,6 +1292,319 @@ async function main() {
     await new Promise((resolve) => setTimeout(resolve, 30));
     console.log(`诊断: 加载遮罩的宿主侧信号 ${JSON.stringify(busyFlags)}`);
     console.log('OK: 慢查询期间 webview 会收到 busy 信号，「取消」消息安全');
+  }
+
+  // ---- 宿主侧竞态回归：本轮修掉的三类「晚到的消息」都只表现在缓存表里 ----
+  {
+    const provider = captured.webviewViewProvider.provider;
+    assert(
+      typeof provider.__debugSnapshot === 'function',
+      '产物没有提供 __debugSnapshot 只读快照接口（宿主侧竞态无法被观察）'
+    );
+
+    // A) `endResolve` 必须认 token：命令可重入（用户连点两次右键菜单），
+    //    先开始的那次收尾时不能把后开始的那次一起清掉 —— 否则后一次会被判成「已取消」而静默不出图。
+    const first = provider.beginResolve('第一次解析');
+    const second = provider.beginResolve('第二次解析');
+    assert(
+      first.token !== second.token,
+      `两次 beginResolve 应当拿到不同 token，实际都是 ${first.token}`
+    );
+    assert(first.isCancelled() === true, '被后一次顶掉的那次应当视为已取消，好让旧流程尽快收尾');
+    assert(second.isCancelled() === false, '后开始的那次不应被判成取消');
+    provider.endResolve(first.token);
+    assert(
+      provider.__debugSnapshot().busyToken === second.token,
+      `过期 token 的 endResolve 不应清掉后一次解析的 busy 状态（应仍为 ${second.token}）`
+    );
+    assert(second.isCancelled() === false, '过期 token 收尾后，后一次仍不应被判成取消');
+    provider.endResolve(second.token);
+    assert(
+      provider.__debugSnapshot().busyToken === undefined,
+      '自己的 token 应当能正常结束解析（busy 应被清空）'
+    );
+    // 「窗口已正常结束」不等于「用户点了取消」：收尾之后再判一次不能误判成取消
+    assert(second.isCancelled() === false, 'endResolve 之后再判 isCancelled 不应误判成取消');
+    console.log(
+      'OK: endResolve 的 token 可重入 —— 过期 token 不清后一次、自己的 token 正常收尾、收尾后不误判成取消'
+    );
+
+    // B) `reportWidths` 必须写回**消息里点名的会话**，而不是当前活动标签：
+    //    否则宽度会串台 —— 甲标签的实测宽度被拿去做乙标签的列排布。
+    const tick = () => new Promise((resolve) => setTimeout(resolve, 60));
+    currentRootName = 'leafAdd';
+    await registered.get('cppCallGraph.showCallers')();
+    await tick();
+    const ownerPayload = lastSessionPayload();
+    const widthOwner = ownerPayload.id;
+    const ownerRootId = Object.values(ownerPayload.nodes).find((node) => node.depth === 0)?.id;
+    assert(typeof ownerRootId === 'string', '点名的会话里找不到根节点，无法验证宽度是否真的用上');
+    currentRootName = 'isEven';
+    await registered.get('cppCallGraph.showCallers')();
+    await tick();
+    const bystander = lastSessionPayload().id;
+    assert(
+      widthOwner !== bystander,
+      `两次查询应当各自建出标签，实际都拿到 ${widthOwner}`
+    );
+    // 让「旁观者」成为活动标签，再给非活动的那个回传宽度
+    fake.send({ type: 'selectTab', id: bystander });
+    await tick();
+    const reportedWidth = 512;
+    captured.posted.length = 0;
+    fake.send({
+      type: 'reportWidths',
+      sessionId: widthOwner,
+      widths: [{ id: ownerRootId, width: reportedWidth }],
+    });
+    await tick();
+    const snapshotAfterWidths = provider.__debugSnapshot();
+    const ownerEntry = snapshotAfterWidths.measuredWidths.find(
+      (entry) => entry.sessionId === widthOwner
+    );
+    assert(
+      ownerEntry !== undefined && ownerEntry.count === 1,
+      `回传的宽度应当记在点名的会话 ${widthOwner} 名下，实际 ${JSON.stringify(
+        snapshotAfterWidths.measuredWidths
+      )}`
+    );
+    assert(
+      !snapshotAfterWidths.measuredWidths.some((entry) => entry.sessionId === bystander),
+      `活动标签 ${bystander} 没有被回传宽度，不应凭空多出一条记录：${JSON.stringify(
+        snapshotAfterWidths.measuredWidths
+      )}`
+    );
+    // 重排也必须是「点名的那个会话」：串台的话活动标签会被重排
+    const relaid = captured.posted
+      .filter((message) => message.type === 'sessionUpdate')
+      .map((message) => message.session.id);
+    assert(
+      relaid.includes(widthOwner) && !relaid.includes(bystander),
+      `回传宽度后应只重排点名的会话，实际重排了 ${JSON.stringify(relaid)}`
+    );
+    // 最强的一条：宽度要真的进入**点名那个会话**的布局几何。
+    // 若写进了活动标签的表，这里拿到的仍是估宽而不是 512。
+    const relaidPayload = captured.posted.find(
+      (message) => message.type === 'sessionUpdate' && message.session.id === widthOwner
+    );
+    assert(relaidPayload !== undefined, `没有收到会话 ${widthOwner} 的重排结果`);
+    assert(
+      relaidPayload.session.boxes[ownerRootId]?.width === reportedWidth,
+      `点名的会话应当采用回传宽度 ${reportedWidth}，实际 ${
+        relaidPayload.session.boxes[ownerRootId]?.width
+      }`
+    );
+    console.log(
+      `诊断: 回传宽度归属 —— 记录落在 ${widthOwner}，重排 ${JSON.stringify(relaid)}，` +
+        `活动标签 ${bystander} 未受影响，根框宽度实测为回传值 ${reportedWidth}`
+    );
+
+    // D) 点标签必须真的切过去：webview 只在**新会话**的 sessionUpdate 里认领活动标签
+    //    （否则 relayout 重发时标签会自己跳到最后），所以宿主必须**显式**告诉它活动标签是哪个。
+    //    曾经只补发内容、不发这条消息 —— 表现是「多个标签时只有最新那个点得动」。
+    captured.posted.length = 0;
+    fake.send({ type: 'selectTab', id: widthOwner });
+    await tick();
+    assert(
+      provider.__debugSnapshot().activeId === widthOwner,
+      `宿主侧活动标签应当切到 ${widthOwner}，实际 ${provider.__debugSnapshot().activeId}`
+    );
+    assert(
+      captured.posted.some(
+        (message) => message.type === 'selectTab' && message.id === widthOwner
+      ),
+      `点标签后宿主应当下发 selectTab(${widthOwner})，实际下发 ${
+        JSON.stringify(captured.posted.map((message) => message.type))
+      }`
+    );
+    // 顺序也有讲究：内容（sessionUpdate）必须先到，否则 webview 切过去时手里还没有这张图
+    const switchTypes = captured.posted.map((message) => message.type);
+    assert(
+      switchTypes.indexOf('sessionUpdate') < switchTypes.lastIndexOf('selectTab'),
+      `selectTab 不应早于该标签的内容下发，实际顺序 ${JSON.stringify(switchTypes)}`
+    );
+    console.log(
+      `OK: 点标签会显式切换 —— 宿主下发 selectTab(${widthOwner})，且内容先到（顺序 ${JSON.stringify(
+        switchTypes
+      )}）`
+    );
+
+    // C) 标签关闭后仍在路上的 collapse / selectNode / reportWidths 不能再写回缓存：
+    //    forgetSession 已经清过一次，此后无人再清，而会话 id 是随机串、不会复用，
+    //    于是这些条目会一直留着（还可能在同名会话恢复时被套用）。
+    assert(
+      provider.__debugSnapshot().sessionIds.length >= 2,
+      `本用例需要至少两个标签，实际 ${provider.__debugSnapshot().sessionIds.length} 个`
+    );
+    const victim = provider.__debugSnapshot().sessionIds[0];
+    fake.send({ type: 'closeTab', id: victim });
+    await tick();
+    assert(
+      !provider.__debugSnapshot().sessionIds.includes(victim),
+      `closeTab 之后 ${victim} 应当已不在会话列表里`
+    );
+    fake.send({ type: 'collapse', sessionId: victim, collapsed: ['stale-node'] });
+    fake.send({ type: 'selectNode', sessionId: victim, nodeId: 'stale-node' });
+    fake.send({
+      type: 'reportWidths',
+      sessionId: victim,
+      widths: [{ id: 'stale-node', width: 300 }],
+    });
+    await tick();
+    const stale = provider.__debugSnapshot();
+    assert(
+      !stale.collapsedNodes.some((entry) => entry.sessionId === victim),
+      `已关闭会话不应留在收起状态表里：${JSON.stringify(stale.collapsedNodes)}`
+    );
+    assert(
+      !stale.selectedIds.some((entry) => entry.sessionId === victim),
+      `已关闭会话不应留在选中节点表里：${JSON.stringify(stale.selectedIds)}`
+    );
+    assert(
+      !stale.measuredWidths.some((entry) => entry.sessionId === victim),
+      `已关闭会话不应留在实测宽度表里：${JSON.stringify(stale.measuredWidths)}`
+    );
+    console.log(
+      `OK: 晚到的 collapse / selectNode / reportWidths 不会给已关闭会话 ${victim} 留下缓存条目`
+    );
+  }
+
+  // ---- 节点 id 的 key 反解：含 `>` 的符号名（operator>）不能再被切错 ----
+  {
+    const { baseKeyOf } = extension.__hierarchy;
+    assert(typeof baseKeyOf === 'function', '产物没有导出 __hierarchy.baseKeyOf');
+    const sep = '\u0000';
+    const operatorKey = 'file:///x.cpp|1|0|1|20|operator>';
+    assert(
+      baseKeyOf(`rootKey${sep}${operatorKey}`) === operatorKey,
+      `operator> 的 key 应当被完整取出，实际 ${JSON.stringify(
+        baseKeyOf(`rootKey${sep}${operatorKey}`)
+      )}`
+    );
+    const cycleId = `rootKey${sep}cycle@${operatorKey}@12`;
+    assert(
+      baseKeyOf(cycleId) === operatorKey,
+      `环节点的 key 也应当被完整取出，实际 ${JSON.stringify(baseKeyOf(cycleId))}`
+    );
+    // 旧格式（0.20 快照）仍按老规则解析，保证恢复出来的图还能用
+    assert(
+      baseKeyOf('parent>legacyKey') === 'legacyKey',
+      '旧格式 id 应当仍按 `>` 规则反解（兼容旧快照）'
+    );
+    console.log(
+      'OK: 节点 id 分隔符改用 NUL —— operator> 这类含 `>` 的名字不再被切错，旧快照仍可解析'
+    );
+  }
+
+  // ---- 0.21 引擎配置档：自定义引擎可接入、认领规则生效、未知 id 退回并给出警告 ----
+  {
+    const engines = extension.__engines;
+    assert(engines !== undefined, '产物没有导出 __engines（引擎层测试接口）');
+    const baseProfiles = engines.engineProfiles().map((profile) => profile.id);
+    assert(
+      baseProfiles.includes('clangd') && baseProfiles.includes('cpptools'),
+      `内置引擎表应当含 clangd 与 cpptools，实际 [${baseProfiles.join(', ')}]`
+    );
+
+    // 一条完整的自定义引擎 + 一条只有 id 的最小条目（label 应回退成 id）
+    configStore['cppCallGraph.customEngines'] = [
+      { id: 'my-engine', label: '我的引擎', badge: 'my-eng', matchName: 'myEngineThing' },
+      { id: 'minimal' },
+    ];
+    const profiles = engines.engineProfiles().map((profile) => profile.id);
+    assert(
+      profiles.includes('my-engine') && profiles.includes('minimal'),
+      `自定义引擎应当出现在配置档表里，实际 [${profiles.join(', ')}]`
+    );
+    assert(
+      engines.describeEngine('minimal') === 'minimal',
+      `省略 label 时展示名应回退成 id，实际 ${engines.describeEngine('minimal')}`
+    );
+
+    configStore['cppCallGraph.languageService'] = 'my-engine';
+    const selected = engines.selectedProfile();
+    assert(
+      selected.profile && selected.profile.id === 'my-engine' && !selected.warning,
+      `选中自定义引擎应当成功，实际 ${JSON.stringify(selected)}`
+    );
+    assert(
+      engines.badgeFor('my-engine') === 'my-eng',
+      `角标应当来自自定义引擎的 badge，实际 ${engines.badgeFor('my-engine')}`
+    );
+    assert(
+      engines.matchesProfile({ name: 'myEngineThingHelper', detail: '' }, selected.profile) === true,
+      '匹配到 matchName 的候选项应当被认领'
+    );
+    assert(
+      engines.matchesProfile({ name: 'other', detail: '' }, selected.profile) === false,
+      '不含匹配子串的候选项不该被认领'
+    );
+
+    // 挑选策略：三档都能读出来（默认 nearest）
+    configStore['cppCallGraph.enginePickPolicy'] = 'onlySelected';
+    assert(engines.pickPolicy() === 'onlySelected', '挑选策略应当读到 onlySelected');
+    configStore['cppCallGraph.enginePickPolicy'] = 'nearest';
+    assert(engines.pickPolicy() === 'nearest', '挑选策略应当读回 nearest');
+
+    // 选中了「不可用」的引擎 → 必须只给警告、**不能**把 profile 交出去
+    // （否则它会照常参与认领，onlySelected 档下会变成"查不出结果"）
+    configStore['cppCallGraph.customEngines'] = [
+      { id: 'ghost', label: '幽灵引擎', extensionId: 'nobody.ghost-engine' },
+    ];
+    configStore['cppCallGraph.languageService'] = 'ghost';
+    const unavailable = engines.selectedProfile();
+    assert(
+      unavailable.profile === undefined &&
+        typeof unavailable.warning === 'string' &&
+        unavailable.warning.includes('不可用'),
+      `选中不可用引擎时应当退回不认领并给出警告，实际 ${JSON.stringify(unavailable)}`
+    );
+    // 恢复成前面用的那份配置，后面的用例还要用 my-engine
+    configStore['cppCallGraph.customEngines'] = [
+      { id: 'my-engine', label: '我的引擎', badge: 'my-eng', matchName: 'myEngineThing' },
+      { id: 'minimal' },
+    ];
+
+    // 未知 id → 不认领 + 给出可读的警告（绝不静默失效）
+    configStore['cppCallGraph.languageService'] = 'nope';
+    const unknown = engines.selectedProfile();
+    assert(
+      unknown.profile === undefined &&
+        typeof unknown.warning === 'string' &&
+        unknown.warning.includes('nope'),
+      `未知引擎 id 应当退回不认领并给出警告，实际 ${JSON.stringify(unknown)}`
+    );
+
+    // custom + customEngineId：填了才生效，空着要给出提示
+    configStore['cppCallGraph.languageService'] = 'custom';
+    configStore['cppCallGraph.customEngineId'] = 'my-engine';
+    assert(
+      engines.selectedProfile().profile?.id === 'my-engine',
+      'custom + customEngineId 应当选中该引擎'
+    );
+    configStore['cppCallGraph.customEngineId'] = '';
+    const empty = engines.selectedProfile();
+    assert(
+      empty.profile === undefined && typeof empty.warning === 'string',
+      'custom 但 customEngineId 为空时应当给出提示并退回不认领'
+    );
+
+    // 同 id 覆盖内置项（这里只验展示名，其余行为随之改变）
+    configStore['cppCallGraph.customEngines'] = [{ id: 'clangd', label: '我的 clangd' }];
+    assert(
+      engines.describeEngine('clangd').includes('我的 clangd'),
+      `同 id 的自定义项应当覆盖内置项，实际 ${engines.describeEngine('clangd')}`
+    );
+
+    // 清理：不影响后面的用例
+    delete configStore['cppCallGraph.customEngines'];
+    delete configStore['cppCallGraph.customEngineId'];
+    delete configStore['cppCallGraph.enginePickPolicy'];
+    configStore['cppCallGraph.languageService'] = 'auto';
+    assert(engines.pickPolicy() === 'nearest', '清理后挑选策略应回到默认 nearest');
+    console.log(
+      'OK: 引擎配置档 —— 自定义引擎可接入、认领规则生效、未知 id 退回并给出警告、三档策略可切换'
+    );
   }
 
   console.log('--- 引擎探测 ---');

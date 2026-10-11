@@ -11,7 +11,7 @@
  */
 import * as vscode from 'vscode';
 import { itemKey } from './callHierarchy';
-import { logWarn } from '../util/log';
+import { logInfo, logWarn } from '../util/log';
 import {
   Answer,
   RelationQuery,
@@ -102,7 +102,31 @@ export function deserializeItem(descriptor: RootDescriptor): vscode.CallHierarch
   } as vscode.CallHierarchyItem;
 }
 
+/**
+ * 节点 id 的分隔符：**必须选符号名里不可能出现的字符**。
+ *
+ * 曾经用 `>`，而 C++ 的 `operator>` / `operator>>` / `operator->` / `operator<=>` 名字里
+ * 自带 `>`，`baseKeyOf()`（靠 lastIndexOf('>') 取 key）会把 key 切错，
+ * 环检测随之失效、图上多出重复方框。改用 NUL：源码里不可能出现，uri/key 里也不会。
+ * 旧快照里的 id 仍是 `>` 分隔 —— `baseKeyOf()` 保留了旧格式的兜底分支。
+ */
+const ID_SEPARATOR = '\u0000';
+
+/** 每层最多保留多少条（`cppCallGraph.maxChildrenPerNode`，默认 200）。
+ *  ⚠️ 全工程只此一处读取该设置：手改 settings.json 写入 0/负数/NaN 时统一退到 200，
+ *  避免下游算出 `nodeBudget = 负数` 之类的边界（曾让「展开全部」直接空转）。
+ *  ⚠️ 下限还要夹一次 1：设置页的 `minimum: 1` 只画下划线、不阻止读取，手写 0.5 这种小数会
+ *  满足 `> 0` 但 `Math.floor(0.5) === 0` —— 那时任何节点都展不开，图上永远只剩根。 */
+export function maxChildrenPerNodeLimit(): number {
+  const value = vscode.workspace
+    .getConfiguration('cppCallGraph')
+    .get<number>('maxChildrenPerNode', 200);
+  return Number.isFinite(value) && value > 0 ? Math.max(1, Math.floor(value)) : 200;
+}
+
 export class CallSession {
+  /** 正在展开中的节点（并发护栏：同一节点不被同时展开两次）。 */
+  private readonly inflight = new Set<string>();
   readonly id: string;
   readonly direction: Direction;
   readonly kind: SessionKind;
@@ -207,16 +231,32 @@ export class CallSession {
   /**
    * 展开一个节点：向语言服务请求它的下一层关系并写入图。
    * 返回新增的节点数量（0 表示确实是叶子）。
+   *
+   * @param maxNew 本次最多新增几个子项（省略即只受 `maxChildrenPerNode` 约束）。
+   *   「展开全部」用它把**剩余预算**传进来：预算是每次 expand **之前**检查的，而单次 expand
+   *   最多能新增 maxChildrenPerNode 个，不夹这一层总数就会冲过布局上限
+   *   （默认档位下 799 + 200 = 999 > 800），超出的节点既没有方框也没有连线。
    */
-  async expand(nodeId: string): Promise<number> {
+  async expand(nodeId: string, maxNew?: number): Promise<number> {
     const node = this.nodes.get(nodeId);
     const item = this.items.get(nodeId);
     if (!node || !item || node.loaded || node.isCycle) {
       return 0;
     }
-    const ancestors = this.ancestorKeys(node);
-    const results = await expandRelation(this.query, this.direction, item);
-    return this.applyResults(node, results, ancestors);
+    // 并发护栏：`node.loaded` 要等 await 之后才置位，而 VS Code 不串行化消息 ——
+    // 「点 + 后立刻点展开全部」或「连点两次展开全部」会让同一节点被并发展开，
+    // 结果是重复语言服务请求 + `omitted` 重复累加。
+    if (this.inflight.has(nodeId)) {
+      return 0;
+    }
+    this.inflight.add(nodeId);
+    try {
+      const ancestors = this.ancestorKeys(node);
+      const results = await expandRelation(this.query, this.direction, item);
+      return this.applyResults(node, results, ancestors, maxNew);
+    } finally {
+      this.inflight.delete(nodeId);
+    }
   }
 
   /**
@@ -238,15 +278,31 @@ export class CallSession {
   private applyResults(
     node: GraphNode,
     results: Answer[],
-    ancestors: string[]
+    ancestors: string[],
+    maxNew?: number
   ): number {
     let added = 0;
-    for (const result of results) {
+    // 每层数量上限：设置的**名字**就是"每个节点最多几个子项"，所以在这里真正生效
+    // （此前它只被「展开全部」的预算用到，手动展开完全不截断 —— 那是个名不副实的 bug）。
+    // maxNew 是「展开全部」按剩余预算给的更紧的一层上限，取两者较小值。
+    const perNode = maxChildrenPerNodeLimit();
+    const limit = Math.max(0, Math.min(perNode, maxNew ?? Number.POSITIVE_INFINITY));
+    const omitted = results.length > limit ? results.length - limit : 0;
+    if (omitted > 0) {
+      node.omitted = (node.omitted ?? 0) + omitted;
+      logInfo(
+        `「${node.name}」的下一层共 ${results.length} 条，本次上限 ${limit} 条` +
+          `（maxChildrenPerNode=${perNode}${maxNew !== undefined ? `，剩余预算 ${maxNew}` : ''}），` +
+          `省略 ${omitted} 条。`
+      );
+    }
+    const limited = omitted > 0 ? results.slice(0, limit) : results;
+    for (const result of limited) {
       const key = itemKey(result.item);
       const isCycle = key === this.rootId || ancestors.includes(key);
       const id = isCycle
-        ? `${node.id}>cycle@${key}@${result.item.selectionRange.start.line}`
-        : `${node.id}>${key}`;
+        ? `${node.id}${ID_SEPARATOR}cycle@${key}@${result.item.selectionRange.start.line}`
+        : `${node.id}${ID_SEPARATOR}${key}`;
       // 同一个 id 只可能来自同一份结果（id 由 key 决定），已在图里就只补一条父子边。
       if (this.nodes.has(id)) {
         if (!node.children.includes(id)) {
@@ -335,9 +391,12 @@ export class CallSession {
         // 旧版本存下来的 kind 可能是已废弃的值（如 'macro' / 'type'），
         // 统一归一化，避免恢复到不认识的类型后角标画不出来。
         kind: normalizeNodeKind(node.kind),
-        // 有 item 的节点按原样恢复加载态（数据还在，展开/跳转都可用）；
+        // 有 item 的节点**按原样**恢复加载态（数据还在，展开/跳转都可用）；
         // 没有 item 的（旧快照）只能当叶子 —— 否则会画出一个点了没反应的「+」。
-        loaded: withItem ? node.loaded && (!node.children.length || node.isCycle) : true,
+        // ⚠️ 这里曾经写成 `node.loaded && (!node.children.length || node.isCycle)`：
+        // 有子节点时右半恒为 false，于是**所有已展开的父节点（含根）恢复后都变成未加载** ——
+        // 表现为重载窗口后「展开全部」对整棵已展开的树重发一轮请求，且 `omitted` 被重复累加。
+        loaded: withItem ? node.loaded : true,
       };
       session.nodes.set(restored.id, restored);
       if (withItem) {
@@ -370,8 +429,26 @@ function normalizeNodeKind(kind: unknown): GraphNode['kind'] {
   return 'other';
 }
 
-/** 从节点 id 里取出该目标本身的 key（id 形如 `<父id>><key>`，环节点带 `>cycle@` 后缀）。 */
+/**
+ * 从节点 id 里取出该目标本身的 key。
+ *
+ * 新格式：`<父id>\0<key>`，环节点带 `\0cycle@` 前缀；`\0` 不会出现在符号名里，切分是明确的。
+ * 旧格式（0.20 及以前持久化下来的快照）：`<父id>><key>`，且 `key` 末尾是符号名 ——
+ * 对含 `>` 的名字（`operator>`）本来就切不准，这里保留原样只为让旧快照还能用。
+ */
 export function baseKeyOf(id: string): string {
+  const nul = id.lastIndexOf(ID_SEPARATOR);
+  if (nul >= 0) {
+    const rest = id.slice(nul + 1);
+    const cycleMarker = 'cycle@';
+    if (rest.startsWith(cycleMarker)) {
+      const body = rest.slice(cycleMarker.length);
+      const at = body.lastIndexOf('@');
+      return at >= 0 ? body.slice(0, at) : body;
+    }
+    return rest;
+  }
+  // ↓ 旧格式兜底
   const marker = '>cycle@';
   const cycleIndex = id.indexOf(marker);
   if (cycleIndex >= 0) {

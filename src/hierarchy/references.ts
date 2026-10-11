@@ -13,10 +13,20 @@
  */
 import * as vscode from 'vscode';
 import { Answer } from './relations';
+import { pickByChoice } from './callHierarchy';
 import { logWarn } from '../util/log';
 
 /** 引用点数量上限：宏常被广泛使用，避免一次抓回上千个把画布撑爆。 */
 export const MAX_REFERENCE_HITS = 200;
+
+/**
+ * 引用点处理的并发度。
+ *
+ * 纯串行时 200 个引用点 = 200 次串行语言服务往返，等待时间随引用数线性增长；
+ * 每批 6 个既能把墙钟时间压下来，又对语言服务足够温和。
+ * 「取消」在**每批之间**检查一次（比逐点检查略粗，但仍能在数百毫秒内生效）。
+ */
+export const REFERENCE_CONCURRENCY = 6;
 
 /** 文本搜索兜底时只扫这些后缀（C/C++ 头文件与源文件）。 */
 const TEXT_SEARCH_INCLUDE = '**/*.{c,cc,cpp,cxx,c++,h,hh,hpp,hxx,h++,inl,ipp,tpp}';
@@ -96,7 +106,10 @@ export function macroShapeOf(
   document: vscode.TextDocument,
   word: string
 ): { functionLike: boolean; line: number; text: string } | undefined {
-  const pattern = new RegExp(`^\\s*#\\s*define\\s+${word}(\\s*\\(|(?=[^A-Za-z0-9_]))`);
+  // ⚠️ 末尾必须是**负**前瞻：正向前瞻 `(?=[^A-Za-z0-9_])` 在行尾（后面没有字符）时失败，
+  // 于是 `#define DEBUG`（对象式宏、宏体为空、行尾无空白）不被判定为宏 ——
+  // 文本搜索兜底与「定义行不算引用者」两条会同时失效。
+  const pattern = new RegExp(`^\\s*#\\s*define\\s+${word}(\\s*\\(|(?![A-Za-z0-9_]))`);
   for (let line = 0; line < document.lineCount; line += 1) {
     const text = document.lineAt(line).text;
     if (!/#\s*define/.test(text)) {
@@ -206,27 +219,55 @@ async function textSearch(word: string): Promise<ReferenceHit[]> {
   return hits;
 }
 
-/** 读某一行原文（引用点那一行，用于界面上的「引用发生处」）。 */
+/**
+ * 读某一行原文（引用点那一行，用于界面上的「引用发生处」）。
+ *
+ * ⚠️ 刻意**不用** `openTextDocument`：那会把文档塞进 `workspace.textDocuments` 并由宿主
+ * 一直持有它的 model —— 一次宏的文本搜索可能命中几十上百个文件，只为读一行就把它们
+ * 全留在内存里。这里改为：优先用**已经打开**的文档，否则用 `workspace.fs` 读一次并按行切。
+ *
+ * ⚠️ 缓存里存的是**读取的 Promise**，不是读好的行数组：引用查找是并发批处理的
+ * （`REFERENCE_CONCURRENCY`），同一批里落在同一个文件的多个引用点会同时到达这里。
+ * 存值的话，`cache.has()` 与 `await readLines()` 之间是异步让渡点，它们会同时看到
+ * 「缓存里还没有」，于是同一个文件被整读好几遍（宏在同一头文件里被引用十几次是常态）；
+ * 存 Promise 则后到者直接复用同一个读取过程。
+ */
 async function lineTextOf(
   hit: ReferenceHit,
-  cache: Map<string, vscode.TextDocument | undefined>
+  cache: Map<string, Promise<string[] | undefined>>
 ): Promise<string> {
   const key = hit.uri.toString();
-  if (!cache.has(key)) {
-    try {
-      cache.set(key, await vscode.workspace.openTextDocument(hit.uri));
-    } catch (error) {
-      logWarn(
-        `读取引用所在文件失败（${hit.uri.fsPath}）：${error instanceof Error ? error.message : String(error)}`
-      );
-      cache.set(key, undefined);
+  let pending = cache.get(key);
+  if (!pending) {
+    pending = readLines(hit.uri);
+    cache.set(key, pending);
+  }
+  const lines = await pending;
+  const text = lines?.[hit.line];
+  return typeof text === 'string' ? text.trim().slice(0, 120) : '';
+}
+
+/** 取一个文件的全部行：已打开的直接读，否则 fs 读一次（失败返回 undefined）。 */
+async function readLines(uri: vscode.Uri): Promise<string[] | undefined> {
+  const open = vscode.workspace.textDocuments.find(
+    (document) => document.uri.toString() === uri.toString()
+  );
+  if (open) {
+    const lines: string[] = [];
+    for (let index = 0; index < open.lineCount; index += 1) {
+      lines.push(open.lineAt(index).text);
     }
+    return lines;
   }
-  const document = cache.get(key);
-  if (!document || hit.line >= document.lineCount) {
-    return '';
+  try {
+    const bytes = await vscode.workspace.fs.readFile(uri);
+    return Buffer.from(bytes).toString('utf8').split(/\r?\n/);
+  } catch (error) {
+    logWarn(
+      `读取引用所在文件失败（${uri.fsPath}）：${error instanceof Error ? error.message : String(error)}`
+    );
+    return undefined;
   }
-  return document.lineAt(hit.line).text.trim().slice(0, 120);
 }
 
 /** 文档符号树的缓存（同一个文件只问一次语言服务）。 */
@@ -263,12 +304,10 @@ async function answersFromHits(
   symbolCache: SymbolCache = new Map()
 ): Promise<Answer[]> {
   const byKey = new Map<string, Answer>();
-  const documentCache = new Map<string, vscode.TextDocument | undefined>();
-  for (const hit of hits) {
-    // 每个引用点都要问一次语言服务，这一步最慢 —— 用户点「取消」就在这里尽快收尾
-    if (isCancelled()) {
-      return [...byKey.values()];
-    }
+  const textCache: Map<string, Promise<string[] | undefined>> = new Map();
+
+  /** 处理一个引用点，产出（可能为空）的答案。纯函数式，便于并发调用。 */
+  const resolveHit = async (hit: ReferenceHit): Promise<Answer | undefined> => {
     const position = new vscode.Position(hit.line, hit.character);
     let item: vscode.CallHierarchyItem | undefined;
     try {
@@ -277,7 +316,9 @@ async function answersFromHits(
         hit.uri,
         position
       );
-      item = prepared?.[0];
+      // 与主路径同一套挑选规则：同一个位置可能返回多个 item（各自的 selectionRange 不同），
+      // 取第一个可能拿到离光标更远的那个符号 —— 这里必须复用 pickByChoice。
+      item = pickByChoice(prepared ?? [], position);
     } catch {
       item = undefined;
     }
@@ -295,7 +336,7 @@ async function answersFromHits(
         );
       }
     }
-    const text = await lineTextOf(hit, documentCache);
+    const text = await lineTextOf(hit, textCache);
     if (!item) {
       // 连符号都拿不到：以「这一行的原文」占位，至少让用户看到引用点在这里
       const name = text.length > 0 ? text : `${hit.uri.fsPath.split(/[\\/]/).pop() ?? ''}:${hit.line + 1}`;
@@ -310,14 +351,31 @@ async function answersFromHits(
         range
       );
     }
-    const identity = `${item.uri.toString()}#${item.kind}#${item.name}#${item.selectionRange.start.line}`;
-    if (byKey.has(identity)) {
-      continue;
+    return { item, callSite: { uri: hit.uri, line: hit.line, text } };
+  };
+
+  // 小并发：纯串行时 200 个引用点就是 200 次串行往返，等待时间随引用数线性增长。
+  // 每批 6 个（对语言服务足够温和），**每批之间**检查一次取消 —— 比"每个引用点之间"
+  // 粗一点，但足以让「取消」在几百毫秒内生效。
+  for (let start = 0; start < hits.length; start += REFERENCE_CONCURRENCY) {
+    if (isCancelled()) {
+      break;
     }
-    byKey.set(identity, {
-      item,
-      callSite: { uri: hit.uri, line: hit.line, text },
-    });
+    const batch = hits.slice(start, start + REFERENCE_CONCURRENCY);
+    const answers = await Promise.all(batch.map((hit) => resolveHit(hit)));
+    // 按批内顺序合并，保证 callSite 取「第一次引用」的语义可复现（并发完成顺序不稳定）
+    for (const answer of answers) {
+      if (!answer) {
+        continue;
+      }
+      const identity = `${answer.item.uri.toString()}#${answer.item.kind}#${answer.item.name}#${
+        answer.item.selectionRange.start.line
+      }`;
+      if (byKey.has(identity)) {
+        continue;
+      }
+      byKey.set(identity, answer);
+    }
   }
   return [...byKey.values()];
 }

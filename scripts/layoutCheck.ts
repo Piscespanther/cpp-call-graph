@@ -2,7 +2,7 @@
  * 图布局的几何验证：列方向、同行不重叠、父节点垂直居中、连线端点顺序。
  * 单独运行：node scripts/layoutCheck.js（由 npm run smoke 一并构建执行）
  */
-import { GraphNode, collectEdges, createLayout, estimateBoxWidth } from '../src/hierarchy/graphLayout';
+import { GraphNode, MAX_BOX_WIDTH, collectEdges, createLayout, estimateBoxWidth } from '../src/hierarchy/graphLayout';
 
 function node(
   id: string,
@@ -124,9 +124,10 @@ export function report(): string[] {
     lines.push(
       `列间隙（长名）: ${gap.toFixed(0)}px（左宽 ${left.width}，右 x=${right.x}）`
     );
-    if (gap < 24) {
+    // 判据用设计值 COLUMN_GAP(52)，不再用"收缩一半也算过"的 24
+    if (gap < 52 - 0.5) {
       throw new Error(
-        `相邻列之间只剩 ${gap}px，箭头画不下（应 ≥24px）：` +
+        `相邻列之间只剩 ${gap}px，小于设计的列间隙 52px（箭头画不下）：` +
           `左方框右边缘 ${left.x + left.width}，右方框左边缘 ${right.x}`
       );
     }
@@ -193,7 +194,99 @@ export function report(): string[] {
     );
   }
 
-  // ---- 「不显示路径」开关：宿主的估宽必须跟着变小 ----
+  // ---- 路径显示方式不得把方框撑破（三种口径 + 超长路径） ----
+  {
+    const longPath = `${'verylongdirectoryname/'.repeat(6)}lcd_init.c`; // 远超 40 字符
+    const fullNode = node('fullpath', 'callees', 0, []);
+    fullNode.name = 'fn';
+    fullNode.file = longPath;
+    fullNode.line = 1234;
+    const fullWidth = estimateBoxWidth(fullNode, true, {
+      mode: 'full',
+      tailLevels: 0,
+      anchors: [],
+    });
+    const anchoredWidth = estimateBoxWidth(fullNode, true, {
+      mode: 'tail',
+      tailLevels: 2,
+      anchors: ['+3', 'verylongdirectoryname'],
+    });
+    const cjkFull = estimateBoxWidth(
+      { ...fullNode, file: `${'全角目录名/'.repeat(6)}实现文件.cpp` },
+      true,
+      { mode: 'full', tailLevels: 0, anchors: [] }
+    );
+    lines.push(
+      `路径显示: 超长路径 full ${fullWidth.toFixed(0)}px / 带锚点 tail ${anchoredWidth.toFixed(0)}px / ` +
+        `全角 full ${cjkFull.toFixed(0)}px（上限 ${MAX_BOX_WIDTH}）`
+    );
+    for (const [label, width] of [
+      ['full', fullWidth],
+      ['带锚点 tail', anchoredWidth],
+      ['全角 full', cjkFull],
+    ] as const) {
+      if (width > MAX_BOX_WIDTH) {
+        throw new Error(
+          `${label} 模式下估宽 ${width.toFixed(0)}px 超过上限 ${MAX_BOX_WIDTH} —— ` +
+            '路径显示方式不得把方框撑破（显示文字要先按 40 字符收敛）'
+        );
+      }
+    }
+  }
+
+  // ---- 全角长路径不得溢出方框（最坏字身 = 1 倍字号） ----
+  // 上限 MAX_BOX_WIDTH 必须容得下“最坏字身 + 全部留白”，否则估宽被钳住、文字画出方框右边。
+  {
+    const worst = node('worst', 'callees', 0, []);
+    worst.name = '函'.repeat(30); // 名称截断上限 30
+    worst.file = '源'.repeat(36) + '.cpp'; // 路径截断上限 40（截断后再拼 `:行号`）
+    worst.line = 9999;
+    const estimated = estimateBoxWidth(worst, true);
+    const namePx = 30 * 13; // 30 个全角 × 13px 粗体
+    const locPx = 40 * 12; // 40 个全角 × 12px
+    const need = Math.max(namePx, locPx) + 22 + 10 + 13 + 5 + 6;
+    lines.push(
+      `全角最坏情形: 估 ${estimated.toFixed(0)}px（上限 ${MAX_BOX_WIDTH}），文字+留白至少需要 ${need}px`
+    );
+    if (estimated < need - 1) {
+      throw new Error(
+        `全角最坏情形下估宽 ${estimated.toFixed(0)}px 小于需要 ${need.toFixed(0)}px —— ` +
+          `MAX_BOX_WIDTH 容不下最坏字身，文字会溢出方框并压到加减号`
+      );
+    }
+  }
+
+
+  // 中文与全角标点的字身宽度约等于 1 倍字号，ASCII 约为 0.8 倍。
+  // 判据用**同字符数的 ASCII 路径做对照**：含中文的那条必须估得更宽。
+  // （之前一律按 ASCII 系数算，两者会得到完全相同的宽度 —— 这正是 bug 的形态。）
+  {
+    const cjkName = '函数名字一二三四五六七八九十';
+    const cjkPath = '源码/模块/子目录/实现文件.cpp';
+    const cjkNode = node('cjk', 'callees', 0, []);
+    cjkNode.name = cjkName;
+    cjkNode.file = cjkPath;
+    cjkNode.line = 42;
+
+    // 字符数完全相同、但全是 ASCII 的路径
+    const asciiFile = `${'a'.repeat(Math.max(1, [...cjkPath].length - 4))}.cpp`;
+    const asciiNode = { ...cjkNode, file: asciiFile };
+
+    const cjkWidth = estimateBoxWidth(cjkNode, true);
+    const asciiWidth = estimateBoxWidth(asciiNode, true);
+    lines.push(
+      `中文估宽: 同样 ${[...cjkPath].length} 个字符 → 中文路径 ${cjkWidth.toFixed(0)}px，` +
+        `纯 ASCII 路径 ${asciiWidth.toFixed(0)}px`
+    );
+    if (cjkWidth <= asciiWidth) {
+      throw new Error(
+        `含全角的路径估宽 ${cjkWidth.toFixed(0)}px 没有比同长度的 ASCII 路径（${asciiWidth.toFixed(0)}px）更宽 —— ` +
+          `估宽公式把全角字符也按 ASCII 系数算了，方框会压住文字`
+      );
+    }
+  }
+
+
   //
   // webview 会把**实测宽度**报回来，宿主优先用它；但第一帧还没有实测宽度，
   // 靠 estimateBoxWidth 估。关掉路径时如果还按带路径的宽度估，列位置会先宽后窄地跳一下。

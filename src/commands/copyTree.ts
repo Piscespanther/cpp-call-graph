@@ -49,7 +49,7 @@ export async function buildSessionText(session: CallSession): Promise<string> {
   }
   return vscode.window.withProgress(
     {
-      location: vscode.ProgressLocation.Notification,
+      location: vscode.ProgressLocation.Window,
       title: `正在导出${DIRECTION_LABEL[session.direction]}…`,
       cancellable: false,
     },
@@ -59,12 +59,23 @@ export async function buildSessionText(session: CallSession): Promise<string> {
       ];
       const visited = new Set<string>();
       let budget = MAX_NODES;
+      // 两个上限要分别记录：恰好用满 500 个节点时并没有截断，
+      // 而层数超限（>8 层）此前完全不提示 —— 两种情况的说明不一样。
+      let hitNodeLimit = false;
+      let hitDepthLimit = false;
       const walk = (nodeId: string, depth: number): void => {
-        if (budget <= 0 || depth > MAX_DEPTH) {
+        const node = session.node(nodeId);
+        // ⚠️ 「不存在 / 已访问」必须**先**判：否则恰好用满上限时，最后一个节点的
+        // 重复入栈会在 budget<=0 处把 hitNodeLimit 置位 —— 明明没截断却提示「结果被截断」。
+        if (!node || visited.has(nodeId)) {
           return;
         }
-        const node = session.node(nodeId);
-        if (!node || visited.has(nodeId)) {
+        if (budget <= 0) {
+          hitNodeLimit = true;
+          return;
+        }
+        if (depth > MAX_DEPTH) {
+          hitDepthLimit = true;
           return;
         }
         visited.add(nodeId);
@@ -83,8 +94,11 @@ export async function buildSessionText(session: CallSession): Promise<string> {
         }
       };
       walk(session.rootId, 0);
-      if (budget <= 0) {
-        lines.push('  …（已达导出上限，结果被截断）');
+      if (hitNodeLimit) {
+        lines.push(`  …（已达导出上限 ${MAX_NODES} 个节点，结果被截断）`);
+      }
+      if (hitDepthLimit) {
+        lines.push(`  …（已达导出层数上限 ${MAX_DEPTH} 层，更深的节点未导出）`);
       }
       return lines.join('\n');
     }

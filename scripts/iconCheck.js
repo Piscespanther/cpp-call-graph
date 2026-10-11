@@ -53,7 +53,13 @@ const iconPaths = {};
 }
 
 const KINDS = Object.keys(kindToIcon);
-assert(KINDS.length >= 20, `KIND_TO_ICON 覆盖的类型太少：${KINDS.length}`);
+// 合规口径 = 内联的 **21 条 codicon 符号图标**：断言**去重后**的图标数恰好 21
+// （`kindToIcon` 有 25 个 key —— 多个 NodeKind 复用同一个图标，所以不能直接断言 key 数）。
+const distinctKindIcons = new Set(Object.values(kindToIcon));
+assert(
+  distinctKindIcons.size === 21,
+  `去重后的符号图标应当恰好 21 个（合规口径），实际 ${distinctKindIcons.size}`
+);
 
 // ------------------------------------------------------------ 最小 DOM
 

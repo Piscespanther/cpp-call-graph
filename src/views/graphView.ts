@@ -12,8 +12,8 @@
  *      否则 <script> 的 nonce 与 CSP 不一致，脚本被 CSP 拒绝执行。
  */
 import * as vscode from 'vscode';
-import { Direction, EngineLabel, describeEngine } from '../hierarchy/callHierarchy';
-import { CallSession, SerializedSession } from '../hierarchy/session';
+import { Direction, EngineLabel, badgeFor, describeEngine } from '../hierarchy/callHierarchy';
+import { CallSession, SerializedSession, maxChildrenPerNodeLimit } from '../hierarchy/session';
 import { GraphNode, createLayout } from '../hierarchy/graphLayout';
 import { DIRECTION_SHORT } from '../hierarchy/graphTypes';
 import { logError, logInfo, logWarn } from '../util/log';
@@ -27,9 +27,65 @@ const STORAGE_KEY = 'cppCallGraph.sessions';
 const FLASH_MS = 1200;
 /** 持久化合流窗口（毫秒）：连续展开时只在停下来之后写一次快照。 */
 const PERSIST_DELAY_MS = 400;
-/** 「展开全部」的层数上限与节点总量上限（防止在巨大工程上拖死语言服务）。 */
-const MAX_EXPAND_ROUNDS = 5;
+/** 「展开全部」的层数上限默认值（设置项 `cppCallGraph.maxExpandRounds` 可改）；
+ *  节点总量上限固定为 800，与布局上限一致 —— 超过布局上限的节点没有方框，不会上图。 */
+const DEFAULT_MAX_EXPAND_ROUNDS = 5;
 const MAX_EXPAND_NODES = 800;
+
+/**
+ * 「展开全部」的层数上限（设置项 `cppCallGraph.maxExpandRounds`）。
+ *
+ * ⚠️ 与 `maxChildrenPerNodeLimit()` 同一口径：0 / 负数 / NaN / 小数一律夹到合法范围，
+ * 否则手改 settings.json 会算出 0 轮或负数预算，「展开全部」变成点了没反应。
+ */
+function maxExpandRoundsLimit(): number {
+  const value = vscode.workspace
+    .getConfiguration('cppCallGraph')
+    .get<number>('maxExpandRounds', DEFAULT_MAX_EXPAND_ROUNDS);
+  return Number.isFinite(value) && value > 0 ? Math.max(1, Math.floor(value)) : DEFAULT_MAX_EXPAND_ROUNDS;
+}
+
+/**
+ * 读一个「层数 / 计数」类设置：0 / 负数 / NaN / 小数一律归一（0 表示「该项不用」）。
+ *
+ * 与 `maxChildrenPerNodeLimit()`、`maxExpandRoundsLimit()` 同一口径 —— 手改 settings.json
+ * 写进小数或负数时，不能让下游算出负数或 0.5 层这种无意义的窗口。
+ */
+function readCount(value: number | undefined): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+}
+
+/** 已经就 `pathAnchors` 的写法提示过一次（每次重排都会读设置，不能反复刷日志）。 */
+let warnedAnchorsShape = false;
+/**
+ * 读路径锚点设置。
+ *
+ * 设置项是**逗号分隔的字符串**（手写最省事，不必写数组与引号），例如 `chip,chip+1`。
+ * 但两种写法都容错接受：
+ *   - 数组：每项再按逗号切一次（`["chip,chip+1"]` 这种"数组里塞一条逗号串"的写法很常见）；
+ *   - 字符串：直接按逗号切。
+ * 早期版本把整条 `"chip,chip+1"` 当成一个模式，解析不出任何段就静默忽略 ——
+ * 表现是"设置没反应"，所以这里必须切开，并在写法偏离时提示一次。
+ */
+function readAnchors(value: unknown): string[] {
+  const split = (text: string): string[] =>
+    text
+      .split(',')
+      .map((item) => item.trim())
+      .filter((item) => item.length > 0);
+  if (Array.isArray(value)) {
+    const patterns = value.flatMap((item) => split(String(item)));
+    if (value.some((item) => String(item).includes(',')) && !warnedAnchorsShape) {
+      warnedAnchorsShape = true;
+      logWarn(
+        'cppCallGraph.pathAnchors 建议直接写成逗号分隔的字符串，例如 "chip,chip+1"；' +
+          '写在数组项里的逗号串已按同样规则拆开。'
+      );
+    }
+    return patterns;
+  }
+  return typeof value === 'string' ? split(value) : [];
+}
 
 export interface SessionPayload {
   id: string;
@@ -37,6 +93,8 @@ export interface SessionPayload {
   description: string;
   direction: Direction;
   engineLabel: string;
+  /** 标签角标 id（由引擎配置档决定；webview 用它选图标，读不到设置也不猜名字）。 */
+  badge?: string;
   rootId: string;
   nodes: Record<string, GraphNode & { canExpand: boolean }>;
   edges: Array<{ id: string; from: string; to: string; depth: number }>;
@@ -49,6 +107,7 @@ interface SessionSummary {
   title: string;
   description: string;
   direction: Direction;
+  badge?: string;
 }
 
 export class GraphViewProvider implements vscode.WebviewViewProvider {
@@ -247,10 +306,11 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
   }
 
   setEngineLabel(label: EngineLabel): void {
+    // ⚠️ 只更新**视图**上的引擎名，不要回写各会话的 `engineLabel` ——
+    // 会话里存的是**引擎 id**（角标 `badgeFor()` 与会话来源标注都按 id 查表），
+    // 而这里是展示名（含版本与可执行文件路径）。回写会把自定义引擎的角标、
+    // 以及引用兜底会话的「文本搜索」来源标注一并冲掉（重载窗口后必然发生）。
     this.engineLabel = describeEngine(label);
-    for (const session of this.sessions) {
-      session.engineLabel = this.engineLabel;
-    }
     this.postSummaries();
   }
 
@@ -342,8 +402,7 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
 
   private async handleMessage(message: WebviewMessage): Promise<void> {
     switch (message.type) {
-      case 'ready':
-      case 'requestInit': {
+      case 'ready': {
         this.postInit();
         break;
       }
@@ -353,6 +412,11 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
           this.activeId = message.id;
           // 切换标签必须把该标签的图补发给前端，否则前端只有摘要、没有内容。
           this.postSession(session);
+          // ⚠️ 还必须显式告知「现在活动的是这个标签」。webview 只在**新会话**的
+          // sessionUpdate 里认领活动标签（否则 relayout 逐个重发时标签会自己跳到最后），
+          // 所以补发内容本身并不切换标签 —— 缺了这条消息，点标签就没有任何反应，
+          // 只有最新建出的那个标签点得动。
+          void this.view?.webview.postMessage({ type: 'selectTab', id: message.id });
         }
         break;
       }
@@ -372,13 +436,28 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
         await this.expandAll(message.sessionId);
         break;
       }
+      case 'expandFull': {
+        await this.expandFull(message.sessionId);
+        break;
+      }
       case 'collapse': {
         // 收起状态变了：记下来并重新布局（收起的子树不占高度，兄弟之间的空挡随之收掉）
-        this.collapsedNodes.set(message.sessionId, new Set(message.collapsed));
-        const session = this.sessions.find((item) => item.id === message.sessionId);
-        if (session) {
-          this.postSession(session);
+        //
+        // ⚠️ 集合没变就直接跳过：postSession 会重算整张图 + 重排版 + 全量克隆，
+        // 而 webview 每次改收起状态都整份重发，无变化时的重排纯属浪费。
+        const next = new Set(message.collapsed);
+        const previous = this.collapsedNodes.get(message.sessionId);
+        if (previous && previous.size === next.size && [...next].every((id) => previous.has(id))) {
+          break;
         }
+        // ⚠️ 先确认会话还在，再写缓存：标签关闭后仍在路上的 collapse 会把条目写回已关闭会话的 id，
+        // 而 forgetSession 已经清过一遍、此后再无人清理（会话 id 是随机串，不会复用）。
+        const session = this.sessions.find((item) => item.id === message.sessionId);
+        if (!session) {
+          break;
+        }
+        this.collapsedNodes.set(message.sessionId, next);
+        this.postSession(session);
         break;
       }
       case 'cancelResolve': {
@@ -395,13 +474,19 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
       }
       case 'selectNode': {
         // 用户点了某个方框：记下来，供「复制元素 / 复制地址」使用
-        this.selectedIds.set(message.sessionId, message.nodeId);
+        //
+        // ⚠️ 与 collapse / reportWidths 同一口径：先确认会话还在，再写缓存。
+        // 标签关闭后仍在路上的 selectNode 会给已关闭会话留一条永不清理的条目
+        // （forgetSession 已经清过一次，此后无人再清；会话 id 是随机串、不会复用）。
+        if (this.getSession(message.sessionId)) {
+          this.selectedIds.set(message.sessionId, message.nodeId);
+        }
         break;
       }
       case 'openSettings': {
         // 工具栏的齿轮按钮：打开 VS Code 设置并预过滤到本扩展。
         // 命令 ID 取自 VS Code 自己的 workbench 包（workbench.action.openSettings），
-        // 传扩展 id 作为查询串，设置页会直接筛出本插件的 4 项设置。
+        // 传扩展 id 作为查询串，设置页会直接筛出本插件的设置（0.21 起共 9 项）。
         await vscode.commands.executeCommand(
           'workbench.action.openSettings',
           `@ext:${this.context.extension.id}`
@@ -446,10 +531,6 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
         await this.copyNodeLocation(message.sessionId, message.nodeId);
         break;
       }
-      case 'saveOffsets': {
-        // 拖动偏移由 webview 自己维护，宿主不需要参与。
-        break;
-      }
     }
   }
 
@@ -476,46 +557,89 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
     this.schedulePersist();
   }
 
-  /** 反复展开未展开的节点，最多两轮，避免在大工程上一次拉爆。 */
   /**
-   * 工具栏的「展开全部」。
-   *
-   * 逐层请求语言服务，所以要有两个上限，避免在巨大工程上把语言服务拖死：
-   *   - MAX_EXPAND_ROUNDS：层数上限
-   *   - MAX_EXPAND_NODES：节点总数上限（与 maxChildrenPerNode 的默认档位相称）
-   * 走 withProgress 显示进度（面板在底部，用户能看见；不是弹窗 Toast）。
+   * 工具栏的「展开全部」：按设置项 `cppCallGraph.maxExpandRounds` 的层数上限逐层展开。
+   * 节点预算按「每层上限 × 层数」折算（与设置里的两个上限相称），再夹到布局上限以内。
    */
   private async expandAll(sessionId: string): Promise<void> {
+    const rounds = maxExpandRoundsLimit();
+    await this.expandBatched(sessionId, {
+      rounds,
+      nodeBudget: Math.min(MAX_EXPAND_NODES, maxChildrenPerNodeLimit() * rounds),
+      title: '正在展开全部调用关系…',
+      label: '展开全部',
+    });
+  }
+
+  /**
+   * 工具栏的「完全展开」：递归展开直到没有可展开的节点，**不受层数上限约束**。
+   *
+   * 与「展开全部」的差别只有这一点：层数不设限。节点总数仍夹在布局上限以内
+   * （超过上限的节点没有方框、不会上图，日志里会说明有多少个未显示）。
+   */
+  private async expandFull(sessionId: string): Promise<void> {
+    await this.expandBatched(sessionId, {
+      rounds: Number.POSITIVE_INFINITY,
+      nodeBudget: MAX_EXPAND_NODES,
+      title: '正在完全展开调用关系…',
+      label: '完全展开',
+    });
+  }
+
+  /**
+   * 「展开全部」与「完全展开」共用的逐层展开。
+   *
+   * 逐层请求语言服务，所以要有限度，避免在巨大工程上把语言服务拖死：
+   *   - `rounds`：最多展开几层（`Infinity` 表示递归到底）
+   *   - `nodeBudget`：节点总数上限，且**每次 expand 都夹剩余额度**（见下）
+   * 走 withProgress 显示进度（面板在底部，用户能看见；不是弹窗 Toast）。
+   */
+  private async expandBatched(
+    sessionId: string,
+    options: { rounds: number; nodeBudget: number; title: string; label: string }
+  ): Promise<void> {
+    const { rounds, nodeBudget, title, label } = options;
     const session = this.getSession(sessionId);
     if (!session) {
       return;
     }
-    const maxChildren =
-      vscode.workspace
-        .getConfiguration('cppCallGraph')
-        .get<number>('maxChildrenPerNode', 200) || 200;
-    const nodeBudget = Math.min(MAX_EXPAND_NODES, maxChildren * MAX_EXPAND_ROUNDS);
+    // 已经尝试过的节点：失败的展开不会把 `loaded` 置位，若只按 `!loaded` 挑目标，
+    // 「完全展开」会在同一个失败节点上无限重试（层数不设限，没有别的机制来打断它）。
+    const attempted = new Set<string>();
 
     await vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Window, title: '正在展开全部调用关系…' },
+      { location: vscode.ProgressLocation.Window, title },
       async (progress) => {
         let total = 0;
-        for (let round = 0; round < MAX_EXPAND_ROUNDS; round += 1) {
+        for (let round = 0; round < rounds; round += 1) {
           const targets = Object.values(session.nodeRecord())
-            .filter((node) => !node.loaded && !node.isCycle)
+            .filter((node) => !node.loaded && !node.isCycle && !attempted.has(node.id))
             .map((node) => node.id);
           if (targets.length === 0) {
             break;
           }
           for (const id of targets) {
-            if (Object.keys(session.nodeRecord()).length >= nodeBudget) {
-              logWarn(`展开全部：已达节点上限 ${nodeBudget}，停止继续展开。`);
+            attempted.add(id);
+            // ⚠️ 每轮都要复查会话还在不在：循环里每个节点都要 await 一次语言服务，
+            // 大图上这可能是几秒到几十秒；期间用户很可能已经关掉这个标签（或点了「关闭全部」）。
+            // 不复查的话请求会继续跑满预算，而用户唯一的「停止」手段就是关标签 —— 那等于无效。
+            if (!this.getSession(sessionId)) {
+              logInfo(`「${label}」中止：该标签已被关闭。`);
+              return;
+            }
+            const before = Object.keys(session.nodeRecord()).length;
+            // 剩余预算必须夹进这一次 expand：预算是在展开**之前**查的，而单次 expand 最多
+            // 能新增 maxChildrenPerNode 个节点，只查预算会让总数冲过布局上限
+            // （默认档位下最多 799 + 200 = 999 > 800），超出的节点没有方框也没有连线。
+            const remaining = nodeBudget - before;
+            if (remaining <= 0) {
+              logWarn(`${label}：已达节点上限 ${nodeBudget}（当前 ${before} 个），停止继续展开。`);
               this.postSession(session);
               await this.persist();
               return;
             }
             try {
-              await session.expand(id);
+              await session.expand(id, remaining);
               total += 1;
             } catch (error) {
               logError(`展开 ${id} 失败`, error);
@@ -532,7 +656,7 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
           });
         }
         logInfo(
-          `展开全部完成：处理 ${total} 个节点，当前共 ${Object.keys(session.nodeRecord()).length} 个。`
+          `${label}完成：处理 ${total} 个节点，当前共 ${Object.keys(session.nodeRecord()).length} 个。`
         );
         this.postSession(session);
         await this.persist();
@@ -622,11 +746,21 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
    * ⚠️ 新增设置项时，**三处要一起改**：`package.json` 的 `configuration`、
    * 这里的方法、以及 `README.md` 的设置表（工作区规则里明写了这条）。
    */
-  private settingsPayload(): { stickyParent: boolean; showLocation: boolean } {
+  private settingsPayload(): {
+    stickyParent: boolean;
+    showLocation: boolean;
+    pathDisplay: 'tail' | 'full';
+    pathTailLevels: number;
+    pathAnchors: string[];
+  } {
     const config = vscode.workspace.getConfiguration('cppCallGraph');
     return {
       stickyParent: config.get<boolean>('stickyParent', true),
       showLocation: config.get<boolean>('showLocation', true),
+      // 路径在一行里怎么省略。锚点模式在这里就整理成数组：webview 只认数组，不该自己解析字符串。
+      pathDisplay: config.get<string>('pathDisplay', 'tail') === 'full' ? 'full' : 'tail',
+      pathTailLevels: readCount(config.get<number>('pathTailLevels', 0)),
+      pathAnchors: readAnchors(config.get<unknown>('pathAnchors', [])),
     };
   }
 
@@ -712,6 +846,9 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
       title: session.title,
       description: session.description,
       direction: session.direction,
+      // ⚠️ 必须和 postSummaries 一致地带上角标：init 只给活动会话带完整 payload，
+      // 其余标签只靠这份摘要占位；漏掉 badge 的表现是「重载窗口后只有活动标签有引擎角标」。
+      badge: badgeFor(session.engineLabel),
     }));
     const payloads = active ? [this.buildPayload(active)] : [];
     void this.view.webview
@@ -777,6 +914,8 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
         title: session.title,
         description: session.description,
         direction: session.direction,
+        // 角标由宿主按配置档算好传给 webview（它读不到设置，也不该猜引擎名）
+        badge: badgeFor(session.engineLabel),
       })),
       activeId: this.activeSession?.id ?? '',
     });
@@ -797,12 +936,20 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
     const { nodes, edges } = session.graph();
     // 用 webview 上一帧回传的实测宽度排布列位置；没有时 createLayout 自己估宽。
     const measured = this.measuredWidths.get(session.id);
+    // ⚠️ 路径显示方式必须与 webview 渲染用同一份设置：估宽与实际文字不一致时，
+    // 列宽会按错误的宽度排，文字要么顶到加减号、要么右边空一大截。
+    const settings = this.settingsPayload();
     const layout = createLayout(
       nodes,
       session.rootId,
       measured,
       this.collapsedNodes.get(session.id),
-      this.settingsPayload().showLocation
+      settings.showLocation,
+      {
+        mode: settings.pathDisplay,
+        tailLevels: settings.pathTailLevels,
+        anchors: settings.pathAnchors,
+      }
     );
     const payloadNodes: SessionPayload['nodes'] = {};
     for (const [id, node] of Object.entries(nodes)) {
@@ -817,6 +964,7 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
       description: session.description,
       direction: session.direction,
       engineLabel: session.engineLabel,
+      badge: badgeFor(session.engineLabel),
       rootId: session.rootId,
       nodes: payloadNodes,
       edges,
@@ -871,6 +1019,38 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
       void this.setViewVisible(true);
     }
   }
+
+  /**
+   * 仅用于测试（`scripts/smoke.js`）：内部缓存的**只读快照**。
+   *
+   * 为什么需要它：`measuredWidths` / `collapsedNodes` / `selectedIds` 是按会话 id 索引的表，
+   * 「消息晚到、会话已关闭」这类竞态只表现在这些表里 —— 界面看不出来，也没有别的观察点。
+   * 刻意只返回 id 与计数、不交出内部表本身：测试拿不到引用就改不了状态，
+   * 断言反映的仍是真实运行时行为。
+   */
+  __debugSnapshot(): {
+    sessionIds: string[];
+    activeId: string | undefined;
+    busyToken: number | undefined;
+    measuredWidths: Array<{ sessionId: string; count: number }>;
+    collapsedNodes: Array<{ sessionId: string; count: number }>;
+    selectedIds: Array<{ sessionId: string; nodeId: string }>;
+  } {
+    return {
+      sessionIds: this.sessions.map((session) => session.id),
+      activeId: this.activeId,
+      busyToken: this.busy?.token,
+      measuredWidths: [...this.measuredWidths].map(([sessionId, widths]) => ({
+        sessionId,
+        count: widths.size,
+      })),
+      collapsedNodes: [...this.collapsedNodes].map(([sessionId, ids]) => ({
+        sessionId,
+        count: ids.size,
+      })),
+      selectedIds: [...this.selectedIds].map(([sessionId, nodeId]) => ({ sessionId, nodeId })),
+    };
+  }
 }
 
 // ---------------------------------------------------------------- 工具
@@ -898,12 +1078,13 @@ function sameWidths(a: Map<string, number>, b: Map<string, number>): boolean {
 type WebviewMessage =
   | { type: 'ready' }
   | { type: 'error'; message: string }
-  | { type: 'requestInit' }
   | { type: 'selectTab'; id: string }
   | { type: 'closeTab'; id: string }
   | { type: 'closeAllTabs' }
   | { type: 'expand'; sessionId: string; nodeId: string }
   | { type: 'expandAll'; sessionId: string }
+  /** 「完全展开」：递归到底（不受层数上限约束），节点总数仍受布局上限约束。 */
+  | { type: 'expandFull'; sessionId: string }
   | { type: 'collapse'; sessionId: string; collapsed: string[] }
   | { type: 'openLocation'; sessionId: string; nodeId: string }
   | { type: 'selectNode'; sessionId: string; nodeId: string }
@@ -912,9 +1093,4 @@ type WebviewMessage =
   | { type: 'copyTabText'; sessionId: string }
   | { type: 'reportWidths'; sessionId: string; widths: Array<{ id: string; width: number }> }
   | { type: 'copyNodeName'; sessionId: string; nodeId: string }
-  | { type: 'copyNodeLocation'; sessionId: string; nodeId: string }
-  | {
-      type: 'saveOffsets';
-      sessionId: string;
-      offsets: Array<{ id: string; dx: number; dy: number }>;
-    };
+  | { type: 'copyNodeLocation'; sessionId: string; nodeId: string };

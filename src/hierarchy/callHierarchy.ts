@@ -6,37 +6,58 @@
  *   - vscode.provideIncomingCalls   (item)           ~ callHierarchy/incomingCalls
  *   - vscode.provideOutgoingCalls   (item)           ~ callHierarchy/outgoingCalls
  *
- * 关于「用哪个语言服务」：
- *   clangd 与 ms-vscode.cpptools 都注册在同一个虚拟语言 ID（c / cpp）上，
- *   上面这些命令会把位置交给**所有**匹配的 provider，由 VS Code 决定顺序，
- *   扩展无法指定「只问 clangd」。因此这里提供了引擎过滤：
- *   我们先分别向两个 provider 请求（prepareCallHierarchy 返回的是全部结果），
- *   再按用户选择的引擎挑出对应的一份，从而做到「只展示 clangd 的结果」。
+ * 关于「用哪个语言服务」：**0.21 起没有 clangd / cpptools 的分支了** ——
+ * 引擎信息（显示名、角标、可用性、认领规则）全部在 `engines.ts` 里以配置档（表）描述，
+ * 用户还能在设置里加自定义条目。这里只负责「取数据」与「按策略挑一个」：
+ *   · 默认（`nearest`）不认领，按 `selectionRange` 离光标最近挑 —— 与 0.20 行为一致；
+ *   · 用户显式选了某个配置档且它配了 `match` 时，才先在它认领的结果里挑，认不到就退回就近挑；
+ *   · 只有 `onlySelected` 才可能"查不出结果"，那需要用户明确选择。
  */
 import * as vscode from 'vscode';
 import { existsSync } from 'node:fs';
-import * as path from 'node:path';
 
 import { CallDirection, Direction } from './graphTypes';
+import {
+  EngineChoice,
+  EngineId,
+  EngineLabel,
+  EngineProfile,
+  PickPolicy,
+  badgeFor,
+  clangdExecutable,
+  describeEngine,
+  engineProfiles,
+  explainUnavailable,
+  invalidateExecutableCache,
+  isExtensionActiveOrInstalled,
+  isProfileAvailable,
+  listAvailableEngines,
+  matchesProfile,
+  pickPolicy,
+  preferredEngine,
+  profileById,
+  selectedProfile,
+} from './engines';
 
 export type { CallDirection, Direction };
-
-/** 用户可以选择的语言服务。 */
-export type EngineChoice = 'auto' | 'clangd' | 'cpptools';
-
-/** 语言服务标识（探测不出时回落到 unknown）。 */
-export type EngineLabel = 'clangd' | 'cpptools' | 'unknown';
-
-export interface EngineInfo {
-  label: EngineLabel;
-  /** 展示名，例如 "clangd 0.6.0"。 */
-  display: string;
-}
-
-export const ENGINE_EXTENSION_IDS: Record<'clangd' | 'cpptools', string> = {
-  clangd: 'llvm-vs-code-extensions.vscode-clangd',
-  cpptools: 'ms-vscode.cpptools',
+export type { EngineChoice, EngineId, EngineLabel, EngineProfile, PickPolicy };
+// 这些名字以前定义在本文件里，为了不惊动所有调用方继续从这里转出。
+export {
+  badgeFor,
+  clangdExecutable,
+  describeEngine,
+  explainUnavailable,
+  engineProfiles,
+  isExtensionActiveOrInstalled,
+  isProfileAvailable,
+  listAvailableEngines,
+  matchesProfile,
+  pickPolicy,
+  preferredEngine,
+  profileById,
+  selectedProfile,
 };
+export const invalidateClangdCache = invalidateExecutableCache;
 
 export const LANG_IDS = [
   'c',
@@ -64,165 +85,9 @@ export function itemKey(item: vscode.CallHierarchyItem): string {
 }
 
 // ------------------------------------------------------------ 引擎可用性
-
-export function isExtensionActiveOrInstalled(id: string): boolean {
-  return vscode.extensions.getExtension(id) !== undefined;
-}
-
-// ------------------------------------------------- clangd 可执行文件探测
 //
-// 注意：装了 clangd *扩展* 不等于有 clangd *程序*。VS Code 的 clangd 扩展
-// 只是个客户端，它需要真正的 clangd 可执行文件，否则不会注册任何 provider，
-// 也就无法提供调用关系（这一点在 callHierarchy.ts 顶部有说明）。
-// 另外 clang 编译器（clang.exe / clang++.exe）不能替代 clangd.exe。
-
-let clangdPathCache: { value: string | undefined } | undefined;
-
-/** 从 PATH 里找 clangd（含 Windows 的 .exe/.cmd/.bat）。 */
-function findOnPath(command: string): string | undefined {
-  if (!command) {
-    return undefined;
-  }
-  // 已经给了具体路径
-  if (command.includes('/') || command.includes('\\')) {
-    return existsSync(command) ? command : undefined;
-  }
-  const pathValue = process.env.PATH ?? process.env.Path ?? '';
-  const extensions =
-    process.platform === 'win32'
-      ? (process.env.PATHEXT ?? '.EXE;.CMD;.BAT').split(';').filter(Boolean)
-      : [''];
-  for (const entry of pathValue.split(path.delimiter)) {
-    if (!entry) {
-      continue;
-    }
-    for (const extension of extensions) {
-      const candidate = path.join(entry, command + extension);
-      if (existsSync(candidate)) {
-        return candidate;
-      }
-    }
-  }
-  return undefined;
-}
-
-/** 常见的 clangd 安装位置（winget / LLVM 官方安装器 / MSYS2 / scoop 等）。 */
-function findInCommonLocations(): string | undefined {
-  if (process.platform !== 'win32') {
-    return undefined;
-  }
-  const home = process.env.USERPROFILE ?? process.env.HOME ?? '';  const localAppData = process.env.LOCALAPPDATA ?? '';
-  const programData = process.env.ProgramData ?? 'C:\\ProgramData';
-  const candidates = [
-    'C:\\Program Files\\LLVM\\bin\\clangd.exe',
-    'C:\\Program Files (x86)\\LLVM\\bin\\clangd.exe',
-    localAppData ? path.join(localAppData, 'Programs', 'LLVM', 'bin', 'clangd.exe') : '',
-    localAppData ? path.join(localAppData, 'Microsoft', 'WinGet', 'Links', 'clangd.exe') : '',
-    programData ? path.join(programData, 'chocolatey', 'bin', 'clangd.exe') : '',
-    home ? path.join(home, 'scoop', 'shims', 'clangd.exe') : '',
-    'C:\\msys64\\mingw64\\bin\\clangd.exe',
-    'C:\\msys64\\clang64\\bin\\clangd.exe',
-  ];
-  for (const candidate of candidates) {
-    if (candidate && existsSync(candidate)) {
-      return candidate;
-    }
-  }
-  return undefined;
-}
-
-/**
- * 解析 clangd 可执行文件的实际位置，找不到返回 undefined。
- * 优先级：clangd.path 设置 → PATH → 常见安装目录。结果会缓存。
- */
-export function clangdExecutable(): string | undefined {
-  if (clangdPathCache !== undefined) {
-    return clangdPathCache.value;
-  }
-  const configured = vscode.workspace
-    .getConfiguration('clangd')
-    .get<string>('path', 'clangd');
-  const found =
-    findOnPath(configured) ??
-    findOnPath('clangd') ??
-    findInCommonLocations();
-  clangdPathCache = { value: found };
-  return found;
-}
-
-/** 设置变化后丢弃缓存，重新探测。 */
-export function invalidateClangdCache(): void {
-  clangdPathCache = undefined;
-}
-
-/**
- * 当前有哪些引擎「真的可能」提供调用层级。
- * clangd 要求扩展存在 **且** 找得到 clangd 可执行文件。
- */
-export function listAvailableEngines(): EngineLabel[] {
-  const engines: EngineLabel[] = [];
-  if (
-    isExtensionActiveOrInstalled(ENGINE_EXTENSION_IDS.clangd) &&
-    clangdExecutable()
-  ) {
-    engines.push('clangd');
-  }
-  if (isExtensionActiveOrInstalled(ENGINE_EXTENSION_IDS.cpptools)) {
-    engines.push('cpptools');
-  }
-  return engines;
-}
-
-/** 最可能的输出通道：优先 clangd，其次 cpptools。 */
-export function preferredEngine(): EngineLabel {
-  const engines = listAvailableEngines();
-  return engines[0] ?? 'unknown';
-}
-
-export function describeEngine(label: EngineLabel): string {
-  if (label === 'unknown') {
-    return '未识别的语言服务';
-  }
-  if (label === 'clangd') {
-    const version =
-      vscode.extensions.getExtension(ENGINE_EXTENSION_IDS.clangd)?.packageJSON
-        ?.version ?? '';
-    const executable = clangdExecutable();
-    const base = version ? `clangd ${version}` : 'clangd';
-    return executable ? `${base}（${executable}）` : base;
-  }
-  const version =
-    vscode.extensions.getExtension(ENGINE_EXTENSION_IDS.cpptools)?.packageJSON
-      ?.version ?? '';
-  return version ? `C/C++ (cpptools) ${version}` : 'C/C++ (cpptools)';
-}
-
-/** 选中的引擎是否真的可用（扩展存在 **且** 程序可执行文件找得到）。 */
-export function resolveEngineChoice(choice: EngineChoice): EngineLabel {
-  if (choice === 'auto') {
-    return 'unknown';
-  }
-  return listAvailableEngines().includes(choice) ? choice : 'unknown';
-}
-
-/** 用户明确选了某个引擎、但它不可用时的原因说明。 */
-export function explainUnavailable(choice: EngineChoice): string | undefined {
-  if (choice === 'auto') {
-    return undefined;
-  }
-  if (choice === 'cpptools') {
-    return isExtensionActiveOrInstalled(ENGINE_EXTENSION_IDS.cpptools)
-      ? undefined
-      : '没有安装 C/C++ 扩展（ms-vscode.cpptools）';
-  }
-  if (!isExtensionActiveOrInstalled(ENGINE_EXTENSION_IDS.clangd)) {
-    return '没有安装 clangd 扩展（llvm-vs-code-extensions.vscode-clangd）';
-  }
-  if (!clangdExecutable()) {
-    return 'clangd 扩展已安装，但找不到 clangd 可执行文件。clangd 扩展只是客户端，需要另外安装 clangd（例如 `winget install LLVM.LLVM`，或设置 `clangd.path`）';
-  }
-  return undefined;
-}
+// 0.21 起"哪个引擎可用 / 该显示什么 / 该认领哪些结果"全部搬到了 `engines.ts`
+// （表驱动 + 支持设置里的自定义条目）。这里不再有 clangd / cpptools 的分支。
 
 // ------------------------------------------------------------ 探测（识别引擎）
 
@@ -308,16 +173,17 @@ export async function probeEngines(
     return undefined;
   }
 
+  const profiles = engineProfiles();
   const entries: ProbeEntry[] = prepared.map((item, index) => {
-    if (item.name.includes('cppCallGraphProbeTarget')) {
-      return { item, engine: 'clangd' as EngineLabel };
+    // 先用各配置档自己的认领规则判断（表驱动，自定义引擎也能被认出来）；
+    // 认不出再按"谁真的可用"的顺序推测（与 listAvailableEngines 一致）——仅诊断展示用。
+    const claimed = profiles.find((profile) => matchesProfile(item, profile));
+    if (claimed) {
+      return { item, engine: claimed.id };
     }
-    // 无法从 item 反推引擎时，按“谁真的可用”的顺序推测（与 listAvailableEngines 一致）。
     const fallback = listAvailableEngines();
     const engine: EngineLabel =
-      prepared.length === 2
-        ? (fallback[index] ?? 'unknown')
-        : 'unknown';
+      prepared.length === 2 ? (fallback[index] ?? 'unknown') : 'unknown';
     return { item, engine };
   });
 
@@ -415,7 +281,10 @@ export function pickByChoice(
 export async function resolveAt(
   document: vscode.TextDocument,
   position: vscode.Position,
-  choice: EngineChoice,
+  /** 用户显式选中的配置档（`auto` / `any` / 不可用时为 undefined = 不认领）。 */
+  selected: EngineProfile | undefined,
+  policy: PickPolicy,
+  /** 不认领时用来标注会话（探测到的引擎名，或 'unknown'）。 */
   expected: EngineLabel
 ): Promise<ResolvedItem | undefined> {
   const offsets = [0, -1, 1, -2, 2, -3, 3, -4, 4, -5, 5];
@@ -461,14 +330,36 @@ export async function resolveAt(
   lastPrepareError = `已解析出 ${allItems.length} 个候选：${[...new Set(collectedNames)].join(', ')}`;
   lastPrepareErrorAt = new Date().toISOString();
 
-  const picked = pickByChoice(allItems, position);
+  // 挑选策略：
+  //   nearest（默认）—— 不认领，按选区离光标最近挑（与 0.20 一致，最安全）
+  //   preferSelected  —— 先只在选中配置档认领的结果里挑；认不到退回就近挑（并留痕）
+  //   onlySelected    —— 只认选中配置档；认不到就没有结果（用户明确选择了这个档）
+  let claimedCount = 0;
+  let picked: vscode.CallHierarchyItem | undefined;
+  if (selected && policy !== 'nearest') {
+    const claimed = allItems.filter((item) => matchesProfile(item, selected));
+    claimedCount = claimed.length;
+    if (claimedCount > 0) {
+      picked = pickByChoice(claimed, position);
+    } else if (policy === 'onlySelected') {
+      lastPrepareError = `引擎「${selected.label}」在此位置没有结果（策略 onlySelected），已放弃就近挑`;
+      lastPrepareErrorAt = new Date().toISOString();
+      return undefined;
+    } else {
+      lastPrepareError = `引擎「${selected.label}」在此位置没有认领到结果，已退回就近挑`;
+      lastPrepareErrorAt = new Date().toISOString();
+    }
+  }
+  picked = picked ?? pickByChoice(allItems, position);
   if (!picked) {
     return undefined;
   }
+  // 认领成功时标注选中的引擎；否则标注探测到的（认不出就是 unknown）。
+  const engine: EngineLabel =
+    selected && claimedCount > 0 ? selected.id : expected;
   return {
     item: picked,
-    // 显式选了引擎时标注该引擎；auto 且探测不出时如实标注 unknown。
-    engine: choice === 'auto' ? expected : resolveEngineChoice(choice),
+    engine,
     allNames: [...new Set(collectedNames)],
   };
 }

@@ -2,7 +2,7 @@
   "name": "cpp-call-graph",
   "displayName": "C/C++ 调用关系图 (Call Graph)",
   "description": "在底部面板以图形化方式浏览 C/C++ 函数的被调用关系与调用关系，每次查询一个标签页（基于 LSP Call Hierarchy / clangd）。",
-  "version": "0.20.0",
+  "version": "0.21.0",
   "publisher": "Piscespanther",
   "license": "MIT",
   "repository": {
@@ -134,41 +134,138 @@
           "enum": [
             "auto",
             "clangd",
-            "cpptools"
+            "cpptools",
+            "any",
+            "custom"
           ],
           "enumItemLabels": [
             "自动（由 VS Code 决定）",
             "优先 clangd",
-            "优先 C/C++ 扩展 (cpptools)"
+            "优先 C/C++ 扩展（cpptools）",
+            "不指定引擎（按光标就近）",
+            "自定义（用 customEngineId）"
           ],
           "default": "auto",
-          "markdownDescription": "C/C++ 的调用层级由哪个语言服务提供。\n\n- **clangd**：需要 clangd *扩展* **与**真正的 `clangd` 可执行文件同时具备（该扩展仅为客户端，仅安装 clang 编译器的 `clang.exe` 不满足要求），且工程需提供 `compile_commands.json`。\n- **cpptools**：C/C++ 扩展，调用层级经其自身的 RPC 获取。\n\n两者注册在同一个语言 ID 上，VS Code 按注册顺序选用，扩展无法强制指定；本设置仅影响结果取舍与展示标注。若需彻底避免两个引擎互相干扰，建议只启用其中一个：使用 clangd 时将 `C_Cpp.intelliSenseEngine` 设为 `disabled`，或直接禁用 C/C++ 扩展。"
+          "markdownDescription": "调用层级由哪个语言服务提供。\n\n- **自动**：由 VS Code 决定。\n- **clangd**：需同时具备 clangd 扩展与 `clangd` 可执行文件（仅安装 clang 编译器不满足要求），且工程提供 `compile_commands.json` 或 `compile_flags.txt`。\n- **cpptools**：C/C++ 扩展。\n- **不指定引擎**：按符号名范围与光标的距离挑选，多引擎共存时最安全。\n- **自定义**：使用 `cppCallGraph.customEngineId`。\n\n多个语言服务注册在同一个语言 ID 上，扩展无法强制指定；本设置只影响结果的认领与展示标注（另见 `cppCallGraph.enginePickPolicy`）。如需避免互相干扰，可只启用其中一个。"
+        },
+        "cppCallGraph.customEngineId": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "`cppCallGraph.languageService` 选择「自定义」时使用的引擎 id：可填 `cppCallGraph.customEngines` 中定义的 id，也可填内置 id。填不存在的 id 会记一条警告并退回「不指定引擎」。"
+        },
+        "cppCallGraph.customEngines": {
+          "type": "array",
+          "default": [],
+          "markdownDescription": "自定义语言服务列表，用于接入其它实现 Call Hierarchy 的语言服务。字段：`id`（必填）、`label`、`extensionId`、`badge`、`matchName`、`matchDetail`、`advice`。与内置项同 id 时覆盖内置项。",
+          "items": {
+            "type": "object",
+            "required": [
+              "id"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "唯一标识（设置里填的就是它）"
+              },
+              "label": {
+                "type": "string",
+                "description": "展示名（省略时用 id）"
+              },
+              "extensionId": {
+                "type": "string",
+                "description": "判断「装了没」用的扩展 ID（省略表示不依赖任何扩展）"
+              },
+              "badge": {
+                "type": "string",
+                "description": "标签角标文字（省略时不显示角标）"
+              },
+              "matchName": {
+                "type": "string",
+                "description": "候选结果的「名字」含该子串时，认领给这个引擎（大小写不敏感）"
+              },
+              "matchDetail": {
+                "type": "string",
+                "description": "候选结果的「详情」含该子串时，认领给这个引擎（大小写不敏感）"
+              },
+              "advice": {
+                "type": "string",
+                "description": "该引擎不可用时给出的提示"
+              }
+            }
+          }
+        },
+        "cppCallGraph.enginePickPolicy": {
+          "type": "string",
+          "enum": [
+            "nearest",
+            "preferSelected",
+            "onlySelected"
+          ],
+          "enumItemLabels": [
+            "按光标就近（默认）",
+            "优先选中引擎（认不到时退回就近）",
+            "只认选中引擎（可能查不出结果）"
+          ],
+          "default": "nearest",
+          "markdownDescription": "存在多个语言服务时，如何从聚合回来的候选中挑选。\n\n- **按光标就近**：按符号名范围与光标的距离取最近的（默认）。\n- **优先选中引擎**：先在选中引擎认领的结果中挑选，认不到时退回就近并在日志中说明。\n- **只认选中引擎**：只认选中引擎的结果，认不到时报该引擎在此位置无结果。这是唯一可能查不出结果的档位，且只对配置了 `matchName` / `matchDetail` 的自定义引擎有效。"
         },
         "cppCallGraph.maxChildrenPerNode": {
           "type": "number",
           "default": 200,
           "minimum": 1,
-          "markdownDescription": "同一层中每个函数最多显示的调用者/被调用者数量。"
+          "markdownDescription": "每个方框最多显示的直接调用者 / 被调用者数量。超出部分不显示，悬停提示给出被省略的条数。"
+        },
+        "cppCallGraph.maxExpandRounds": {
+          "type": "number",
+          "default": 5,
+          "minimum": 1,
+          "maximum": 50,
+          "markdownDescription": "工具栏「展开全部」逐层展开的层数上限（默认 5）。「完全展开」不受该项约束，会展开到没有可展开的节点；两者均受节点总数上限约束，超出部分不上图并在日志中说明。"
         },
         "cppCallGraph.autoReveal": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "**双击**图形中的函数方框时，自动打开对应文件并定位到函数声明处（单击只选中该方框）。"
+          "markdownDescription": "双击方框时打开对应文件并定位到声明处（单击只选中）。"
         },
         "cppCallGraph.showEngineWarning": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "检测到 clangd 与 C/C++ 扩展（cpptools）同时可用时给出提示，以避免调用关系结果被两个引擎混用。"
+          "markdownDescription": "检测到两个及以上语言服务可能同时提供调用层级时给出提示，避免结果被多个引擎混用。"
         },
         "cppCallGraph.stickyParent": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "纵向滚动时，将**所有已经展开了下一层的方框**固定于窗口垂直中央作为参照：子方框自其旁侧滑过，与其相连的箭头同步重绘。每个方框只在自己的子树范围内滑动。关闭后按普通画布方式滚动。"
+          "markdownDescription": "纵向滚动时，把所有已展开下一层的方框固定在窗口垂直中央；每个方框只在自己的子树范围内滑动。关闭后按普通画布滚动。"
         },
         "cppCallGraph.showLocation": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "是否在方框中显示「文件路径:行号」一行。关闭后仅显示元素名，方框的宽度与**高度**均相应收窄为单行高度。"
+          "markdownDescription": "在方框中显示「文件路径:行号」一行。关闭后仅显示元素名，方框宽度与高度均收窄为单行。"
+        },
+        "cppCallGraph.pathDisplay": {
+          "type": "string",
+          "enum": [
+            "tail",
+            "full"
+          ],
+          "enumDescriptions": [
+            "保留末尾若干层，另可按锚点保留指定的目录段",
+            "宽度允许时显示整条路径"
+          ],
+          "default": "tail",
+          "markdownDescription": "方框内路径的显示方式。\n\n- **省略**：保留末尾若干层，另保留 `cppCallGraph.pathAnchors` 指定的目录段。\n- **完整**：宽度允许时显示整条路径，放不下时保留首尾。\n\n方框宽度上限为 600px；完整路径始终可在悬停提示中查看，右键「复制地址」复制的也是完整路径。"
+        },
+        "cppCallGraph.pathTailLevels": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 8,
+          "markdownDescription": "「省略」模式下末尾保留的层数（含文件名）。`0` 表示按方框宽度自动。"
+        },
+        "cppCallGraph.pathAnchors": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "「省略」模式下必须显示的目录段，逗号分隔，可写多条。\n\n- `目录名`：该目录名对应的那一段（大小写不敏感，取最左命中）。\n- `目录名+N` / `目录名-N`：以该目录名为基准偏移 N 层，**只显示偏移后的那一段**。\n- `+N`：从工作区根数第 N 段（1 = 最左一段）。\n- `-N`：从文件名往上数第 N 段（1 = 文件所在目录）。\n\n并列目录的名字各不相同时用偏移定位。要连基准目录一起显示，把它另写一条。越界或未命中的条目忽略，并在日志中说明。"
         }
       }
     }
@@ -179,7 +276,9 @@
     "watch": "node esbuild.js --watch",
     "smoke": "node esbuild.js && node scripts/buildChecks.js && node scripts/smoke.js && node scripts/pickCheck.js && node scripts/webviewCheck.js && node scripts/renderCheck.js && node scripts/iconCheck.js && node scripts/iconShapeCheck.js && node scripts/genSymbolIcons.js --verify",
     "package": "node esbuild.js --production && vsce package --no-dependencies",
-    "vscode:prepublish": "node esbuild.js --production"
+    "privacy": "node scripts/privacyScan.js",
+    "stress": "node esbuild.js && node scripts/stressCheck.js",
+    "vscode:prepublish": "node esbuild.js --production && node scripts/buildChecks.js && node scripts/privacyScan.js"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

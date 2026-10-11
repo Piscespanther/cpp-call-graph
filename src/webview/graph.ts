@@ -21,6 +21,8 @@ interface GraphNode {
   id: string;
   name: string;
   detail?: string;
+  /** 展开时按 `maxChildrenPerNode` 省略掉的条数（>0 时在悬停提示里说明）。 */
+  omitted?: number;
   file: string;
   line: number;
   callSite?: CallSite;
@@ -81,6 +83,8 @@ interface SessionPayload {
   description: string;
   direction: Direction;
   engineLabel: string;
+  /** 角标 id（宿主按引擎配置档算好；缺省时回退到按 engineLabel 文本猜）。 */
+  badge?: string;
   rootId: string;
   nodes: Record<string, GraphNode>;
   edges: GraphEdge[];
@@ -93,6 +97,7 @@ interface SessionSummary {
   title: string;
   description: string;
   direction: Direction;
+  badge?: string;
 }
 
 interface InitMessage {
@@ -107,11 +112,27 @@ interface InitMessage {
 }
 
 /** 需要下发给 webview 的设置项（与宿主 settingsPayload() 一一对应）。 */
+/** 路径在方框里的显示方式（与宿主 `graphLayout.ts` 的 PathDisplayOptions 同形）。 */
+interface PathDisplayOptions {
+  mode: 'tail' | 'full';
+  /** 末尾保留几层（含文件名）；0 = 按字符预算自动（0.20 的行为）。 */
+  tailLevels: number;
+  /**
+   * 必须显示的目录段，可组合多层；每条模式只保留它自己解析出的那一段。
+   * 写法见宿主 `graphLayout.ts` 的同名说明（两侧必须逐字同规则）。
+   */
+  anchors: string[];
+}
+
 interface WebviewSettings {
   /** 纵向滚动时把父方框钉在窗口垂直中央。 */
   stickyParent?: boolean;
   /** 方框里是否显示「文件路径:行号」那一行。 */
   showLocation?: boolean;
+  /** 路径显示方式（见 PathDisplayOptions）。 */
+  pathDisplay?: 'tail' | 'full';
+  pathTailLevels?: number;
+  pathAnchors?: string[];
 }
 
 interface SessionUpdateMessage {
@@ -180,6 +201,14 @@ const busyLabelEl = document.getElementById('busy-label') as HTMLParagraphElemen
 
 /** 遮罩延迟：快查询不闪一下（毫秒）。 */
 const BUSY_DELAY_MS = 240;
+
+/**
+ * 本地「正在展开」标记的超时时间。
+ *
+ * 正常情况下宿主回 `sessionUpdate` 就会清掉该标记；但宿主在「会话已关闭」等异常路径下
+ * 直接 return、不发任何消息，标记会永久留着并把遮罩一直点亮。超时后自行清除。
+ */
+const LOADING_TIMEOUT_MS = 12000;
 /** 遮罩默认文案（与 graph.html 里 #busy-label 的初始文本一致）。 */
 const BUSY_DEFAULT_LABEL = '正在解析…';
 /** 宿主是否正在解析（busy 消息维护）。 */
@@ -240,7 +269,11 @@ const state = {
   activeId: undefined as string | undefined,
   /** 每个会话的 viewBox 原点（内容坐标）。 */
   viewports: new Map<string, { x: number; y: number }>(),
-  selected: undefined as string | undefined,
+  /**
+   * 当前选中的方框。**必须带会话 id**：节点 id 由内容派生，同一个符号在
+   * 「被调用关系图」与「调用关系图」两个标签里 id 完全相同，只存 id 会串标签。
+   */
+  selected: undefined as { sessionId: string; nodeId: string } | undefined,
   loading: new Set<string>(),
   /** 每个会话里被手动收起的节点（只影响显示，不丢数据）。 */
   collapsed: new Map<string, Set<string>>(),
@@ -250,6 +283,12 @@ const state = {
   stickyParent: true,
   /** 由宿主下发的设置：方框里是否显示「文件路径:行号」那一行。 */
   showLocation: true,
+  /** 由宿主下发的设置：路径怎么省略（默认与 0.20 一致：按字符预算保留末尾目录段）。 */
+  pathOptions: {
+    mode: 'tail',
+    tailLevels: 0,
+    anchors: [],
+  } as PathDisplayOptions,
 };
 
 /**
@@ -342,7 +381,14 @@ const MIN_BOX_WIDTH = 120;
  * 文字被截断后仍顶到加减号上（曾经取 320 就踩了这个坑，实测压住 0.8px）。
  * 当前文字上限约 40 字符 ≈ 300px，加两侧预留约 320，故取 400 留出余量。
  */
-const MAX_BOX_WIDTH = 400;
+/**
+ * 方框宽度的上限（与宿主 `graphLayout.ts` 的同名常量必须一致，renderCheck 有等值断言）。
+ *
+ * ⚠️ 要按**最坏字身**定：路径截断上限 40 个字符（再加 `:行号`），全角字符约 1 倍字号
+ * → 最坏 45 个全角 ≈ 540px 文字，加左侧起点 22 与右侧留白 34 共 596px。
+ * 用 ASCII 口径的 400 会让全角长路径溢出方框。
+ */
+const MAX_BOX_WIDTH = 600;
 /** 几何缺失时的兜底宽度（正常路径下不会用到）。 */
 const DEFAULT_BOX_WIDTH = 200;
 /** 文字右端到加减号之间的最小间隙（保证加减号不压文字）。 */
@@ -366,9 +412,9 @@ function nodeNameText(node: GraphNode): string {
   return `${node.isCycle ? '↻ ' : ''}${truncateMiddle(node.name, NAME_MAX_CHARS)}`;
 }
 
-/** 节点上显示的「路径:行号」。 */
+/** 节点上显示的「路径:行号」（按设置的路径显示方式，与宿主估宽同一份逻辑）。 */
 function nodeLocText(node: GraphNode): string {
-  return `${shortenPath(node.file, LOC_MAX_CHARS)}:${node.line}`;
+  return `${displayPathText(node.file, state.pathOptions, LOC_MAX_CHARS)}:${node.line}`;
 }
 
 /**
@@ -447,13 +493,28 @@ function measureTextWidth(text: string, fontSize: number, bold: boolean): number
     }
   }
   if (measured > 0) {
+    // 超限时**淘汰最旧的一条**（Map 保持插入顺序），而不是整表清空 ——
+    // 整表清空会让接下来那一帧把上千段文字重新量一遍，等于把优化退回去。
     if (measureCache.size >= MEASURE_CACHE_LIMIT) {
-      measureCache.clear();
+      const oldest = measureCache.keys().next();
+      if (!oldest.done) {
+        measureCache.delete(oldest.value);
+      }
     }
     measureCache.set(key, measured);
     return measured;
   }
-  return text.length * fontSize * (bold ? 0.66 : 0.6);
+  // 退到估算：ASCII 用实测系数（粗体 0.66 / 常规 0.6），
+  // **非 ASCII（中文、全角标点）按 1 倍字号** —— 否则中文路径会被估窄、方框压住文字。
+  let units = 0;
+  for (const character of text) {
+    if ((character.codePointAt(0) ?? 0) > 0x2e7f) {
+      units += 1;
+    } else {
+      units += bold ? 0.66 : 0.6;
+    }
+  }
+  return units * fontSize;
 }
 
 /**
@@ -499,6 +560,27 @@ function measureSessionWidths(session: SessionPayload): void {
  */
 /** 上一次回报给宿主的宽度（按会话）：一模一样就不再发，省掉每帧一次含 N 项的 IPC。 */
 const lastReportedWidths = new Map<string, string>();
+
+/**
+ * 本地「正在展开」标记的键：**必须带会话 id**。
+ *
+ * 节点 id 由内容派生，同一个符号在「被调用关系图」与「调用关系图」两个标签里 id 完全相同；
+ * 只按节点 id 记录时，标签 B 的一次 `sessionUpdate` 会把标签 A 正在展开的标记清掉，
+ * 于是遮罩与「取消」会在解析还没结束时就失效。
+ */
+function loadingKey(sessionId: string, nodeId: string): string {
+  return `${sessionId}\u0000${nodeId}`;
+}
+
+/** 清掉某个会话的全部「正在展开」标记（会话关闭或这一层数据已回来时用）。 */
+function clearSessionLoading(sessionId: string): void {
+  const prefix = `${sessionId}\u0000`;
+  for (const key of [...state.loading]) {
+    if (key.startsWith(prefix)) {
+      state.loading.delete(key);
+    }
+  }
+}
 
 function reportMeasuredWidths(session: SessionPayload): void {
   const widths: Array<{ id: string; width: number }> = [];
@@ -571,13 +653,58 @@ function buildKindIcon(kind: NodeKind, iconY: number = ICON_Y): SVGGElement {
  * 标记「当前元素」：记在本地状态里（用于高亮样式），并告知宿主
  * （宿主侧的「复制元素 / 复制地址」需要知道用户选的是哪个节点）。
  */
+/**
+ * 只刷新「选中」与「当前命中」这两个**纯状态类**，不重建 DOM。
+ *
+ * 为什么需要：单击方框、以及上下键切换命中，过去都走 `render()` —— 它会把 `#nodes` 整个重建
+ * （每个方框重新建元素、重新量宽）。压测数据：800 个方框时一次重建约 50 ms，
+ * 而这两个状态变化只影响两三个 class 名。
+ *
+ * ⚠️ 「是不是命中」（`match` 类）**不在这里**维护：命中要在元素名底下垫一层底纹矩形，
+ * 宽度得实测文字，属于结构性变化，仍由 `render()` 处理（改查询词时本来就要重建一帧）。
+ */
+function refreshStateClasses(session: SessionPayload): void {
+  const currentId = currentMatchId();
+  for (const group of nodesEl.children) {
+    const id = group.getAttribute('data-node');
+    if (!id) {
+      continue;
+    }
+    const isSelected =
+      state.selected?.sessionId === session.id && state.selected.nodeId === id;
+    if (isSelected) {
+      group.classList.add('selected');
+    } else {
+      group.classList.remove('selected');
+    }
+    group.setAttribute('aria-pressed', isSelected ? 'true' : 'false');
+    if (currentId === id) {
+      group.classList.add('match-current');
+    } else {
+      group.classList.remove('match-current');
+    }
+  }
+  // 计数文案（「第 x/y 处」）与开关状态也在这里刷新 —— 以前是靠 `render()` 里的这一步，
+  // 改成只改 class 之后必须显式调用，否则步进命中时计数不跟着动（测试会立刻发现）。
+  updateSearchUi();
+}
+
+/**
+ * 标记某个方框为选中（并通知宿主）。
+ *
+ * 只更新状态与相关 class，**不再重建整张图** —— 选中不改变任何几何，重建纯属浪费。
+ * （宿主侧的「复制元素 / 复制地址」需要知道用户选的是哪个节点。）
+ */
 function markSelected(session: SessionPayload, node: GraphNode): void {
-  if (state.selected === node.id) {
+  if (state.selected?.sessionId === session.id && state.selected.nodeId === node.id) {
     return;
   }
-  state.selected = node.id;
+  // 选中态**按会话隔离**：节点 id 由内容派生，同一个符号在「被调用关系图」与
+  // 「调用关系图」两个标签里 id 完全相同；只存 id 会让另一个标签里的同名节点
+  // 看起来也被选中，并让「复制当前标签为文本」从错误的起点导出。
+  state.selected = { sessionId: session.id, nodeId: node.id };
   post({ type: 'selectNode', nodeId: node.id, sessionId: session.id });
-  render();
+  refreshStateClasses(session);
 }
 
 /** 内容包围盒（含留白）。 */
@@ -645,10 +772,29 @@ function readView(session: SessionPayload): Viewport {
   return view;
 }
 
-/** 图变了：把 viewBox 原点复位到内容左上角。 */
+/**
+ * 图变了：把 viewBox 原点复位到内容左上角，并**补偿滚动**以免视口跳动。
+ *
+ * ⚠️ 宿主不只在「图真的变了」时发 `sessionUpdate`：改设置（`postSettings(true)`）与
+ * 宽度重排（`reportWidths` 触发）都会把整张会话重发一遍。此时内容并没有移动，
+ * 但 `view.y` 被复位而 `scrollTop` 不变 → 用户会看到画面整体跳一下（平滑滚动还会演成动画）。
+ * 所以：锚点没变就什么都不做；变了就把滚动量同步补偿同样的位移。
+ */
 function reanchor(session: SessionPayload): void {
   const bounds = contentBounds(session);
+  const previous = state.viewports.get(session.id);
   state.viewports.set(session.id, { x: bounds.x, y: bounds.y });
+  if (!previous || session.id !== state.activeId) {
+    return;
+  }
+  const dx = bounds.x - previous.x;
+  const dy = bounds.y - previous.y;
+  if (dx !== 0) {
+    canvasEl.scrollLeft += dx;
+  }
+  if (dy !== 0) {
+    canvasEl.scrollTop += dy;
+  }
 }
 
 function activeSession(): SessionPayload | undefined {
@@ -837,6 +983,11 @@ function renderTabs(): void {
     }
     const tab = document.createElement('div');
     tab.className = id === state.activeId ? 'tab active' : 'tab';
+    // 标签栏（#tabs 已是 role="tablist"）里的每一项都应当是 tab，并暴露选中状态；
+    // 键盘用漫游 tabindex：只有活动标签在 Tab 序列里，其余靠方向键切换（见下）。
+    tab.setAttribute('role', 'tab');
+    tab.setAttribute('aria-selected', id === state.activeId ? 'true' : 'false');
+    tab.tabIndex = id === state.activeId ? 0 : -1;
     tab.title = `${session.direction === 'callers' ? '被调用关系' : '调用关系'} · ${session.description}${session.engineLabel ? ` · ${session.engineLabel}` : ''}`;
 
     const label = document.createElement('span');
@@ -848,17 +999,19 @@ function renderTabs(): void {
     // 方向原先是用「被调用:名字」这种前缀表达的，既啰嗦又占地方，改成图标。
     tab.appendChild(createDirectionIcon(session.direction));
 
-    if (state.order.length > 1 && session.engineLabel) {
+    // 引擎角标：多标签时才有意义（单标签一眼就知道是哪个引擎）。
+    const engineBadge = state.order.length > 1 ? badgeOf(session) : '';
+    if (engineBadge) {
       const engine = document.createElement('span');
       engine.className = 'tab-engine';
-      engine.textContent = shortEngine(session.engineLabel);
+      engine.textContent = engineBadge;
       tab.appendChild(engine);
     }
 
     const close = document.createElement('button');
     close.className = 'tab-close';
     close.type = 'button';
-    close.title = '关闭这个标签';
+    close.title = '关闭标签';
     close.textContent = '✕';
     close.addEventListener('click', (event) => {
       event.stopPropagation();
@@ -869,17 +1022,65 @@ function renderTabs(): void {
     tab.addEventListener('click', () => {
       post({ type: 'selectTab', id });
     });
+    // ⚠️ `div[role="tab"]` 不会因为回车/空格自动产生 click（只有原生 button 才会），
+    // 而漫游 tabindex 又把非活动标签移出了 Tab 序列 —— 不接键盘的话，
+    // 唯一能被 Tab 聚焦的那个标签反而按不动，「其余靠方向键切换（见下）」也没有下文。
+    // 这里按 WAI-ARIA 的 tabs 模式补齐：方向键在标签间移动焦点并切换，Home/End 去首尾。
+    tab.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ' || event.key === 'Spacebar') {
+        event.preventDefault();
+        post({ type: 'selectTab', id });
+        return;
+      }
+      const step = event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0;
+      const jump = event.key === 'Home' ? 0 : event.key === 'End' ? state.order.length - 1 : -1;
+      if (step === 0 && jump < 0) {
+        return;
+      }
+      event.preventDefault();
+      const index = state.order.indexOf(id);
+      const next =
+        jump >= 0 ? state.order[jump] : state.order[(index + step + state.order.length) % state.order.length];
+      if (next === undefined || next === id) {
+        return;
+      }
+      post({ type: 'selectTab', id: next });
+      // 焦点也要跟着走：标签是重建出来的，等宿主回执后那一帧再聚焦新标签。
+      setTimeout(() => {
+        for (const child of tabsEl.children) {
+          if (child.getAttribute('aria-selected') === 'true') {
+            (child as HTMLElement).focus?.();
+            break;
+          }
+        }
+      }, 0);
+    });
     tabsEl.appendChild(tab);
   }
   tabsEl.style.display = state.order.length > 0 ? 'flex' : 'none';
   toolbarEl.classList.toggle('is-empty', state.order.length === 0);
 }
 
+/**
+ * 标签上的引擎角标。
+ *
+ * 优先用宿主算好的 `badge`（引擎配置档决定，接了新引擎也只改设置）；
+ * 缺省时退回按 `engineLabel` 文本猜 —— 兼容旧宿主/旧快照，认不出就不显示角标。
+ */
+function badgeOf(session: { badge?: string; engineLabel?: string }): string {
+  const badge = (session.badge ?? '').trim();
+  if (badge && badge !== 'unknown') {
+    return badge;
+  }
+  return shortEngine(session.engineLabel ?? '');
+}
+
 function shortEngine(label: string): string {
-  if (label.startsWith('clangd')) {
+  const text = label.toLowerCase();
+  if (text.startsWith('clangd') || text.includes('clangd')) {
     return 'clangd';
   }
-  if (label.includes('cpptools')) {
+  if (text.includes('cpptools') || text.includes('c/c++')) {
     return 'cpptools';
   }
   return '';
@@ -1009,12 +1210,15 @@ function renderNode(
   position: { x: number; y: number },
   geometry: Box
 ): SVGGElement {
+  // 选中态同时用于 class 与 aria-pressed（屏幕阅读器读不出 class）
+  const selected =
+    state.selected?.sessionId === session.id && state.selected.nodeId === node.id;
   const group = svg('g', {
     class: [
       'node',
       node.depth === 0 ? 'root' : '',
       node.isCycle ? 'cycle' : '',
-      state.selected === node.id ? 'selected' : '',
+      selected ? 'selected' : '',
       searchState.hits.has(node.id) ? 'match' : '',
       currentMatchId() === node.id ? 'match-current' : '',
     ]
@@ -1023,6 +1227,26 @@ function renderNode(
     // 链上节点各自带上自己的粘性位移：纵向滚动时它们都停在视口垂直中央（见「粘性父框」一节）
     transform: `translate(${position.x} ${position.y + stickyShiftOf(node.id)})`,
     'data-node': node.id,
+    // 键盘可达：方框进 Tab 序列；回车跳转、空格选中（见下面的 keydown 处理）。
+    tabindex: '0',
+    role: 'button',
+    'aria-label': `${node.name}，${node.file}:${node.line}，回车键跳转，空格键选中`,
+    'aria-pressed': selected ? 'true' : 'false',
+  });
+
+  // 键盘操作：与鼠标的单击（选中）与双击（跳转）等价。
+  // ⚠️ 展开/收起目前仍只能用鼠标点加减号（那条路径要经 pointer.expandTarget + window 的
+  // mouseup 才生效，合成事件容易在守卫处被丢掉），所以 aria-label 里不承诺空格能展开。
+  group.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      post({ type: 'openLocation', sessionId: session.id, nodeId: node.id });
+      return;
+    }
+    if (event.key === ' ' || event.key === 'Spacebar') {
+      event.preventDefault();
+      markSelected(session, node);
+    }
   });
 
   // 框高由宿主布局给出（显示路径 43 / 不显示 26）；文字基线与图标位置都按框高算，
@@ -1043,17 +1267,7 @@ function renderNode(
   // 必须先 append 底纹、再 append 文字，底纹才画在文字下面。
   const displayName = nodeNameText(node);
   if (searchState.hits.has(node.id)) {
-    const hitWidth = measureTextWidth(displayName, NAME_FONT_SIZE, true);
-    group.appendChild(
-      svg('rect', {
-        class: 'name-hit',
-        x: TEXT_X - NAME_HIT_PAD_X,
-        y: nameBaseline - NAME_HIT_ABOVE,
-        width: Math.max(1, Math.ceil(hitWidth) + NAME_HIT_PAD_X * 2),
-        height: NAME_HIT_HEIGHT,
-        rx: 2,
-      })
-    );
+    group.appendChild(hitRectFor(displayName, nameBaseline));
   }
 
   const nameText = svg('text', { x: TEXT_X, y: nameBaseline, class: 'name' });
@@ -1105,7 +1319,7 @@ function renderNode(
   //   正确顺序：先判「已展开且有子节点」→ collapse，再判「可展开或已被收起」→ expand。
   const isCollapsed = collapsedSet(session.id).has(node.id);
   const hasVisibleChildren = !isCollapsed && node.children.length > 0;
-  if (state.loading.has(node.id)) {
+  if (state.loading.has(loadingKey(session.id, node.id))) {
     group.appendChild(buildExpander(session, node, geometry, 'loading'));
   } else if (hasVisibleChildren) {
     group.appendChild(buildExpander(session, node, geometry, 'collapse'));
@@ -1248,7 +1462,12 @@ function buildSignShape(mode: ExpanderMode): SVGGElement {
 
 /** 悬停提示：只保留函数名、完整路径、位置行数。 */
 function buildTooltip(node: GraphNode): string {
-  return `${node.name}\n${node.file}:${node.line}`;
+  const lines = [node.name, `${node.file}:${node.line}`];
+  // 按设置截断过就在悬停提示里说明（方框里不加东西，避免影响布局）
+  if (node.omitted && node.omitted > 0) {
+    lines.push(`（另有 ${node.omitted} 条未显示，受 maxChildrenPerNode 限制）`);
+  }
+  return lines.join('\n');
 }
 
 /** 从中间截断，保留首尾，适合函数名（如 veryLongFunctionName → veryLong…Name）。 */
@@ -1261,12 +1480,89 @@ function truncateMiddle(text: string, max: number): string {
   return `${text.slice(0, head)}…${text.slice(text.length - tail)}`;
 }
 
-/** 路径太长时保留结尾几段，避免文字溢出方框（完整路径在 tooltip 里）。 */
-function shortenPath(file: string, max: number): string {
-  if (file.length <= max) {
+/**
+ * 按设置把一条路径变成方框里显示的文字。
+ *
+ * ⚠️ 与宿主 `graphLayout.ts` 的 `displayPathText` **必须逐字同步**：宿主用同一份逻辑估宽，
+ * 两边算出的字符串一旦不同，列宽与实际文字就对不上（renderCheck 有跨侧等值断言）。
+ *
+ * - `full`：整条放得下就用整条；放不下则保留首尾（首部是能区分 chip/board 的那几段，
+ *   尾部是文件名）—— 完整路径始终在悬停提示里。
+ * - `tail`：末尾窗口（固定层数，或 `tailLevels = 0` 时按字符预算，即 0.20 的行为）+ 锚点段；
+ *   锚点优先保留，窗口放不下时先缩窗口。
+ */
+function displayPathText(file: string, options: PathDisplayOptions, max: number): string {
+  const parts = file.split(/[\\/]/).filter((part) => part.length > 0);
+  if (parts.length <= 1) {
     return file;
   }
-  const parts = file.split(/[\\/]/);
+  if (options.mode === 'full') {
+    return file.length <= max ? file : truncateMiddle(file, max);
+  }
+
+  const anchors = resolveAnchorIndexes(parts, options.anchors);
+  let tailCount =
+    options.tailLevels > 0
+      ? Math.min(options.tailLevels, parts.length)
+      : budgetTailCount(parts, max);
+  while (tailCount > 1 && assemblePath(parts, anchors, tailCount).length > max) {
+    tailCount -= 1;
+  }
+  const text = assemblePath(parts, anchors, tailCount);
+  return text.length <= max ? text : truncateMiddle(file, max);
+}
+
+/**
+ * 把锚点模式解析成段下标（与宿主 `graphLayout.ts` 的 `resolveAnchorIndexes` 逐字同规则）。
+ *
+ * 写法：`名字` / `名字+N` / `名字-N` / `+N`（从根数）/ `-N`（从文件名往上数）。
+ * 解析顺序：整串名字精确匹配 → 名字+偏移 → 纯偏移（避免 `chip-01` 这类目录名被误判）。
+ * 越界的模式直接忽略；宿主那份会另外记警告，这里只忽略以保证两侧输出一致。
+ */
+function resolveAnchorIndexes(parts: string[], patterns: readonly string[]): Set<number> {
+  const indexes = new Set<number>();
+  const lower = parts.map((part) => part.toLowerCase());
+  for (const raw of patterns) {
+    const pattern = String(raw ?? '').trim();
+    if (!pattern) {
+      continue;
+    }
+    const exact = lower.indexOf(pattern.toLowerCase());
+    if (exact >= 0) {
+      indexes.add(exact);
+      continue;
+    }
+    const named = /^(.+?)([+-])(\d+)$/.exec(pattern);
+    if (named) {
+      const base = lower.indexOf(named[1].toLowerCase());
+      if (base >= 0) {
+        const offset = Number.parseInt(named[3], 10) * (named[2] === '-' ? -1 : 1);
+        const index = base + offset;
+        if (index >= 0 && index < parts.length) {
+          indexes.add(index);
+        }
+      }
+      continue;
+    }
+    const plain = /^([+-])(\d+)$/.exec(pattern);
+    if (plain) {
+      const count = Number.parseInt(plain[2], 10);
+      const index = plain[1] === '+' ? count - 1 : parts.length - 2 - (count - 1);
+      if (index >= 0 && index < parts.length) {
+        indexes.add(index);
+      }
+    }
+  }
+  return indexes;
+}
+
+/** 末尾窗口按**字符预算**能放下几段（`tailLevels = 0` 的口径，与宿主同规则）。 */
+function budgetTailCount(parts: string[], max: number): number {
+  const whole = parts.join('/');
+  if (whole.length <= max) {
+    return parts.length;
+  }
+  let count = 1;
   let result = parts[parts.length - 1];
   for (let i = parts.length - 2; i >= 0; i -= 1) {
     const candidate = `${parts[i]}/${result}`;
@@ -1274,8 +1570,42 @@ function shortenPath(file: string, max: number): string {
       break;
     }
     result = candidate;
+    count += 1;
   }
-  return `…/${result}`;
+  return count;
+}
+
+/** 把「末尾窗口 + 锚点段」拼成显示串：被跳过的连续段压缩成一个 `…`（与宿主同规则）。 */
+function assemblePath(parts: string[], anchors: Set<number>, tailCount: number): string {
+  const keep = new Set<number>();
+  for (let i = Math.max(0, parts.length - tailCount); i < parts.length; i += 1) {
+    keep.add(i);
+  }
+  for (const index of anchors) {
+    if (index >= 0 && index < parts.length) {
+      keep.add(index);
+    }
+  }
+  if (keep.size === parts.length) {
+    return parts.join('/');
+  }
+  const out: string[] = [];
+  let skipped = false;
+  for (const [index, part] of parts.entries()) {
+    if (keep.has(index)) {
+      if (skipped) {
+        out.push('…');
+        skipped = false;
+      }
+      out.push(part);
+    } else {
+      skipped = true;
+    }
+  }
+  if (skipped) {
+    out.push('…');
+  }
+  return out.join('/');
 }
 
 // ------------------------------------------------------------ 滚动 / 拖框
@@ -1316,14 +1646,22 @@ window.addEventListener('mouseup', () => {
     } else {
       const session = state.sessions.get(sessionId);
       const node = session?.nodes[nodeId];
-      if (session && node && !state.loading.has(nodeId)) {
+      if (session && node && !state.loading.has(loadingKey(sessionId, nodeId))) {
         if (node.loaded) {
           // 数据已有，只是被收起过：直接展开，不需要再问语言服务
           collapsedSet(sessionId).delete(nodeId);
           postCollapsed(sessionId);
           render();
         } else {
-          state.loading.add(nodeId);
+          state.loading.add(loadingKey(sessionId, nodeId));
+          // 超时兜底：宿主在「会话已关闭」等异常路径下**不会回任何消息**
+          // （graphView.expandNode 找不到会话时直接 return），那样 loading 永远不会被清除，
+          // 遮罩会一直亮着且此后无人关闭它。超时后自行清除并重绘。
+          setTimeout(() => {
+            if (state.loading.delete(loadingKey(sessionId, nodeId))) {
+              render();
+            }
+          }, LOADING_TIMEOUT_MS);
           // 以被点的方框为基准，展开后它不要在屏幕上跳动。
           // （粘性父框开着时，紧接着这一帧会把它钉到视口中央 —— 以那条不变式为准；
           //   关掉设置或内容本来就不高时，才由这里保住它的屏幕位置。）
@@ -1780,6 +2118,75 @@ function buildNameMatcher(): ((name: string) => boolean) | undefined {
   }
 }
 
+/**
+ * 元素名底纹矩形（搜索命中高亮）。
+ *
+ * `renderNode` 与增量刷新 `refreshSearchMarks()` **共用这一份**几何 —— 两处各写一遍迟早会走形
+ * （这个工程已经因为"同一个口径写两遍"踩过坑）。宽度走量宽缓存，重复调用不会真的去量。
+ */
+function hitRectFor(displayName: string, nameBaseline: number): SVGElement {
+  const hitWidth = measureTextWidth(displayName, NAME_FONT_SIZE, true);
+  return svg('rect', {
+    class: 'name-hit',
+    x: TEXT_X - NAME_HIT_PAD_X,
+    y: nameBaseline - NAME_HIT_ABOVE,
+    width: Math.max(1, Math.ceil(hitWidth) + NAME_HIT_PAD_X * 2),
+    height: NAME_HIT_HEIGHT,
+    rx: 2,
+  });
+}
+
+/**
+ * 查询词变化时**就地**更新命中标记，不重建整张图。
+ *
+ * 为什么需要：以前每敲一个字符都走 `render()` —— 全量重建 `#nodes`（800 个方框约 40 ms，
+ * 连打十个字符就是几百毫秒的顿挫）。而命中只影响两样东西：方框组上的 `match` / `match-current`
+ * class，以及元素名底下那层底纹矩形；两者都能就地增删。
+ *
+ * ⚠️ 结构性的东西（可见性、坐标、框高、图标、加减号）**仍由 `render()` 负责**，这里一概不碰。
+ * ⚠️ 折叠起来的命中节点本来就没有方框元素，所以只按已渲染的方框遍历即可（`hits` 里多出来的
+ * 那些由 `updateSearchUi()` 的「另有 N 处位于已收起的节点」说明）。
+ */
+function refreshSearchMarks(session: SessionPayload | undefined): void {
+  refreshSearchMatches(session);
+  if (!session) {
+    return;
+  }
+  const currentId = currentMatchId();
+  for (const group of nodesEl.children) {
+    const id = group.getAttribute('data-node');
+    if (!id) {
+      continue;
+    }
+    const hit = searchState.hits.has(id);
+    if (hit) {
+      group.classList.add('match');
+    } else {
+      group.classList.remove('match');
+    }
+    if (currentId === id) {
+      group.classList.add('match-current');
+    } else {
+      group.classList.remove('match-current');
+    }
+    const children = [...group.children];
+    const existing = children.find((child) => child.getAttribute('class') === 'name-hit');
+    if (hit && !existing) {
+      // 底纹必须画在名字**下面**：先 append 底纹，再把名字重新 append 一次
+      // （appendChild 对已有子节点是"移动"语义），这样不用依赖 insertBefore。
+      const nameEl = children.find((child) => child.getAttribute('class') === 'name');
+      if (nameEl) {
+        const baseline = Number(nameEl.getAttribute('y') ?? '0');
+        group.appendChild(hitRectFor(nameEl.textContent ?? '', baseline));
+        group.appendChild(nameEl);
+      }
+    } else if (!hit && existing) {
+      existing.remove();
+    }
+  }
+  updateSearchUi();
+}
+
 /** 重算命中集合（render() 每帧调用）。 */
 function refreshSearchMatches(session: SessionPayload | undefined): void {
   searchState.matches = [];
@@ -1825,8 +2232,8 @@ function updateSearchUi(): void {
       countEl.textContent = '无命中';
       countEl.classList.add('empty');
     } else {
-      const hidden = searchState.hidden > 0 ? ` +${searchState.hidden}` : '';
-      countEl.textContent = `${searchState.index + 1}/${searchState.matches.length}${hidden}`;
+      const hidden = searchState.hidden > 0 ? `，另有 ${searchState.hidden} 处位于已收起的节点` : '';
+      countEl.textContent = `第 ${searchState.index + 1}/${searchState.matches.length} 处${hidden}`;
       countEl.classList.remove('empty');
     }
     countEl.title = searchState.hidden > 0 ? `另有 ${searchState.hidden} 个命中在已收起的节点里` : '';
@@ -1839,7 +2246,10 @@ function updateSearchUi(): void {
     ['btn-search-regex', searchState.regex],
   ];
   for (const [id, on] of toggles) {
-    document.getElementById(id)?.classList.toggle('on', on);
+    const button = document.getElementById(id);
+    button?.classList.toggle('on', on);
+    // 视觉上的开关状态（.on 样式）必须同时暴露给辅助技术，否则屏幕阅读器只知道"按钮"。
+    button?.setAttribute('aria-pressed', on ? 'true' : 'false');
   }
 
   const hasMatches = searchState.matches.length > 0;
@@ -1859,8 +2269,8 @@ function stepMatch(delta: number): void {
     return;
   }
   searchState.index = (searchState.index + delta + total) % total;
-  // 重绘一帧让「当前命中」的高亮跟过去，再把那个方框滚到视图中间
-  render();
+  // 只把「当前命中」的高亮挪过去（不重建 DOM），再把那个方框滚到视图中间
+  refreshStateClasses(session);
   const id = currentMatchId();
   if (id) {
     centerOn(session, id);
@@ -1875,7 +2285,8 @@ if (searchInputEl) {
     searchState.query = searchInputEl.value;
     // 查询变了：从第一处命中重新数起
     searchState.index = 0;
-    render();
+    // 只就地更新命中标记（不重建 DOM）—— 打字是高频操作，全量重建在几百个方框时会明显顿挫。
+    refreshSearchMarks(activeSession());
   });
 
   searchInputEl.addEventListener('keydown', (event) => {
@@ -1909,7 +2320,14 @@ if (searchInputEl) {
 
   // Ctrl/Cmd+F 聚焦搜索框：webview 里没有 VS Code 自带的查找框，这里自己接管。
   window.addEventListener('keydown', (event) => {
-    if ((event.ctrlKey || event.metaKey) && (event.key === 'f' || event.key === 'F')) {
+    // 只在搜索框**未聚焦**时接管：输入框内本可用 Ctrl+F 选中框内文字，
+    // 一律拦截会吃掉该行为。另外 `event.key` 在按住 Ctrl 时仍是 'f'，
+    // 原来的 'F' 分支是死代码。
+    if (
+      (event.ctrlKey || event.metaKey) &&
+      event.key === 'f' &&
+      document.activeElement !== searchInputEl
+    ) {
       event.preventDefault();
       searchInputEl.focus();
     }
@@ -1940,6 +2358,19 @@ document.getElementById('btn-expand-all')?.addEventListener('click', () => {
   post({ type: 'expandAll', sessionId: session.id });
 });
 
+// 「完全展开」：与「展开全部」同一套本地准备（清掉收起标记 + 记 pending），
+// 区别只在宿主那一侧 —— 它不再受设置里的层数上限约束，会一直展开到没有可展开的节点。
+document.getElementById('btn-expand-full')?.addEventListener('click', () => {
+  const session = activeSession();
+  if (!session) {
+    return;
+  }
+  collapsedSet(session.id).clear();
+  postCollapsed(session.id);
+  pendingExpandAll = session.id;
+  post({ type: 'expandFull', sessionId: session.id });
+});
+
 document.getElementById('btn-copy-tab')?.addEventListener('click', () => {
   const session = activeSession();
   if (!session) {
@@ -1966,9 +2397,39 @@ document.getElementById('btn-busy-cancel')?.addEventListener('click', () => {
   post({ type: 'cancelResolve' });
   hostBusy = false;
   hideBusy();
+  // ⚠️ 清掉「正在展开」之后必须重绘：否则那个方框的加减号还停在 loading 形态
+  // （该形态的点击被吞掉，见 buildExpander），而超时兜底的判据是「这一次 delete 真的删到了」
+  // —— 标记已经被这里 clear 掉，delete 返回 false，于是永远不会有人重绘，
+  // 那个方框的 ± 就一直是死的，直到别的操作顺带 render()。
+  if (activeSession()) {
+    render();
+  }
 });
 
 // ------------------------------------------------------------ 与宿主通信
+
+/**
+ * 把宿主下发的路径显示设置写进 `state`（`init` 与 `settings` 两条消息共用）。
+ *
+ * ⚠️ 逐字段判存在、缺失就**保留当前值**：旧宿主只会发 stickyParent / showLocation，
+ * 一律覆盖会把路径显示方式重置回默认，界面看起来像"设置不生效"。
+ */
+function applyPathSettings(settings: WebviewSettings | undefined): void {
+  if (!settings) {
+    return;
+  }
+  if (settings.pathDisplay === 'tail' || settings.pathDisplay === 'full') {
+    state.pathOptions.mode = settings.pathDisplay;
+  }
+  if (typeof settings.pathTailLevels === 'number' && Number.isFinite(settings.pathTailLevels)) {
+    state.pathOptions.tailLevels = Math.max(0, Math.floor(settings.pathTailLevels));
+  }
+  if (Array.isArray(settings.pathAnchors)) {
+    state.pathOptions.anchors = settings.pathAnchors.filter(
+      (pattern): pattern is string => typeof pattern === 'string'
+    );
+  }
+}
 
 function post(message: unknown): void {
   vscode.postMessage(message);
@@ -2002,6 +2463,7 @@ function handleHostMessage(message: HostMessage): void {
       // 设置随 init 一起下发；字段缺失时保留当前值（旧宿主也能用）
       state.stickyParent = message.settings?.stickyParent ?? state.stickyParent;
       state.showLocation = message.settings?.showLocation ?? state.showLocation;
+      applyPathSettings(message.settings);
       for (const summary of message.summaries ?? []) {
         state.sessions.set(summary.id, {
           id: summary.id,
@@ -2009,6 +2471,9 @@ function handleHostMessage(message: HostMessage): void {
           description: summary.description,
           direction: summary.direction,
           engineLabel: '',
+          // 占位会话也要带上角标：init 只给**活动会话**完整 payload，其余标签在收到各自的
+          // sessionUpdate 之前只有这份摘要。漏掉它的话，重载窗口后除活动标签外都没有引擎角标。
+          badge: summary.badge,
           rootId: '',
           nodes: {},
           edges: [],
@@ -2031,11 +2496,20 @@ function handleHostMessage(message: HostMessage): void {
     }
     case 'sessionUpdate': {
       const session = message.session;
-      const isNew = !state.sessions.has(session.id);
+      const existing = state.sessions.get(session.id);
+      const isNew = existing === undefined;
+      // ⚠️ 「要不要把根方框摆到视图中央」必须按**首次拿到内容**判，不能按 isNew 判。
+      // 宿主是先发标签摘要（update）再发内容（sessionUpdate）：addSession 里刚把会话 push 进
+      // sessions，紧接着 setViewVisible() 就带着这个新标签发了一次 update，前端于是先建了一个
+      // **没有内容的占位会话**。等内容到达时 isNew 已经是 false，居中就永远不会发生 ——
+      // 表现是新图停在内容左上角，调用者多的时候连被查询的那个符号都看不见。
+      // 反过来，已装好图的会话重发（relayout、回传宽度）不算首次，否则会把用户的滚动位置拽走。
+      const hasContent = Object.keys(existing?.nodes ?? {}).length > 0;
       state.sessions.set(session.id, session);
       if (isNew) {
         state.order.push(session.id);
-        // 新查询：等这一帧画完后把根方框摆到视图中间
+      }
+      if (!hasContent) {
         state.centerRequest = session.id;
       }
       // ⚠️ 只有「新会话」才抢活动标签。宿主在 relayout（例如改「显示路径」）时会把
@@ -2044,9 +2518,8 @@ function handleHostMessage(message: HostMessage): void {
       if (isNew || state.activeId === undefined) {
         state.activeId = session.id;
       }
-      for (const id of Object.keys(session.nodes)) {
-        state.loading.delete(id);
-      }
+      // 本会话的本地「正在展开」标记：这次 sessionUpdate 说明这一层数据已经回来了。
+      clearSessionLoading(session.id);
       // 图变了：把 viewBox 原点复位到内容左上角。
       reanchor(session);
       render();
@@ -2063,16 +2536,13 @@ function handleHostMessage(message: HostMessage): void {
       for (const id of [...state.order]) {
         if (!known.has(id)) {
           // 关掉的会话如果还有节点留在「正在展开」里，遮罩会被永久点亮（宿主不会再发
-          // 它的 sessionUpdate），所以这里按节点 id 一并清掉。
-          const gone = state.sessions.get(id);
-          if (gone) {
-            for (const nodeId of Object.keys(gone.nodes)) {
-              state.loading.delete(nodeId);
-            }
-          }
+          // 它的 sessionUpdate），所以这里把该会话的标记一并清掉。
+          clearSessionLoading(id);
           state.sessions.delete(id);
           state.viewports.delete(id);
           state.collapsed.delete(id);
+          // 宽度签名也要回收：会话 id 不复用，留着只是长期占位（与宿主 forgetSession 对应）
+          lastReportedWidths.delete(id);
         }
       }
       state.order = message.sessions.map((session) => session.id);
@@ -2081,6 +2551,11 @@ function handleHostMessage(message: HostMessage): void {
         if (existing) {
           existing.title = info.title;
           existing.description = info.description;
+          // 角标也要跟着更新（宿主按配置档算好，webview 读不到设置、不该自己猜引擎名）。
+          // 漏掉这一句的表现：重载窗口后只有活动标签有引擎角标，其余标签要点一次才出现。
+          if (info.badge !== undefined) {
+            existing.badge = info.badge;
+          }
         } else {
           // 宿主已知但前端还没有内容的会话（例如刚恢复），先占位，等 sessionUpdate。
           state.sessions.set(info.id, {
@@ -2089,6 +2564,9 @@ function handleHostMessage(message: HostMessage): void {
             description: info.description,
             direction: info.direction,
             engineLabel: '',
+            // 占位会话的 engineLabel 是空的，badge 必须从摘要里带过来，
+            // 否则 badgeOf 只能回退到空串（角标不显示）
+            badge: info.badge,
             rootId: '',
             nodes: {},
             edges: [],
@@ -2107,6 +2585,7 @@ function handleHostMessage(message: HostMessage): void {
       // 只更新开关再重绘一帧，不做别的状态处理。
       state.stickyParent = message.settings?.stickyParent ?? state.stickyParent;
       state.showLocation = message.settings?.showLocation ?? state.showLocation;
+      applyPathSettings(message.settings);
       render();
       break;
     }

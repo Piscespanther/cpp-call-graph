@@ -504,11 +504,6 @@ body {
   marker-end: url(#arrow);
 }
 
-.edge.dir-left {
-  /* 被调用关系：箭头指向左侧的被调用方 */
-  marker-end: url(#arrow);
-}
-
 .edge.cycle {
   stroke: var(--cycle);
   stroke-dasharray: 4 3;
@@ -636,34 +631,25 @@ body {
   color: var(--vscode-symbolIcon-colorForeground, var(--symbol-fallback));
 }
 
+/*
+ * ⚠️ 节点里的字号**写死 13px / 12px**，刻意不跟随 `--vscode-font-size`。
+ *
+ * 原因：方框的宽与高是**按 13px 粗体墨迹**校准出来的（`NAME_FONT_SIZE` / `LOC_FONT_SIZE`
+ * 与宿主的 NODE_HEIGHT 43 / NODE_HEIGHT_COMPACT 26 是一套口径）。若这里跟随用户字体
+ * （比如 16px），量宽仍按 13/12 算，就会出现"文字顶到加减号、单行模式不再垂直居中"。
+ * 要么两边都跟随（需要把量宽与框高都改成动态推导），要么两边都写死 —— 目前选后者。
+ */
 .node .name {
   font-family: var(--vscode-font-family);
-  font-size: var(--vscode-font-size, 13px);
+  font-size: 13px;
   fill: var(--node-fg);
   font-weight: 600;
 }
 
 .node .loc {
   font-family: var(--vscode-font-family);
-  font-size: calc(var(--vscode-font-size, 13px) - 1px);
+  font-size: 12px;
   fill: var(--muted);
-}
-
-.node .detail {
-  font-family: var(--vscode-font-family);
-  font-size: calc(var(--vscode-font-size, 13px) - 1px);
-  fill: var(--muted);
-}
-
-.node .callsite {
-  font-family: var(--vscode-font-family);
-  font-size: calc(var(--vscode-font-size, 13px) - 1px);
-  fill: var(--vscode-charts-purple, #bc8cff);
-}
-
-.node .cycle-badge {
-  font-size: 11px;
-  fill: var(--cycle);
 }
 
 /* ------------------------------------------------------------ 展开按钮 */

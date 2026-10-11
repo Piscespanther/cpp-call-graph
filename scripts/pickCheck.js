@@ -120,7 +120,9 @@ async function main() {
 
   prepareCalls = [];
   const cursorMid = new Position(0, 15); // STATE_A 中间
-  const resolvedMid = await resolveAt(document, cursorMid, 'auto', 'clangd');
+  // 0.21 起 resolveAt 的签名是 (document, position, selectedProfile, pickPolicy, expectedLabel)。
+  // 传 undefined + 'nearest' = 不认领、按选区离光标最近挑（与 0.20 的 'auto' 行为一致）。
+  const resolvedMid = await resolveAt(document, cursorMid, undefined, 'nearest', 'clangd');
   assert(resolvedMid !== undefined, '名字中间应当解析出结果');
   assert(
     resolvedMid.item.name === 'STATE_A',
@@ -132,7 +134,13 @@ async function main() {
   preparedByColumn.clear();
   preparedByColumn.set(21, [stateA]); // 只有第 21 列（紧邻右边界）能命中
   prepareCalls = [];
-  const resolvedRight = await resolveAt(document, new Position(0, 21), 'auto', 'clangd');
+  const resolvedRight = await resolveAt(
+    document,
+    new Position(0, 21),
+    undefined,
+    'nearest',
+    'clangd'
+  );
   assert(resolvedRight !== undefined, '名字右侧应当能靠试探命中');
   assert(
     resolvedRight.item.name === 'STATE_A',
@@ -160,7 +168,13 @@ async function main() {
 
   // ---- 5. 无结果 → undefined，不瞎选 ----
   preparedByColumn.clear();
-  const resolvedNone = await resolveAt(document, new Position(0, 0), 'auto', 'clangd');
+  const resolvedNone = await resolveAt(
+    document,
+    new Position(0, 0),
+    undefined,
+    'nearest',
+    'clangd'
+  );
   assert(resolvedNone === undefined, '完全无结果时应返回 undefined');
   console.log('诊断: 无结果时返回 undefined（不会瞎选一个）');
 
