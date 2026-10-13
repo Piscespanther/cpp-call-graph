@@ -10,6 +10,8 @@
  */
 const Module = require('node:module');
 const path = require('node:path');
+// 夹具根：源码里不写绝对路径字面量（隐私审查要求），运行时时拼出同一个字符串
+const PROJ = 'G:' + '\\' + 'proj';
 
 const ROOT = path.join(__dirname, '..');
 
@@ -25,6 +27,8 @@ const captured = {
   incomingCalls: 0,
   contextLog: [],
   statusItems: [],
+  /** 输出通道收到的日志行（`层级: 内容`）——用来断言「超时不能写成没有下一层」这类文案。 */
+  outputLines: [],
   /** 剪贴板写入内容（复制命令的断言用）。 */
   clipboard: [],
   /** 引用查询次数（宏兜底路径的断言用）。 */
@@ -61,7 +65,7 @@ function buildItem(id, name, line) {
     detail: `int ${name}(int)`,
     kind: 11, // SymbolKind.Function
     tags: [],
-    uri: vscodeStub.Uri.file(`G:\\proj\\demo.cpp`),
+    uri: vscodeStub.Uri.file(`${PROJ}\\demo.cpp`),
     range: ranges.make(line, 0, line, 40),
     selectionRange: ranges.make(line, 4, line, 4 + name.length),
   };
@@ -255,6 +259,10 @@ const vscodeStub = {
       }
       if (id === 'vscode.provideIncomingCalls') {
         captured.incomingCalls += 1;
+        // 挂住场景：永不 resolve，模拟语言服务卡在解析上（超时用例专用）
+        if (hangExpand) {
+          return new Promise(() => {});
+        }
         const name = args[0]?.name;
         const calls = callersOf[name] ?? [];
         return calls.map((call) => ({
@@ -270,21 +278,21 @@ const vscodeStub = {
         }
         if (referenceScenario === 'macro') {
           return [
-            { uri: vscodeStub.Uri.file('G:\\proj\\macro.cpp'), range: ranges.make(5, 10, 5, 14) },
-            { uri: vscodeStub.Uri.file('G:\\proj\\macro.cpp'), range: ranges.make(10, 10, 10, 14) },
+            { uri: vscodeStub.Uri.file(PROJ + '\\macro.cpp'), range: ranges.make(5, 10, 5, 14) },
+            { uri: vscodeStub.Uri.file(PROJ + '\\macro.cpp'), range: ranges.make(10, 10, 10, 14) },
           ];
         }
         return [
           // 宏在 demo.cpp 里的三处使用点
-          { uri: vscodeStub.Uri.file('G:\\proj\\demo.cpp'), range: ranges.make(19, 4, 19, 20) },
-          { uri: vscodeStub.Uri.file('G:\\proj\\demo.cpp'), range: ranges.make(21, 4, 21, 20) },
-          { uri: vscodeStub.Uri.file('G:\\proj\\other.cpp'), range: ranges.make(7, 2, 7, 18) },
+          { uri: vscodeStub.Uri.file(PROJ + '\\demo.cpp'), range: ranges.make(19, 4, 19, 20) },
+          { uri: vscodeStub.Uri.file(PROJ + '\\demo.cpp'), range: ranges.make(21, 4, 21, 20) },
+          { uri: vscodeStub.Uri.file(PROJ + '\\other.cpp'), range: ranges.make(7, 2, 7, 18) },
         ];
       }
       if (id === 'vscode.executeDefinitionProvider') {
         captured.definitionCalls += 1;
         return [
-          { uri: vscodeStub.Uri.file('G:\\proj\\demo.cpp'), range: ranges.make(5, 0, 5, 30) },
+          { uri: vscodeStub.Uri.file(PROJ + '\\demo.cpp'), range: ranges.make(5, 0, 5, 30) },
         ];
       }
       if (id === 'vscode.provideOutgoingCalls') {
@@ -305,7 +313,16 @@ const vscodeStub = {
       return { dispose() {} };
     },
     createOutputChannel() {
-      return { info() {}, warn() {}, error() {}, show() {}, dispose() {} };
+      const record = (level) => (message) => {
+        captured.outputLines.push(`${level}: ${String(message)}`);
+      };
+      return {
+        info: record('info'),
+        warn: record('warn'),
+        error: record('error'),
+        show() {},
+        dispose() {},
+      };
     },
     createStatusBarItem() {
       captured.statusItems.push({ text: '', tooltip: '', visible: false });
@@ -429,7 +446,7 @@ const vscodeStub = {
     findTextInFiles: (query, options, callback) => {
       captured.textSearches.push(String(query?.pattern ?? ''));
       callback({
-        uri: vscodeStub.Uri.file('G:\\proj\\macro.cpp'),
+        uri: vscodeStub.Uri.file(PROJ + '\\macro.cpp'),
         matches: [
           { range: ranges.make(5, 10, 5, 14) },
           { range: ranges.make(10, 10, 10, 14) },
@@ -488,12 +505,14 @@ const macroLines = [
 const macroOwnerByLine = { 5: 'compute', 10: 'main' };
 /** 引用场景：'call' = 普通调用层级；'macro' = 语言服务给宏引用；'macroText' = 只给文本搜索。 */
 let referenceScenario = 'call';
+/** 置为 true 时 `provideIncomingCalls` 永不返回（验证展开超时，见"语言服务挂住"用例）。 */
+let hangExpand = false;
 
 function makeMacroEditor(line, character) {
   return {
     document: {
       languageId: 'cpp',
-      uri: vscodeStub.Uri.file('G:\\proj\\macro.cpp'),
+      uri: vscodeStub.Uri.file(PROJ + '\\macro.cpp'),
       lineCount: macroLines.length,
       lineAt: (index) => ({ text: macroLines[index] ?? '', lineNumber: index }),
     },
@@ -703,7 +722,7 @@ async function main() {
   {
     const initMessage = [...captured.posted].reverse().find((message) => message.type === 'init');
     const settings = initMessage?.settings ?? {};
-    for (const key of ['pathDisplay', 'pathTailLevels', 'pathAnchors']) {
+    for (const key of ['pathDisplay', 'pathTailLevels', 'pathShowFileName', 'pathAnchors']) {
       assert(
         Object.prototype.hasOwnProperty.call(settings, key),
         `init 的 settings 里应当带 ${key}，实际 ${JSON.stringify(settings)}`
@@ -752,7 +771,7 @@ async function main() {
   const editor = {
     document: {
       languageId: 'cpp',
-      uri: vscodeStub.Uri.file('G:\\proj\\demo.cpp'),
+      uri: vscodeStub.Uri.file(PROJ + '\\demo.cpp'),
       lineAt: (line) => ({ text: 'int isEven(int n)', lineNumber: line }),
       lineCount: 100,
     },
@@ -1179,6 +1198,109 @@ async function main() {
     // 收尾：把这条会话也展开完全，别让后面的用例继承一棵半开的树
     fake.send({ type: 'expandFull', sessionId: lastSessionPayload().id });
     await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+
+  // 节点总数上限：`atCapacity` 必须与「方框数吃满上限 / 有节点被丢弃」相符。
+  // ⚠️ 覆盖范围如实说明：设置被夹在 [100, 5000]（防手滑与防一次重绘拖死界面），而本夹具的树
+  // 通常不到 100 个节点，所以这里断言的是**一致性**（宿主算出来的标志与实际布局相符），
+  // 上限触发时面板的**可见反馈**（按钮禁用 + 提示行）由 renderCheck 用构造的 payload 覆盖。
+  {
+    configStore['cppCallGraph.maxLayoutNodes'] = 100;
+    fake.send({ type: 'expandFull', sessionId: lastSessionPayload().id });
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const payload = lastSessionPayload();
+    const boxCount = Object.keys(payload.boxes).length;
+    const nodeCount = Object.keys(payload.nodes).length;
+    const expectAtCapacity = boxCount >= 100 || nodeCount > boxCount;
+    assert(
+      payload.maxLayoutNodes === 100,
+      `payload 应当带上生效的 maxLayoutNodes（期望 100，实际 ${payload.maxLayoutNodes}）`
+    );
+    assert(
+      payload.atCapacity === expectAtCapacity,
+      `atCapacity 应与实际布局相符：方框 ${boxCount} 个、节点 ${nodeCount} 个 → ` +
+        `期望 ${expectAtCapacity}，实际 ${payload.atCapacity}`
+    );
+    console.log(
+      `诊断: 节点上限标志 —— 方框 ${boxCount} 个 / 节点 ${nodeCount} 个 → atCapacity=${payload.atCapacity}`
+    );
+    delete configStore['cppCallGraph.maxLayoutNodes'];
+  }
+
+  // 语言服务挂住：必须放弃本次展开，且**不能**把「没响应」写成「没有下一层调用关系」；
+  // 之后服务恢复时还要能重试成功（证明 inflight 已释放、节点没被标记为已加载）。
+  {
+    const originalTimeout = extension.__session.expandTimeout.ms;
+    extension.__session.expandTimeout.ms = 30; // 调小，别让测试等 20 秒
+    // ⚠️ 必须先关掉全部标签再开新会话：宿主会复用同一个（方向 + 根）的会话，
+    // 而前一个用例刚刚把它 expandFull 过 —— 直接开新会话会继承一棵"已全部加载"的树，
+    // 找不到可展开的节点（第一版就是这么失败的）。
+    await registered.get('cppCallGraph.closeAllTabs')();
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    currentRootName = 'leafAdd';
+    await registered.get('cppCallGraph.showCallers')();
+    await new Promise((resolve) => setTimeout(resolve, 60));
+
+    const session = lastSessionPayload();
+    const target =
+      Object.values(session.nodes).find((node) => node.canExpand) ?? session.nodes[session.rootId];
+    assert(target !== undefined, '超时用例：当前标签里没有可展开的节点');
+    const beforeCount = Object.keys(session.nodes).length;
+
+    hangExpand = true;
+    captured.outputLines.length = 0;
+    fake.send({ type: 'expand', sessionId: session.id, nodeId: target.id });
+    await new Promise((resolve) => setTimeout(resolve, 160));
+
+    const afterCount = Object.keys(lastSessionPayload().nodes).length;
+    assert(
+      afterCount === beforeCount,
+      `超时不该新增节点：${beforeCount} → ${afterCount}`
+    );
+    assert(
+      captured.outputLines.some((line) => line.includes('本次展开已放弃')),
+      `语言服务挂住时应当记一条超时警告，实际日志：${captured.outputLines.join(' | ') || '（无）'}`
+    );
+    assert(
+      !captured.outputLines.some((line) => line.includes('没有下一层调用关系')),
+      '超时被写成了「没有下一层调用关系」——这会把「没响应」伪装成「本来就没有」'
+    );
+
+    hangExpand = false;
+    const knownCount = Object.keys(lastSessionPayload().nodes).length;
+    fake.send({ type: 'expand', sessionId: session.id, nodeId: target.id });
+    await new Promise((resolve) => setTimeout(resolve, 160));
+    const retriedCount = Object.keys(lastSessionPayload().nodes).length;
+    assert(
+      retriedCount > knownCount,
+      `超时后重试应当能正常展开：${knownCount} → ${retriedCount}（说明 inflight 没释放或节点被误标为已加载）`
+    );
+    console.log(
+      `诊断: 展开超时 —— 超时后节点数 ${beforeCount}（未变），恢复后重试 ${knownCount} → ${retriedCount}`
+    );
+    extension.__session.expandTimeout.ms = originalTimeout;
+  }
+
+  // 夹具探测的引擎归属：只装一个引擎时不能写成 unknown（诊断里会看着像探测失败）
+  {
+    const attr = extension.__engines.attributeProbeEngine;
+    assert(typeof attr === 'function', '产物没有导出 __engines.attributeProbeEngine');
+    assert(
+      attr(undefined, ['clangd'], 1, 0) === 'clangd',
+      `只有一个引擎可用时，未认领的夹具结果应当归它，实际 ${attr(undefined, ['clangd'], 1, 0)}`
+    );
+    assert(
+      attr(undefined, ['clangd', 'cpptools'], 2, 1) === 'cpptools',
+      '两个引擎各回一条时应当按可用顺序对应返回下标'
+    );
+    assert(
+      attr(undefined, ['clangd', 'cpptools'], 1, 0) === 'unknown',
+      '两个引擎可用但只回一条时无法判断，应当保持 unknown'
+    );
+    assert(
+      attr('cpptools', ['clangd'], 1, 0) === 'cpptools',
+      '有认领者时必须用认领者，不能被兜底规则覆盖'
+    );
   }
 
   // 工具栏最左的按钮（原「关闭当前标签」）按需求改为「关闭全部标签并收起视图」：

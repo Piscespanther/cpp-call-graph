@@ -30,7 +30,26 @@ const PERSIST_DELAY_MS = 400;
 /** 「展开全部」的层数上限默认值（设置项 `cppCallGraph.maxExpandRounds` 可改）；
  *  节点总量上限固定为 800，与布局上限一致 —— 超过布局上限的节点没有方框，不会上图。 */
 const DEFAULT_MAX_EXPAND_ROUNDS = 5;
+/** 节点总数上限的默认值（设置项 `cppCallGraph.maxLayoutNodes` 可改）。 */
 const MAX_EXPAND_NODES = 800;
+
+/**
+ * 节点总数上限（设置项 `cppCallGraph.maxLayoutNodes`）。
+ *
+ * 与布局上限是**同一个值**：超过它的节点没有方框、不会上图，所以「展开全部 / 完全展开」的
+ * 预算也必须用它，否则会出现「预算里算进去了、画面上却没有」的节点。
+ * 夹到 [100, 5000]：下限防止手滑填 1 变成空图，上限防止一次整帧重绘把界面拖死
+ * （实测 400 节点约 8ms、1200 节点约 30ms）。
+ */
+function maxLayoutNodesLimit(): number {
+  const value = vscode.workspace
+    .getConfiguration('cppCallGraph')
+    .get<number>('maxLayoutNodes', MAX_EXPAND_NODES);
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return MAX_EXPAND_NODES;
+  }
+  return Math.min(5000, Math.max(100, Math.floor(value)));
+}
 
 /**
  * 「展开全部」的层数上限（设置项 `cppCallGraph.maxExpandRounds`）。
@@ -100,6 +119,10 @@ export interface SessionPayload {
   edges: Array<{ id: string; from: string; to: string; depth: number }>;
   boxes: Record<string, { x: number; y: number; width: number; height: number }>;
   collapsedCount: number;
+  /** 布局是否已吃满节点总数上限（面板据此禁用两个展开按钮并显示原因）。 */
+  atCapacity: boolean;
+  /** 生效的节点总数上限，用于把原因写清楚（「已达 800」这类具体数字）。 */
+  maxLayoutNodes: number;
 }
 
 interface SessionSummary {
@@ -543,10 +566,15 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
     const node = session.node(nodeId);
     try {
       const added = await session.expand(nodeId);
+      // `expand` 返回 0 有两种情况：① 这一层确实没有调用关系；② 等待超时或该节点正在展开中
+      // —— 后两种都没有把节点标记为已加载。日志必须分开写，否则「没响应」会被读成「本来就没有」。
+      const loaded = session.node(nodeId)?.loaded === true;
       logInfo(
-        added === 0
-          ? `展开「${node?.name ?? nodeId}」：没有下一层调用关系`
-          : `展开「${node?.name ?? nodeId}」：新增 ${added} 个节点（当前共 ${Object.keys(session.nodeRecord()).length} 个）`
+        added > 0
+          ? `展开「${node?.name ?? nodeId}」：新增 ${added} 个节点（当前共 ${Object.keys(session.nodeRecord()).length} 个）`
+          : loaded
+            ? `展开「${node?.name ?? nodeId}」：没有下一层调用关系`
+            : `展开「${node?.name ?? nodeId}」：未取到结果（等待超时或正在展开中），可再点一次重试`
       );
     } catch (error) {
       logError(`展开「${node?.name ?? nodeId}」失败`, error);
@@ -565,7 +593,7 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
     const rounds = maxExpandRoundsLimit();
     await this.expandBatched(sessionId, {
       rounds,
-      nodeBudget: Math.min(MAX_EXPAND_NODES, maxChildrenPerNodeLimit() * rounds),
+      nodeBudget: Math.min(maxLayoutNodesLimit(), maxChildrenPerNodeLimit() * rounds),
       title: '正在展开全部调用关系…',
       label: '展开全部',
     });
@@ -580,7 +608,7 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
   private async expandFull(sessionId: string): Promise<void> {
     await this.expandBatched(sessionId, {
       rounds: Number.POSITIVE_INFINITY,
-      nodeBudget: MAX_EXPAND_NODES,
+      nodeBudget: maxLayoutNodesLimit(),
       title: '正在完全展开调用关系…',
       label: '完全展开',
     });
@@ -601,6 +629,19 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
     const { rounds, nodeBudget, title, label } = options;
     const session = this.getSession(sessionId);
     if (!session) {
+      return;
+    }
+    // ⚠️ 已达上限时**提前给出交代**，不要跑进循环再逐层空转（用户反馈「到上限后两个展开按钮
+    // 点了没用」）：那时循环会在第一个目标上算出 remaining ≤ 0 直接返回，面板上什么都不会变，
+    // 唯一的痕迹是一行输出通道日志 —— 等于没有反馈。
+    const currentCount = Object.keys(session.nodeRecord()).length;
+    if (currentCount >= nodeBudget) {
+      logWarn(
+        `${label}：已达节点总数上限 ${nodeBudget}（当前 ${currentCount} 个），未再展开。` +
+          `可在设置中调大 cppCallGraph.maxLayoutNodes，或先收起部分分支后重试。`
+      );
+      // 重发一次会话：面板据此把「展开全部 / 完全展开」置为禁用态并显示原因
+      this.postSession(session);
       return;
     }
     // 已经尝试过的节点：失败的展开不会把 `loaded` 置位，若只按 `!loaded` 挑目标，
@@ -633,7 +674,10 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
             // （默认档位下最多 799 + 200 = 999 > 800），超出的节点没有方框也没有连线。
             const remaining = nodeBudget - before;
             if (remaining <= 0) {
-              logWarn(`${label}：已达节点上限 ${nodeBudget}（当前 ${before} 个），停止继续展开。`);
+              logWarn(
+                `${label}：已达节点总数上限 ${nodeBudget}（当前 ${before} 个），停止继续展开。` +
+                  `可在设置中调大 cppCallGraph.maxLayoutNodes，或先收起部分分支后重试。`
+              );
               this.postSession(session);
               await this.persist();
               return;
@@ -751,6 +795,7 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
     showLocation: boolean;
     pathDisplay: 'tail' | 'full';
     pathTailLevels: number;
+    pathShowFileName: boolean;
     pathAnchors: string[];
   } {
     const config = vscode.workspace.getConfiguration('cppCallGraph');
@@ -760,6 +805,7 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
       // 路径在一行里怎么省略。锚点模式在这里就整理成数组：webview 只认数组，不该自己解析字符串。
       pathDisplay: config.get<string>('pathDisplay', 'tail') === 'full' ? 'full' : 'tail',
       pathTailLevels: readCount(config.get<number>('pathTailLevels', 0)),
+      pathShowFileName: config.get<boolean>('pathShowFileName', true),
       pathAnchors: readAnchors(config.get<unknown>('pathAnchors', [])),
     };
   }
@@ -948,14 +994,32 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
       {
         mode: settings.pathDisplay,
         tailLevels: settings.pathTailLevels,
+        showFileName: settings.pathShowFileName,
         anchors: settings.pathAnchors,
-      }
+      },
+      maxLayoutNodesLimit()
     );
     const payloadNodes: SessionPayload['nodes'] = {};
+    // 布局是否吃满节点总数上限（两种口径见下面的 atCapacity）：先算好，因为下面的循环要用它
+    // 给「仍有下一层可展开」的方框打**不带数字**的警示标记（方案 A，用户 2026-10-14 选定）。
+    const atCapacity =
+      Object.keys(layout.boxes).length >= maxLayoutNodesLimit() ||
+      Object.keys(layout.omittedByCap).length > 0;
     for (const [id, node] of Object.entries(nodes)) {
+      // 两种省略来源合并成一个总数给标记用，同时保留下因上限被截断的那部分供悬停区分原因
+      // （0.22 首版只算了 maxChildrenPerNode，上限截断的方框上什么都没有，用户反馈「到上限后
+      // 再展开没反应、也没有省略标记」）。
+      const omittedByNodeCap = layout.omittedByCap[id] ?? 0;
+      const canExpand = !node.loaded && !node.isCycle;
+      const hasBox = layout.boxes[id] !== undefined;
       payloadNodes[id] = {
         ...node,
-        canExpand: !node.loaded && !node.isCycle,
+        omitted: (node.omitted ?? 0) + omittedByNodeCap,
+        ...(omittedByNodeCap > 0 ? { omittedByNodeCap } : {}),
+        canExpand,
+        // 方案 A：到上限时，**有方框且仍有下一层可展开**的格子打一个不带数字的警示标记。
+        // 手动点它展开仍然可用 —— 上限只约束「展开全部 / 完全展开」的预算，不拦单点展开。
+        ...(atCapacity && canExpand && hasBox ? { cappedExpandable: true } : {}),
       };
     }
     return {
@@ -969,6 +1033,14 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
       nodes: payloadNodes,
       edges,
       boxes: layout.boxes,
+      /**
+       * 布局是否已经吃满节点总数上限：面板据此禁用两个展开按钮并给出原因。
+       *
+       * 两种情形都算「到顶」：方框数已经等于上限，或者有节点因上限被丢弃（`omittedByCap` 非空）。
+       * 只看前者会漏掉「刚好排满但还有未展开节点」的情况，用户仍会觉得点了没用。
+       */
+      atCapacity,
+      maxLayoutNodes: maxLayoutNodesLimit(),
       collapsedCount: session.collapsedCount,
     };
   }

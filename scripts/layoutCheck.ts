@@ -2,7 +2,14 @@
  * 图布局的几何验证：列方向、同行不重叠、父节点垂直居中、连线端点顺序。
  * 单独运行：node scripts/layoutCheck.js（由 npm run smoke 一并构建执行）
  */
-import { GraphNode, MAX_BOX_WIDTH, collectEdges, createLayout, estimateBoxWidth } from '../src/hierarchy/graphLayout';
+import {
+  GraphNode,
+  collectEdges,
+  createLayout,
+  displayPathText,
+  estimateBoxWidth,
+} from '../src/hierarchy/graphLayout';
+import { arrangeByProximity, pathCloseness } from '../src/hierarchy/session';
 
 function node(
   id: string,
@@ -194,18 +201,15 @@ export function report(): string[] {
     );
   }
 
-  // ---- 路径显示方式不得把方框撑破（三种口径 + 超长路径） ----
+  // ---- 路径显示方式：**必须完整显示，不许截断**（0.22 起没有宽度上限） ----
   {
     const longPath = `${'verylongdirectoryname/'.repeat(6)}lcd_init.c`; // 远超 40 字符
     const fullNode = node('fullpath', 'callees', 0, []);
     fullNode.name = 'fn';
     fullNode.file = longPath;
     fullNode.line = 1234;
-    const fullWidth = estimateBoxWidth(fullNode, true, {
-      mode: 'full',
-      tailLevels: 0,
-      anchors: [],
-    });
+    const fullOptions = { mode: 'full' as const, tailLevels: 0, anchors: [] };
+    const fullWidth = estimateBoxWidth(fullNode, true, fullOptions);
     const anchoredWidth = estimateBoxWidth(fullNode, true, {
       mode: 'tail',
       tailLevels: 2,
@@ -214,44 +218,78 @@ export function report(): string[] {
     const cjkFull = estimateBoxWidth(
       { ...fullNode, file: `${'全角目录名/'.repeat(6)}实现文件.cpp` },
       true,
-      { mode: 'full', tailLevels: 0, anchors: [] }
+      fullOptions
     );
     lines.push(
       `路径显示: 超长路径 full ${fullWidth.toFixed(0)}px / 带锚点 tail ${anchoredWidth.toFixed(0)}px / ` +
-        `全角 full ${cjkFull.toFixed(0)}px（上限 ${MAX_BOX_WIDTH}）`
+        `全角 full ${cjkFull.toFixed(0)}px（不再有宽度上限）`
     );
-    for (const [label, width] of [
-      ['full', fullWidth],
-      ['带锚点 tail', anchoredWidth],
-      ['全角 full', cjkFull],
-    ] as const) {
-      if (width > MAX_BOX_WIDTH) {
-        throw new Error(
-          `${label} 模式下估宽 ${width.toFixed(0)}px 超过上限 ${MAX_BOX_WIDTH} —— ` +
-            '路径显示方式不得把方框撑破（显示文字要先按 40 字符收敛）'
-        );
-      }
+    // ① 完整模式必须原样给出整条路径，一个 '…' 都不许有
+    const fullText = displayPathText(longPath, fullOptions);
+    if (fullText !== longPath) {
+      throw new Error(
+        `full 模式必须原样显示整条路径，实际「${fullText}」——中间截断是不允许的`
+      );
+    }
+    // ② 方框宽度必须随文字增长（证明 600px 钳制已去掉）
+    if (fullWidth <= 600) {
+      throw new Error(
+        `超长路径的估宽只有 ${fullWidth.toFixed(0)}px（≤600）——宽度又被钳住了，文字会溢出方框`
+      );
+    }
+    // ③ 单调性：路径更长就必须更宽，否则说明还在按固定上限收敛
+    const longerWidth = estimateBoxWidth(
+      { ...fullNode, file: `${longPath}/deeper/another.c` },
+      true,
+      fullOptions
+    );
+    if (!(longerWidth > fullWidth)) {
+      throw new Error(
+        `更长的路径没有得到更宽的方框：${fullWidth.toFixed(0)}px → ${longerWidth.toFixed(0)}px`
+      );
+    }
+    // ④ 显式层数的 tail 模式也不许**段内**截断。
+    //    注意 `…` 单独成段是合法的：那是 assemblePath 表示"这里跳过了若干层"，
+    //    非法的只有段内出现省略号（例如 `verylong…name`）。
+    const tailText = displayPathText(longPath, {
+      mode: 'tail',
+      tailLevels: 2,
+      anchors: ['verylongdirectoryname'],
+    });
+    const truncatedSegment = tailText
+      .split('/')
+      .find((segment) => segment.includes('…') && segment !== '…');
+    if (truncatedSegment !== undefined) {
+      throw new Error(`显式层数的 tail 模式下有段被截断：「${truncatedSegment}」`);
     }
   }
 
   // ---- 全角长路径不得溢出方框（最坏字身 = 1 倍字号） ----
-  // 上限 MAX_BOX_WIDTH 必须容得下“最坏字身 + 全部留白”，否则估宽被钳住、文字画出方框右边。
+  // 0.22 起宽度没有上限，判据改为「估宽必须不小于文字 + 留白所需」。
   {
     const worst = node('worst', 'callees', 0, []);
-    worst.name = '函'.repeat(30); // 名称截断上限 30
-    worst.file = '源'.repeat(36) + '.cpp'; // 路径截断上限 40（截断后再拼 `:行号`）
+    worst.name = '函'.repeat(30);
+    worst.file = '源'.repeat(36) + '.cpp';
     worst.line = 9999;
     const estimated = estimateBoxWidth(worst, true);
     const namePx = 30 * 13; // 30 个全角 × 13px 粗体
     const locPx = 40 * 12; // 40 个全角 × 12px
     const need = Math.max(namePx, locPx) + 22 + 10 + 13 + 5 + 6;
     lines.push(
-      `全角最坏情形: 估 ${estimated.toFixed(0)}px（上限 ${MAX_BOX_WIDTH}），文字+留白至少需要 ${need}px`
+      `全角最坏情形: 估 ${estimated.toFixed(0)}px，文字+留白至少需要 ${need.toFixed(0)}px`
     );
     if (estimated < need - 1) {
       throw new Error(
         `全角最坏情形下估宽 ${estimated.toFixed(0)}px 小于需要 ${need.toFixed(0)}px —— ` +
-          `MAX_BOX_WIDTH 容不下最坏字身，文字会溢出方框并压到加减号`
+          '文字会溢出方框并压到加减号'
+      );
+    }
+    // 名称不再截断：更长的名字必须得到更宽的方框
+    const longer = estimateBoxWidth({ ...worst, name: '函'.repeat(60) }, true);
+    if (!(longer > estimated)) {
+      throw new Error(
+        `名称从 30 字加到 60 字，方框没有变宽（${estimated.toFixed(0)}px → ${longer.toFixed(0)}px）——` +
+          '说明名称仍被按字符数截断'
       );
     }
   }
@@ -339,6 +377,95 @@ export function report(): string[] {
     lines.push(
       `路径开关框高: ${twoLine.boxes.root.height} → ${oneLine.boxes.root.height}` +
         `（内容高 ${twoLine.height} → ${oneLine.height}）`
+    );
+  }
+
+  // ---- 节点总数上限的截断必须落到**最近的已排布祖先**上 ----
+  // 被丢弃的节点自己没有方框，计数若记在它头上用户什么都看不到（0.22 首版缺陷）。
+  {
+    const nodes: Record<string, GraphNode> = {
+      root: node('root', 'callees', 0, ['c']),
+      // c 是「被截断的那一层」的父框：上限只放得下 root 与 c，
+      // 于是 c1、c2 及其全部子节点都要归到 c 上（最近的已排布祖先）。
+      c: node('c', 'callees', 1, ['c1', 'c2'], 'root'),
+      c1: node('c1', 'callees', 2, ['c1a', 'c1b'], 'c'),
+      c2: node('c2', 'callees', 2, ['c2a'], 'c'),
+      c1a: node('c1a', 'callees', 3, [], 'c1'),
+      c1b: node('c1b', 'callees', 3, [], 'c1'),
+      c2a: node('c2a', 'callees', 3, [], 'c2'),
+    };
+    // 上限 2 → 只排布 root 与 c（BFS 顺序），其余 5 个节点全部归到 c 上
+    const layout = createLayout(nodes, 'root', undefined, undefined, true, undefined, 2);
+    const placed = Object.keys(layout.boxes).length;
+    if (placed !== 2) {
+      throw new Error(`上限 2 时应当只排布 2 个方框，实际 ${placed}`);
+    }
+    const capped = layout.omittedByCap;
+    if ((capped.c ?? 0) !== 5) {
+      throw new Error(
+        `因上限未排布的 5 个节点应当全部归到最近的已排布祖先 c 上，实际 ${JSON.stringify(capped)}`
+      );
+    }
+    if (capped.root !== undefined || capped.c1 !== undefined) {
+      throw new Error(
+        `省略计数不该挂到别处（root 未直接丢子节点、c1 自己没有方框）：${JSON.stringify(capped)}`
+      );
+    }
+    // 未超上限时不该有任何省略计数（否则正常图会平白多出标记）
+    const full = createLayout(nodes, 'root');
+    if (Object.keys(full.omittedByCap).length !== 0) {
+      throw new Error(`未超上限时不该有省略计数：${JSON.stringify(full.omittedByCap)}`);
+    }
+    lines.push(`上限截断归类: 上限 2 时 c 上记 ${capped.c} 个省略、未超限时无省略计数`);
+  }
+
+  // ---- 同级排序：与父项路径最接近的子项必须落在中段 ----
+  // 这条改动**改变持久化的 children 顺序**（并列目录下同名文件与函数很多），
+  // 是 0.22 里唯一「改了既有语义却没有防线」的地方，所以用纯函数断言钉住。
+  {
+    // 亲疏分档：同文件 > 同目录 > 公共目录段数
+    const same = pathCloseness('a/b/c.c', 'a/b/c.c');
+    const sameDir = pathCloseness('a/b/c.c', 'a/b/d.c');
+    const oneCommon = pathCloseness('a/b/c.c', 'a/x/d.c');
+    if (!(same > sameDir && sameDir > oneCommon)) {
+      throw new Error(
+        `亲疏分档应当 同文件 > 同目录 > 公共段数：${same} / ${sameDir} / ${oneCommon}`
+      );
+    }
+
+    const files: Record<string, string> = {
+      far1: 'a/x/f1.c',
+      near: 'a/b/c.c', // 与父项同目录 → 最亲
+      far2: 'a/y/f2.c',
+      far3: 'a/z/f3.c',
+    };
+    const fileOf = (id: string) => files[id] ?? '';
+    const order = arrangeByProximity('a/b/c.c', ['far1', 'far2', 'far3', 'near'], fileOf);
+    // ⚠️ 偶数个子项时「中间」是一段（4 个时是索引 1~2），所以断言的是**中段区间**，
+    // 而不是某个固定下标 —— 固定下标会把「合法居中」误判为失败（第一版就是这样）。
+    const centerLow = Math.ceil(order.length / 2) - 1;
+    const centerHigh = Math.floor(order.length / 2);
+    const at = order.indexOf('near');
+    if (at < centerLow || at > centerHigh) {
+      throw new Error(
+        `最亲的子项应当落在中段（允许 ${centerLow}~${centerHigh}），实际在 ${at}：${order.join(',')}`
+      );
+    }
+    if (order.length !== 4 || new Set(order).size !== 4) {
+      throw new Error(`重排不得增删或重复子项：${order.join(',')}`);
+    }
+    // 只有两个子项时不重排（避免为「居中」做无意义的交换）
+    const two = arrangeByProximity('a/b/c.c', ['far1', 'near'], fileOf);
+    if (two.join(',') !== 'far1,near') {
+      throw new Error(`只有两个子项时不该重排，实际 ${two.join(',')}`);
+    }
+    // 全部同分（都同目录）时保持原顺序，避免抖动
+    const allNear = arrangeByProximity('a/b/c.c', ['p', 'q', 'r'], () => 'a/b/z.c');
+    if (allNear.join(',') !== 'p,q,r') {
+      throw new Error(`同分时应当保持原顺序，实际 ${allNear.join(',')}`);
+    }
+    lines.push(
+      `同级排序: 亲疏 ${same}/${sameDir}/${oneCommon}，最亲者居中 → ${order.join(',')}`
     );
   }
 

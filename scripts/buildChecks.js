@@ -37,6 +37,35 @@ function checkBundles() {
     }
     console.log(`[checks] ${file} 就绪（${size} 字节，${mtime.toISOString()}）`);
   }
+  checkCssHasNoBom();
+}
+
+/**
+ * 内联样式表**绝不能**带 BOM。
+ *
+ * 立此检查的原因（2026-10-14 事故）：`graph.css` 被编辑器工具写成了带 BOM 的 UTF-8，BOM 随
+ * 内联 `<style>` 进入浏览器，CSS 解析器把它当非法记号、**丢掉紧随其后的第一条规则** ——
+ * 而所有自定义属性（`--node-bg` / `--edge` / `--node-fg` / `--tab-bg` …）都定义在 `:root` 里。
+ * 变量全空后 `fill` / `stroke` / `color` 一律回落到初始值 black：方框全黑、箭头全黑、
+ * 标签文字全黑，而带内联颜色的小图标照常显示。改一处颜色样式就整幅界面发黑，极难联想到 BOM。
+ */
+function checkCssHasNoBom() {
+  const file = path.join(__dirname, '..', 'src', 'webview', 'graph.css');
+  const bytes = fs.readFileSync(file);
+  if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
+    throw new Error(
+      'src/webview/graph.css 带 UTF-8 BOM：它会让内联样式表的第一条规则（:root）被解析器丢弃，' +
+        '导致所有主题变量失效、界面整片变黑。请去掉 BOM 后重新构建'
+    );
+  }
+  const text = bytes.toString('utf8');
+  if (!text.startsWith(':root')) {
+    throw new Error(
+      `src/webview/graph.css 必须以 :root 开头（实际开头：${JSON.stringify(text.slice(0, 12))}）` +
+        '—— 前面多出任何字符都会让 :root 整条失效'
+    );
+  }
+  console.log('[checks] graph.css 无 BOM 且以 :root 开头');
 }
 
 async function main() {

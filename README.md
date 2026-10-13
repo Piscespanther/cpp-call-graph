@@ -33,13 +33,15 @@ code --install-extension .\cpp-call-graph-<版本>.vsix
 | --------------------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `cppCallGraph.languageService`    | `auto`    | 语言服务选择：`auto` / `clangd` / `cpptools` / `any`（不指定引擎）/ `custom`（用 `customEngineId`）                                                                |
 | `cppCallGraph.maxChildrenPerNode` | `200`     | 每个方框最多显示的直接调用者 / 被调用者数量。超出部分不显示，悬停提示给出被省略的条数                                                                              |
+| `cppCallGraph.maxLayoutNodes`     | `800`     | 整张图的节点总数上限（100–5000）。超出部分不上图并在输出通道中说明；同时约束「展开全部」与「完全展开」的节点预算                                          |
 | `cppCallGraph.maxExpandRounds`    | `5`       | 「展开全部」逐层展开的层数上限；「完全展开」不受该项约束，会展开到没有可展开的节点                                                                                 |
 | `cppCallGraph.autoReveal`         | `true`    | 双击方框时打开文件并定位到声明处                                                                                                                                   |
 | `cppCallGraph.showEngineWarning`  | `true`    | 检测到两个及以上语言服务可能同时提供调用层级时给出提示                                                                                                             |
 | `cppCallGraph.stickyParent`       | `true`    | 纵向滚动时把已展开下一层的方框固定在窗口垂直中央，各自限在自己的子树范围内滑动                                                                                     |
 | `cppCallGraph.showLocation`       | `true`    | 方框中显示「文件路径:行号」一行；关闭后仅显示元素名，方框宽度与高度均收窄为单行                                                                                    |
-| `cppCallGraph.pathDisplay`        | `tail`    | 路径显示方式：`tail` 保留末尾若干层 / `full` 宽度允许时显示整条路径。完整路径始终可在悬停提示中查看                                                                |
+| `cppCallGraph.pathDisplay`        | `tail`    | 路径显示方式：`tail` 保留末尾若干层 / `full` 显示整条路径。两种方式都不截断文字，方框按内容加宽                                                |
 | `cppCallGraph.pathTailLevels`     | `0`       | `tail` 模式下末尾保留的层数（含文件名）；`0` 表示按方框宽度自动                                                                                                    |
+| `cppCallGraph.pathShowFileName`  | `true`    | 方框那行路径是否包含文件名；关闭后只显示目录部分（`:行号` 保留，省略与锚点规则照旧作用于目录段）                                                                  |
 | `cppCallGraph.pathAnchors`        | 空        | `tail` 模式下必须显示的目录段，逗号分隔：`目录名` / `目录名+N` / `目录名-N`（以该目录名为基准偏移，只显示偏移后那一段）/ `+N`（从工作区根数）/ `-N`（从文件名往上数）      |
 | `cppCallGraph.customEngineId`     | 空        | `languageService` 为 `custom` 时使用的引擎 id                                                                                                                      |
 | `cppCallGraph.customEngines`      | `[]`      | 自定义语言服务列表，字段：`id` / `label` / `extensionId` / `badge` / `matchName` / `matchDetail` / `advice`                                                        |

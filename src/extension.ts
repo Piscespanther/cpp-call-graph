@@ -19,6 +19,7 @@
 import * as vscode from 'vscode';
 import {
   EngineLabel,
+  attributeProbeEngine,
   badgeFor,
   clangdExecutable,
   describeEngine,
@@ -41,7 +42,7 @@ import {
   resolveAt,
   selectedProfile,
 } from './hierarchy/callHierarchy';
-import { CallSession, baseKeyOf } from './hierarchy/session';
+import { CallSession, baseKeyOf, expandTimeout } from './hierarchy/session';
 import { resolveByReferences } from './hierarchy/references';
 import { Direction, DIRECTION_LABEL } from './hierarchy/graphTypes';
 import {
@@ -468,7 +469,9 @@ export function activate(context: vscode.ExtensionContext): void {
       if (
         event.affectsConfiguration('cppCallGraph.pathDisplay') ||
         event.affectsConfiguration('cppCallGraph.pathTailLevels') ||
-        event.affectsConfiguration('cppCallGraph.pathAnchors')
+        event.affectsConfiguration('cppCallGraph.pathAnchors') ||
+        event.affectsConfiguration('cppCallGraph.pathShowFileName') ||
+        event.affectsConfiguration('cppCallGraph.maxLayoutNodes')
       ) {
         graphPanel.postSettings(true);
         return;
@@ -546,6 +549,16 @@ export const __engines = {
   explainUnavailable,
   isProfileAvailable,
   listAvailableEngines,
+  /** 夹具探测结果的引擎归属规则（纯函数）。 */
+  attributeProbeEngine,
+};
+
+/**
+ * 仅用于测试：暴露会话层的可调项，供 scripts/smoke.js 把展开超时调小，
+ * 以验证「语言服务挂住时不至于永久点不开，且之后还能重试」。
+ */
+export const __session = {
+  expandTimeout,
 };
 
 function explainEmpty(direction: Direction, name: string): string {

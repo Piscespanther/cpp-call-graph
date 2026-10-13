@@ -82,6 +82,14 @@ export interface GraphNode {
   detail?: string;
   /** 展开时按 `maxChildrenPerNode` 省略掉的条数（>0 时在悬停提示里说明）。 */
   omitted?: number;
+  /**
+   * `omitted` 中**因节点总数上限**（`cppCallGraph.maxLayoutNodes`）未显示的那部分。
+   *
+   * 由 `graphView` 在下发前从布局结果的 `omittedByCap` 合并进来；webview 用
+   * `omitted - omittedByNodeCap` 得到「受 maxChildrenPerNode 限制」的那部分，从而在悬停里
+   * 把两种原因分开写清 —— 只说「另有 N 条未显示」用户无法判断该调哪个设置。
+   */
+  omittedByNodeCap?: number;
   file: string;
   line: number;
   /** 关系发生点：谁在第几行引用了/调用了谁。 */
@@ -119,6 +127,13 @@ export interface GraphLayout {
   height: number;
   minX: number;
   minY: number;
+  /**
+   * 因为超出**节点总数上限**而未排布的节点数，按「最近的已排布祖先」归类。
+   *
+   * 这样省略标记能落在**看得见的方框**上：被丢弃的节点自己不会有方框，若把计数记在它头上，
+   * 用户什么都看不到（0.22 首版就是这样，用户反馈「到上限后再展开没反应、也没有省略标记」）。
+   */
+  omittedByCap: Record<string, number>;
 }
 
 /** 全部合法的节点类型，供运行时校验（历史数据的归一化用）。 */

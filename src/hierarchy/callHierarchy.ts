@@ -144,6 +144,34 @@ async function probingDocument(
   }
 }
 
+/**
+ * 决定夹具探测结果归属于哪个引擎。
+ *
+ * 抽成纯函数是为了能被测试直接钉住（此前一律写 unknown，于是"只装 clangd"时
+ * 诊断里会出现 unknown，看着像探测失败）。规则：
+ *   ① 有认领者 → 用认领者；
+ *   ② 只有一个引擎可用 → 结果必然来自它；
+ *   ③ 两个引擎都可用且各回一条 → 按可用顺序与返回下标对应；
+ *   ④ 其余情况无法判断 → `unknown`（例如两个引擎可用但只回了一条）。
+ */
+export function attributeProbeEngine(
+  claimed: EngineLabel | undefined,
+  available: EngineLabel[],
+  preparedCount: number,
+  index: number
+): EngineLabel {
+  if (claimed) {
+    return claimed;
+  }
+  if (available.length === 1) {
+    return available[0];
+  }
+  if (preparedCount === 2 && available.length === 2) {
+    return available[index] ?? 'unknown';
+  }
+  return 'unknown';
+}
+
 /** 用夹具文件探测当前有哪些语言服务真的提供调用层级。 */
 export async function probeEngines(
   context: vscode.ExtensionContext
@@ -174,17 +202,15 @@ export async function probeEngines(
   }
 
   const profiles = engineProfiles();
+  const fallback = listAvailableEngines();
   const entries: ProbeEntry[] = prepared.map((item, index) => {
     // 先用各配置档自己的认领规则判断（表驱动，自定义引擎也能被认出来）；
-    // 认不出再按"谁真的可用"的顺序推测（与 listAvailableEngines 一致）——仅诊断展示用。
+    // 认不出再交给 attributeProbeEngine 兜底（纯函数，规则与测试都在那里）。
     const claimed = profiles.find((profile) => matchesProfile(item, profile));
-    if (claimed) {
-      return { item, engine: claimed.id };
-    }
-    const fallback = listAvailableEngines();
-    const engine: EngineLabel =
-      prepared.length === 2 ? (fallback[index] ?? 'unknown') : 'unknown';
-    return { item, engine };
+    return {
+      item,
+      engine: attributeProbeEngine(claimed?.id, fallback, prepared.length, index),
+    };
   });
 
   const engines: EngineLabel[] = [];

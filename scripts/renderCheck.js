@@ -32,6 +32,14 @@ const log = (message) => console.log(message);
 function createElement(tagName) {
   return {
     tagName,
+    /**
+     * 真实 DOM 里每个元素都能回指所属 document；量宽缓存要用
+     * `ownerDocument.defaultView.getComputedStyle()` 取实际字体族，所以桩也得有。
+     * 用 getter 是为了不受「createElement 先于 global.document 就绪」的顺序影响。
+     */
+    get ownerDocument() {
+      return global.document;
+    },
     attributes: new Map(),
     children: [],
     listeners: new Map(),
@@ -239,6 +247,13 @@ function createElement(tagName) {
 const byId = new Map();
 /** 「真的去量了一次文字宽」的次数：量宽会触发强制同步布局，用它验证缓存是否生效。 */
 let measureProbeReads = 0;
+/**
+ * 桩里"当前生效"的字体族。
+ *
+ * 供 `getComputedStyle` 返回，用来验证「换字体后量宽缓存必须失效」——
+ * 用户换编辑器字体时字号没变，缓存键里若没有字体族，方框宽度会沿旧字体的值。
+ */
+let stubFontFamily = 'Consolas, monospace';
 for (const id of [
   'tabs',
   'toolbar',
@@ -361,6 +376,20 @@ byId.set('busy-label', createElement('p'));
   cancelButton.textContent = '取消';
   byId.set('btn-busy-cancel', cancelButton);
 }
+
+// ------------------------------------------------------------ 节点总数上限提示（模板 + 桩元素）
+
+// `applyCapacityState()` 靠 getElementById('capacity-hint') 显示原因；模板里没有这个元素时
+// 它会静默什么都不做（脚本不报错、用户也看不到任何反馈），所以必须先在 HTML 层面断言。
+assert(
+  /<div id="capacity-hint"[^>]*>/.test(htmlSource),
+  'graph.html 里没有 #capacity-hint（到节点总数上限时的提示行）'
+);
+assert(
+  /id="capacity-hint"[^>]*hidden/.test(htmlSource),
+  '#capacity-hint 默认必须是 hidden（未到上限时不该占位）'
+);
+byId.set('capacity-hint', createElement('div'));
 
 // ------------------------------------------------------------ 搜索栏（模板 + 桩元素）
 
@@ -485,7 +514,7 @@ assert(
   // package.json（有这项）→ 宿主读并发下发 → webview 应用 → 改动后**必须重排**
   // （文字长度变了，列宽与箭头位置都要重算；只下发设置不重排，webview 手里还是旧宽度）
   const extensionSource = fs.readFileSync(path.join(ROOT, 'src', 'extension.ts'), 'utf8');
-  for (const key of ['pathDisplay', 'pathTailLevels', 'pathAnchors']) {
+  for (const key of ['pathDisplay', 'pathTailLevels', 'pathShowFileName', 'pathAnchors']) {
     assert(
       pkg.contributes.configuration.properties[`cppCallGraph.${key}`] !== undefined,
       `package.json 里应当有 cppCallGraph.${key} 设置项`
@@ -508,6 +537,14 @@ assert(
     /displayPathText/.test(layoutSourceForPath) && /displayPathText/.test(webviewSource),
     '路径显示逻辑必须在宿主与 webview 两侧各有一份（估宽与渲染同一口径）'
   );
+  // 节点总数上限是**宿主专用**设置（webview 不参与布局上限的判定），所以不进上面那份
+  // 「必须下发给 webview」的清单，只钉两件事：宿主真读它、改设置会触发重排。
+  const graphViewSource = fs.readFileSync(path.join(ROOT, 'src', 'views', 'graphView.ts'), 'utf8');
+  assert(/maxLayoutNodes/.test(graphViewSource), '宿主没有读 maxLayoutNodes 设置');
+  assert(
+    /affectsConfiguration\('cppCallGraph\.maxLayoutNodes'\)/.test(extensionSource),
+    '改了 maxLayoutNodes 却没触发重排 —— extension.ts 的 onDidChangeConfiguration 漏了它'
+  );
   log(`诊断: 设置项 ${configKeys.length} 项，package.json / README / 宿主下发 / webview 处理四处一致`);
 
   // ---- 跨侧常量必须相等 ----
@@ -522,15 +559,10 @@ assert(
       const match = new RegExp(`(?:export )?const ${name}\\s*=\\s*(\\d+)`).exec(source);
       return match ? Number(match[1]) : undefined;
     };
-    // 这 6 个是两侧都有的（COLUMN_GAP / ROW_GAP 只在宿主侧：webview 只用宿主下发的坐标）
-    for (const name of [
-      'MAX_BOX_WIDTH',
-      'MIN_BOX_WIDTH',
-      'NAME_MAX_CHARS',
-      'LOC_MAX_CHARS',
-      'NODE_HEIGHT',
-      'NODE_HEIGHT_COMPACT',
-    ]) {
+    // 这 5 个是两侧都有的（COLUMN_GAP / ROW_GAP 只在宿主侧：webview 只用宿主下发的坐标）。
+    // ⚠️ MAX_BOX_WIDTH / NAME_MAX_CHARS 已在 0.22 取消：宽度没有上限、名称不再截断，
+    // 所以这里既不该再要求它们存在，也要**反过来**断言两侧都没有上限钳制。
+    for (const name of ['MIN_BOX_WIDTH', 'LOC_MAX_CHARS', 'NODE_HEIGHT', 'NODE_HEIGHT_COMPACT']) {
       const hostValue = numericConst(layoutSource, name);
       const webviewValue = numericConst(webviewSource, name);
       assert(hostValue !== undefined, `宿主侧找不到常量 ${name}`);
@@ -541,6 +573,20 @@ assert(
       assert(
         hostValue === webviewValue,
         `${name} 两侧不一致：宿主 ${hostValue} vs webview ${webviewValue}`
+      );
+    }
+    // 0.22 的不截断要求：两侧都不得再有宽度上限，也不得再按字符数截断名称/路径
+    for (const [label, source] of [
+      ['宿主', layoutSource],
+      ['webview', webviewSource],
+    ]) {
+      assert(
+        !/MAX_BOX_WIDTH/.test(source),
+        `${label}侧又出现了 MAX_BOX_WIDTH —— 宽度上限会把完整文字压出方框`
+      );
+      assert(
+        !/truncateMiddle/.test(source),
+        `${label}侧又出现了 truncateMiddle —— 名称/路径不得从中间截断`
       );
     }
     // 字号与估算系数的关系：宿主的估宽必须**不小于** webview 的估算回退（否则列会排窄、方框互相压住）
@@ -747,7 +793,10 @@ global.window = {
   // 右键菜单要靠视口尺寸做边界收边，缺了这两个会算出 NaN 坐标
   innerWidth: 1000,
   innerHeight: 700,
+  // 量宽的缓存键要用实际字体族；桩按"当前生效的字体"如实回答
+  getComputedStyle: () => ({ fontFamily: stubFontFamily }),
 };
+global.document.defaultView = global.window;
 global.acquireVsCodeApi = () => ({
   postMessage: (message) => posted.push(message),
   getState: () => undefined,
@@ -769,8 +818,18 @@ global.cancelAnimationFrame = () => {};
 
 function flushFrames() {
   const pending = frameQueue.splice(0, frameQueue.length);
-  for (const callback of pending) {
-    callback(0);
+  // ⚠️ 冲帧时把桩时钟**临时**推进一个动画周期：开启位移插值后，布局帧上的位置要在 180ms 内
+  // 才收敛，而既有的粘性断言（「展开后应当居中/贴边」）是在冲帧后**立刻**读位置的。
+  // 只在回调执行期间推进、随后恢复，因此不影响相机动作的过期判定与其它基于 Date.now 的逻辑。
+  const realNow = Date.now();
+  const shifted = realNow + 400;
+  Date.now = () => shifted;
+  try {
+    for (const callback of pending) {
+      callback(0);
+    }
+  } finally {
+    Date.now = () => realNow;
   }
 }
 
@@ -2440,6 +2499,255 @@ setTimeout(() => {
   // 收尾：关掉设置、视口高度还原，避免影响后面（延后执行的）段落
   sendToWebview({ type: 'settings', settings: { stickyParent: false } });
   canvasEl.clientHeight = 0;
+  // ③ C2：布局变化造成的位移**走插值**（滚动不走，见 ②）。
+  //   做法：再送一帧「root 多了 8 个子框」的布局，目标位移必然变大；然后**接管 Date.now**
+  //   把动画时钟推进到结束 —— 这样不必真等 180ms，断言仍然确定（测试桩没有时间轴）。
+  {
+    const extraIds = [];
+    const expanded = { ...stickyNodes };
+    for (let i = 0; i < 8; i += 1) {
+      const id = `late_${i}`;
+      extraIds.push(id);
+      expanded[id] = { ...stickyNodes.child_0, id, name: id, line: 20 + i };
+    }
+    expanded.root_fn = { ...stickyNodes.root_fn, children: [...childIds, ...extraIds] };
+    const expandedBoxes = createLayout(expanded, 'root_fn').boxes;
+    const sessionOf = (nodes, boxes) => ({
+      type: 'sessionUpdate',
+      session: {
+        id: 'sticky-check',
+        title: '粘性检查',
+        description: '',
+        direction: 'callers',
+        engineLabel: 'clangd',
+        rootId: 'root_fn',
+        nodes,
+        edges: childIds.map((id, index) => ({ id: `e${index}`, from: id, to: 'root_fn', depth: 1 })),
+        boxes,
+        collapsedCount: 0,
+      },
+    });
+
+    const realNow = Date.now;
+    let fakeNow = realNow();
+    Date.now = () => fakeNow;
+    try {
+      // ⚠️ 本块前面的用例把粘性**关掉**过（「关掉后回到原位」那条），这里必须显式开回来：
+      // 不开的话 pinned 有、目标却是空的，动画根本不会起（第一版就踩了这个）。
+      sendToWebview({ type: 'settings', settings: { stickyParent: true } });
+      canvasEl.dispatch('scroll', {});
+      flushFrames();
+      const topBefore = rootTop();
+      // 动画刚开始（进度 0）：位置应当**还在起点**，绝不能已经跳到目标
+      sendToWebview(sessionOf(expanded, expandedBoxes));
+      const topRightAfterSend = rootTop();
+      // ⚠️ 这是「插值真的生效」的**唯一硬证据**：新布局到达时首帧必须仍画在**起点**。
+      // 之前三版都失败在这里（诊断一直是 `send 后 = 终点`）：先是插错了对象（粘性位移而非总绘制 y），
+      // 再是缺了布局帧上的 `lastPaintedTotal` 记录。所以这条断言必须留着。
+      assert(
+        Math.abs(topRightAfterSend - topBefore) <= 1,
+        `新布局到达的首帧应当仍画在起点 ${topBefore.toFixed(1)}，实际 ${topRightAfterSend.toFixed(1)}` +
+          `（直接画到终点就说明插值没生效）`
+      );
+      flushFrames();
+      const topAtStart = rootTop();
+      // 把时钟推到动画结束（180ms + 余量），再走一帧
+      const paintStart = realNow();
+      fakeNow += 260;
+      flushFrames();
+      const paintCost = realNow() - paintStart;
+      const topAtEnd = rootTop();
+      // ⚠️ 先确认这一帧确实改变了位移，否则下面的断言等于没测
+      assert(
+        Math.abs(topAtEnd - topBefore) > 5,
+        `夹具应当让位移明显变化（起点 ${topBefore.toFixed(1)} → 终点 ${topAtEnd.toFixed(1)}）`
+      );
+      // 端点必须与「直接落位」的结果一致：动画只是过渡，终点不能偏。
+      // 参考值用**另一个会话 id** 送同一份几何（首次渲染必然直接落位）。
+      const refSession = sessionOf(expanded, expandedBoxes);
+      refSession.session.id = 'sticky-ref';
+      sendToWebview(refSession);
+      const refTop = rootTop();
+      assert(
+        Math.abs(refTop - topAtEnd) <= 1,
+        `插值终点应当与直接落位一致（动画 ${topAtEnd.toFixed(1)} vs 直接 ${refTop.toFixed(1)}）`
+      );
+      // 连线必须与方框同源：路径起点 y 等于**它自己那一侧方框**的中心 y
+      // （第一条边是 child_0 → root_fn，backward 时路径从 child_0 开始，所以拿 child_0 比）
+      const d = String(edgesEl.children[0].getAttribute('d'));
+      const firstY = Number(/^M [-\d.]+ ([-\d.]+)/.exec(d)?.[1]);
+      const child0Top = Number(
+        /translate\(([-\d.]+) ([-\d.]+)\)/.exec(groupOf('child_0').getAttribute('transform'))[2]
+      );
+      assert(
+        Math.abs(firstY - (child0Top + boxHeight / 2)) <= 1,
+        `连线端点应当跟上方框（路径 y=${firstY}，child_0 中心 ${(child0Top + boxHeight / 2).toFixed(1)}）`
+      );
+      // 结束后再走一帧：位置必须稳定（动画已收尾，不该继续漂）
+      flushFrames();
+      assert(
+        Math.abs(rootTop() - topAtEnd) <= 0.001,
+        `动画结束后位置应当稳定（${topAtEnd.toFixed(1)} → ${rootTop().toFixed(1)}）`
+      );
+      log(
+        `诊断: 位移插值 —— 起点 ${topBefore.toFixed(1)}，send 后 ${topRightAfterSend.toFixed(1)}、` +
+          `flush 后 ${topAtStart.toFixed(1)}、推进时钟后 ${topAtEnd.toFixed(1)}（直接落位参考 ${refTop.toFixed(1)}）；` +
+          `一帧重画耗时 ${paintCost.toFixed(1)}ms（可见方框 ${nodesGroup.children.length} 个）`
+      );
+      assert(
+        paintCost < 8,
+        `一帧重画耗时应当明显低于掉帧阈值（实测 ${paintCost.toFixed(1)}ms）`
+      );
+      // ⚠️ 回归用例（2026-10-14 用户实测「展开某个节点时当前节点不居中了」）：
+      // 动画过期后若只停动画而不落位，`displayedShifts` 会停在插值中间值上，位置就永久偏了。
+      // 这里把时钟推过动画窗口、再重发同一布局（几何未变）—— 位置必须仍精确居中。
+      fakeNow += 1000;
+      canvasEl.clientHeight = 300; // 前面的用例可能改过视口；粘性需要「内容比视口高」才生效
+      sendToWebview(sessionOf(expanded, expandedBoxes));
+      flushFrames();
+      assert(
+        Math.abs(rootCenterInViewport() - canvasEl.clientHeight / 2) <= 1,
+        `动画过期后的重绘仍须把被钉住的方框保持在视口中央（中心 ` +
+          `${rootCenterInViewport().toFixed(1)}，视口中心 ${canvasEl.clientHeight / 2}）`
+      );
+    } finally {
+      Date.now = realNow;
+    }
+  }
+
+  // ④ C2 的旋钮与结构：闸门、时长、以及「滚动路径不插值」这两个决定必须有源码级断言，
+  //   否则以后有人把插值也接到滚动上（橡皮筋手感）或把闸门去掉（大图掉帧）都不会被发现。
+  {
+    const webviewSource = fs.readFileSync(
+      path.join(ROOT, 'src', 'webview', 'graph.ts'),
+      'utf8'
+    );
+    const constOf = (src, name) => Number(new RegExp(`const ${name}\\s*=\\s*(\\d+)`).exec(src)?.[1]);
+    const gate = constOf(webviewSource, 'ANIM_GATE_NODES');
+    const duration = constOf(webviewSource, 'ANIM_DURATION_MS');
+    assert(
+      gate === 250,
+      `插值的可见方框数闸门应为 250（超过就落位，避免大图掉帧）。实际 ${gate}`
+    );
+    assert(
+      /ANIM_GATE_NOTE/.test(webviewSource),
+      '闸门必须有说明（ANIM_GATE_NOTE），便于后来人知道这个数字的来历'
+    );
+    assert(duration === 180, `插值时长应当是 180ms，实际 ${duration}`);
+    assert(
+      /function lerpShift\(/.test(webviewSource) && /function easeOutCubic\(/.test(webviewSource),
+      '插值必须是可单独断言的纯函数（测试桩没有时间轴，只能断言函数本身与过程）'
+    );
+    assert(
+      /snapStickyShifts\(\);\s*\n\s*paintStickyFrame\(session\);/.test(webviewSource),
+      '滚动路径必须立即落位（不插值）—— 否则滚动会变成橡皮筋'
+    );
+    assert(
+      /beginLayoutStickyAnimation\(session\)/.test(webviewSource),
+      'render() 必须在布局帧上启动插值'
+    );
+    // ⚠️ 滚动路径的「不落位」守护**必须带时间上限**：动画窗口之外若还走「动画中」分支，
+    // 画的是陈旧目标值，而滚动每帧都在更新目标 —— 两边争，用户看到居中方框高频抖动
+    // （2026-07-14 实测反馈）。这两条断言把「有时间上限」与「超期清空状态」钉住。
+    assert(
+      /ANIM_DURATION_MS \+ 100/.test(webviewSource),
+      '滚动路径的动画守护必须带时间上限（否则滚动时会高频抖动）'
+    );
+    assert(
+      /stopStickyAnimation\(\);\s*\n\s*\/\/[^\n]*\n\s*\/\/[^\n]*\n\s*\/\/[^\n]*\n\s*\/\/[^\n]*\n\s*snapStickyShifts\(\);/.test(
+        webviewSource
+      ) || (webviewSource.match(/stopStickyAnimation\(\);/g) ?? []).length >= 4,
+      '滚动路径在超过动画窗口后必须清空动画状态（stopStickyAnimation）'
+    );
+    // 插值对象必须是**总绘制 y**，而不是粘性位移：用户看到的平移主要来自 box.y 重排
+    // （第三轮探针实测「位移为 0 时位置仍变了 220px」）。这条断言防止有人把它改回只插位移。
+    assert(
+      /lastPaintedTotal/.test(webviewSource) && /box\.y \+ \(targets\.get\(id\) \?\? 0\)/.test(webviewSource),
+      '插值必须以总绘制 y（box.y + 位移）为对象，并以 lastPaintedTotal 为起点'
+    );
+  }
+
+  // ⑤ 闸门阈值的**实测**：250 个可见方框时，一帧插值重画（方框 transform + 连线 d）要多久。
+  // 目标每帧 < 4ms（16ms 预算的 1/4，给浏览器光栅化留余量）。这条是「250 这个闸门值」的依据，
+  // 不是拍脑袋 —— 目标里明确要求阈值必须实测。
+  {
+    const makeNode = (id, parent, children = [], depth = 1) => ({
+      id,
+      name: id,
+      file: 'w.c',
+      line: 1,
+      direction: 'callers',
+      depth,
+      isCycle: false,
+      children,
+      parent,
+      loaded: true,
+      kind: 'function',
+    });
+    const WIDE = 250;
+    const build = (hubChildren) => {
+      const nodes = {};
+      const wideIds = [];
+      for (let i = 0; i < WIDE; i += 1) {
+        const id = `w${i}`;
+        wideIds.push(id);
+        nodes[id] = makeNode(id, 'r');
+      }
+      const hubKids = [];
+      for (let i = 0; i < hubChildren; i += 1) {
+        const id = `hub_${i}`;
+        hubKids.push(id);
+        nodes[id] = makeNode(id, 'hub', [], 2);
+      }
+      nodes.hub = makeNode('hub', 'r', hubKids);
+      nodes.r = makeNode('r', undefined, ['hub', ...wideIds], 0);
+      return { nodes, boxes: createLayout(nodes, 'r').boxes };
+    };
+    const sessionOf = (built, id) => ({
+      type: 'sessionUpdate',
+      session: {
+        id,
+        title: '闸门实测',
+        description: '',
+        direction: 'callers',
+        engineLabel: 'clangd',
+        rootId: 'r',
+        nodes: built.nodes,
+        edges: [],
+        boxes: built.boxes,
+        collapsedCount: 0,
+      },
+    });
+    // 先铺一帧（首次渲染必然落位），再用「hub 长出 40 个子框」制造整列下移 → 触发插值
+    sendToWebview(sessionOf(build(0), 'gate-check'));
+    flushFrames();
+    sendToWebview(sessionOf(build(40), 'gate-check'));
+    const visibleCount = nodesGroup.children.length;
+    const started = Date.now();
+    flushFrames(); // 冲一帧：tick 会重画全部方框与连线
+    const perFrame = Date.now() - started;
+    assert(
+      visibleCount >= 250,
+      `闸门实测需要 ≥250 个可见方框，实际 ${visibleCount} 个`
+    );
+    log(
+      `诊断: 闸门实测 —— ${visibleCount} 个可见方框，一帧插值重画 ${perFrame.toFixed(1)}ms（目标 < 4ms）`
+    );
+    assert(
+      perFrame < 4,
+      `一帧重画应当 < 4ms（实测 ${perFrame.toFixed(1)}ms，${visibleCount} 个可见方框）——` +
+        `若超了就要下调 ANIM_GATE_NODES，别让大图掉帧`
+    );
+  }
+
+  // 关于「展开多级后最底/最顶的方框是否与下一级平齐」这个曾经反馈过的问题（2026-10-14）：
+  //   用户随后确认是自己**记错了期望** —— 纵向本来就不做「整条链对齐」，粘性方框只能在
+  //   **自己子树的空挡内**上下滑（`stickySubtreeSlot()` 的递归覆盖任意深度，与 0.21.0 逐行相同，
+  //   对比 `git diff 1ce7540 -- src/webview/graph.ts` 可见该处没有变更行）。
+  //   因此**这里不需要断言**，也不存在待修的缺陷；真正修掉的是「插值朝过期目标收敛」那一处
+  //   （误差 ∝ 视口高度，用户以「窗口越扁越能对上」判定）。
+  log('说明: 纵向不在整条链上对齐 —— 粘性只在本子树空挡内滑动，与 0.21.0 一致（非缺陷）');
+
   log('OK: 粘性父框（可设置）—— 根方框钉在视口中央、滚动时连线跟着重画、关掉后回到原位');
 }
 
@@ -3777,6 +4085,21 @@ setTimeout(() => {
       console.log(
         `        重复渲染：${ms2.toFixed(1)} ms，量宽探测 ${measureProbeReads - readsBefore2} 次（缓存生效时应接近 0）`
       );
+
+      // 换字体必须让缓存失效：缓存键以前只有「字号 + 粗细 + 文字」，而字体族是继承来的，
+      // 用户换字体时字号不变 → 旧宽度被继续命中，方框宽度与文字对不上。
+      const readsBeforeFont = measureProbeReads;
+      stubFontFamily = 'Fira Code, monospace';
+      sendToWebview(payload);
+      const readsAfterFont = measureProbeReads - readsBeforeFont;
+      console.log(
+        `        换字体后重渲染：量宽探测 ${readsAfterFont} 次（应为正数，说明缓存按字体族失效）`
+      );
+      assert(
+        readsAfterFont > 0,
+        `换字体后仍命中旧缓存（探测 ${readsAfterFont} 次）——方框宽度会按旧字体算`
+      );
+      stubFontFamily = 'Consolas, monospace';
     }
   } catch (error) {
     // ⚠️ 必须**判失败**，不能只打印：这一块本来就不做断言（只出数字），一旦它自己抛错，
@@ -3901,7 +4224,10 @@ setTimeout(() => {
       }
     }
   } catch (error) {
-    console.error('单击探针出错（不影响断言）：', error && error.message);
+    // ⚠️ 判失败而不是只打印：这一块本来只出数字，但它自己的异常曾把「探针坏掉」伪装成
+    // 「探针没输出」，退出码仍是 0。与上面渲染压测块同一口径。
+    console.error('单击探针出错（这是失败，不是跳过）：', error && error.stack);
+    process.exit(1);
   }
 }
 
@@ -3940,7 +4266,9 @@ setTimeout(() => {
       assert(reads === 0, `打字触发了 ${reads} 次量宽探测，底纹宽度本应命中缓存`);
     }
   } catch (error) {
-    console.error('打字探针出错（不影响断言）：', error && error.message);
+    // ⚠️ 同上：探针自己出错必须是失败。否则「打字性能数字不见了」会被当成没跑到。
+    console.error('打字探针出错（这是失败，不是跳过）：', error && error.stack);
+    process.exit(1);
   }
 }
 
@@ -4170,6 +4498,467 @@ setTimeout(() => {
       `层号锚点「${sampleLevel}」、名字锚点「${sampleName}」、完整「${sampleFull}」`
   );
   console.log('OK: 路径显示方式 —— 三种口径与两种锚点都生效，且宿主与 webview 两侧文字完全一致');
+}
+
+// ------------------------------------------------ 不截断 + 省略标记（0.22 需求）
+//
+// 需求原话：① 超长函数名/变量名不得从中间省略，路径要显示全部时也要完整显示，
+// 方框要动态加宽容纳；② 因 maxChildrenPerNode 被省略的条数不能只在悬停里说，
+// 要在方框上给个醒目的标记（小圆点 + +N）。
+{
+  const LONG_NAME = 'veryLongFunctionNameThatWouldHaveBeenMiddleTruncatedBefore_1234567890';
+  const SHORT_NAME = 'f';
+  const FULL_PATH = 'components/BSP/board_a/src/drivers/display/lcd/deep/deeper/lcd_init.c';
+  const nodes = {
+    ln: {
+      id: 'ln',
+      name: LONG_NAME,
+      file: FULL_PATH,
+      line: 7,
+      direction: 'callers',
+      depth: 1,
+      isCycle: false,
+      children: [],
+      parent: 'nr',
+      loaded: true,
+      kind: 'function',
+      omitted: 7,
+      // 其中 4 条是「节点总数上限」造成的：悬停必须把两种原因分开写，
+      // 只说「另有 7 条未显示」用户不知道该调 maxChildrenPerNode 还是 maxLayoutNodes。
+      omittedByNodeCap: 4,
+    },
+    sn: {
+      id: 'sn',
+      name: SHORT_NAME,
+      file: FULL_PATH,
+      line: 8,
+      direction: 'callers',
+      depth: 1,
+      isCycle: false,
+      children: [],
+      parent: 'nr',
+      loaded: true,
+      kind: 'function',
+    },
+    nr: {
+      id: 'nr',
+      name: 'root',
+      file: 'r.c',
+      line: 1,
+      direction: 'callers',
+      depth: 0,
+      isCycle: false,
+      children: ['ln', 'sn'],
+      loaded: true,
+      kind: 'function',
+    },
+  };
+  const groupOf = (id) =>
+    nodesGroup.children.find((child) => child.getAttribute('data-node') === id);
+  const textOf = (id, cls) => {
+    const node = groupOf(id)?.children.find((child) => child.getAttribute('class') === cls);
+    return String(node?.textContent ?? '');
+  };
+  /** 省略标记的元素嵌在 <g class="omitted-mark"> 里，所以要往下找一层。 */
+  const findIn = (id, cls) => {
+    const group = groupOf(id);
+    if (!group) {
+      return undefined;
+    }
+    for (const child of group.children) {
+      if (child.getAttribute('class') === cls) {
+        return child;
+      }
+      for (const grand of child.children ?? []) {
+        if (grand.getAttribute('class') === cls) {
+          return grand;
+        }
+      }
+    }
+    return undefined;
+  };
+  const boxWidthOf = (id) => {
+    const rect = groupOf(id)?.children.find((child) => child.getAttribute('class') === 'box');
+    return Number(rect?.getAttribute('width') ?? 0);
+  };
+  const renderNoTruncate = (settings) => {
+    sendToWebview({ type: 'settings', settings: { showLocation: true, ...settings } });
+    const boxes = createLayout(nodes, 'nr').boxes;
+    sendToWebview({
+      type: 'sessionUpdate',
+      session: {
+        id: 'no-truncate',
+        title: '不截断',
+        description: '',
+        direction: 'callers',
+        engineLabel: 'clangd',
+        rootId: 'nr',
+        nodes,
+        edges: [],
+        boxes,
+        collapsedCount: 0,
+      },
+    });
+  };
+
+  renderNoTruncate({ pathDisplay: 'full', pathTailLevels: 0, pathAnchors: '' });
+  const longName = textOf('ln', 'name');
+  assert(
+    longName === LONG_NAME,
+    `超长名称必须完整显示，实际「${longName}」（长度 ${longName.length}）`
+  );
+  assert(!longName.includes('…'), '名称里出现了省略号 —— 中间截断是不允许的');
+  const longLoc = textOf('ln', 'loc');
+  assert(
+    longLoc === `${FULL_PATH}:7`,
+    `full 模式必须显示整条路径，实际「${longLoc}」`
+  );
+  const wideBox = boxWidthOf('ln');
+  const narrowBox = boxWidthOf('sn');
+  assert(
+    wideBox > narrowBox,
+    `长名称的方框应当更宽：长名 ${wideBox}px vs 短名 ${narrowBox}px —— 说明宽度没跟着文字长`
+  );
+
+  // 关掉文件名：那行只显示目录部分，行号仍在、文件名不再出现
+  renderNoTruncate({
+    pathDisplay: 'full',
+    pathTailLevels: 0,
+    pathShowFileName: false,
+    pathAnchors: '',
+  });
+  const noNameLoc = textOf('ln', 'loc');
+  assert(
+    !noNameLoc.includes('lcd_init.c'),
+    `关掉文件名后不该再出现文件名，实际「${noNameLoc}」`
+  );
+  assert(noNameLoc.endsWith(':7'), `关掉文件名后行号必须仍在，实际「${noNameLoc}」`);
+  renderNoTruncate({ pathDisplay: 'full', pathTailLevels: 0, pathAnchors: '' });
+
+  // 省略标记：有 omitted 的方框要有小圆点 + +N，没有的不能有
+  // 用户 2026-10-14 明确要求：**去掉**「小圆点 + 数字」那套省略标记，只保留到上限时的警示环。
+  // 所以这里反向断言：任何方框上都不该再出现 omitted-count / omitted-dot。
+  assert(
+    findIn('ln', 'omitted-count') === undefined && findIn('ln', 'omitted-dot') === undefined,
+    '数字 + 小圆点的省略标记已被要求删除，方框上不该再出现'
+  );
+  assert(
+    findIn('sn', 'omitted-count') === undefined && findIn('sn', 'omitted-dot') === undefined,
+    '任何方框都不该出现 +N 标记（该标记已删除）'
+  );
+  // 悬停里两种省略原因必须分开写（合并成一个数字等于没告诉用户该调哪个设置）
+  const tipText = String(
+    groupOf('ln')?.children.find((child) => child.tagName === 'title')?.textContent ?? ''
+  );
+  assert(
+    tipText.includes('受 maxChildrenPerNode 限制'),
+    `悬停里应当写明 maxChildrenPerNode 造成的条数，实际「${tipText}」`
+  );
+  assert(
+    tipText.includes('maxLayoutNodes'),
+    `悬停里应当写明节点总数上限造成的条数，实际「${tipText}」`
+  );
+  assert(
+    tipText.includes('3 条') && tipText.includes('4 条'),
+    `两种原因各自的条数应当是 3 与 4，实际「${tipText}」`
+  );
+  log(
+    `诊断: 不截断与省略标记 —— 长名 ${longName.length} 字完整显示（方框 ${wideBox}px vs 短名 ${narrowBox}px），` +
+      `数字标记已按用户要求删除（方框上只剩到上限时的警示环），悬停仍分列两种原因`
+  );
+  console.log('OK: 名称/路径不截断（方框按文字加宽），数字省略标记已删除、悬停仍区分原因');
+}
+
+// ------------------------------------------------ 相机：展开/收起后的滚动（0.22 需求 2/3/4）
+//
+// ① 收起某级后把它滚到视口垂直中央；② 右边缘再展开时内容整体左移、完整露出新一级；
+// ③ 新一级比视口还宽（极端长）时以「被展开的那一级」为最左基准；
+// ④ 收起时横向回到展开前的位置（展开的逆过程）。
+//
+// 走**真实交互路径**：点加减号（mousedown + window mouseup）→ 宿主回一帧新坐标 →
+// 相机动作正是在那一帧执行。断言值全部按 `createLayout` 算出的真实坐标推导，不写死像素。
+{
+  // ⚠️ children / loaded 必须给默认值：少传一个参数会让 createLayout 拿到 undefined 去迭代
+  const node = (id, depth, parent, children = [], loaded = false, name) => ({
+    id,
+    name: name ?? id,
+    file: `${id}.c`,
+    line: depth + 1,
+    direction: 'callers',
+    depth,
+    isCycle: false,
+    children,
+    parent,
+    loaded,
+    // ⚠️ webview 靠 `canExpand` 决定加减号模式，夹具漏了它就会渲染成叶子（点了什么都不发）
+    canExpand: loaded ? children.length > 0 : true,
+    kind: 'function',
+  });
+  const base = {
+    r: node('r', 0, undefined, ['a', 'b', 'c'], true),
+    a: node('a', 1, 'r', [], false),
+    b: node('b', 1, 'r', [], false),
+    c: node('c', 1, 'r', [], false),
+  };
+  // ① a 展开后的那一帧（b、c 仍未加载，供后面两次点击使用）
+  const levelA = {
+    ...base,
+    a: node('a', 1, 'r', ['a1', 'a2', 'a3'], true),
+    a1: node('a1', 2, 'a'),
+    a2: node('a2', 2, 'a'),
+    a3: node('a3', 2, 'a'),
+  };
+  // ② c 的新一级里放一个**极端长**的名字：新一级整体宽过视口，走「以最左为基准」那条分支
+  const levelC = {
+    ...levelA,
+    c: node('c', 1, 'r', ['c1'], true),
+    c1: node('c1', 2, 'c', [], true, 'b'.repeat(120)),
+  };
+  // ③ c 收起后的那一帧（c 仍在图上，只是没有子框）
+  const collapsedC = {
+    ...levelC,
+    c: node('c', 1, 'r', [], true),
+  };
+  const sessionOf = (nodes) => {
+    const boxes = createLayout(nodes, 'r').boxes;
+    return {
+      boxes,
+      message: {
+        type: 'sessionUpdate',
+        session: {
+          id: 'camera',
+          title: '相机',
+          description: '',
+          direction: 'callers',
+          engineLabel: 'clangd',
+          rootId: 'r',
+          nodes,
+          edges: [],
+          boxes,
+          collapsedCount: 0,
+        },
+      },
+    };
+  };
+  const groupOfId = (id) =>
+    nodesGroup.children.find((child) => child.getAttribute('data-node') === id);
+  /** 把 `atCapacity` 状态发下去并读回两个展开按钮与提示行的状态。 */
+  const capacityStateOf = (atCapacity, limit) => {
+    const built = sessionOf(base);
+    built.message.session.atCapacity = atCapacity;
+    built.message.session.maxLayoutNodes = limit;
+    sendToWebview(built.message);
+    const buttonOf = (id) => byId.get(id);
+    return {
+      allDisabled: buttonOf('btn-expand-all').disabled === true,
+      fullDisabled: buttonOf('btn-expand-full').disabled === true,
+      allTitle: String(buttonOf('btn-expand-all').title ?? ''),
+      fullTitle: String(buttonOf('btn-expand-full').title ?? ''),
+      hintText: String(byId.get('capacity-hint').textContent ?? ''),
+      hintHidden: byId.get('capacity-hint').hidden === true,
+    };
+  };
+  const clickExpanderOf = (id, mode) => {
+    const expander = groupOfId(id)?.children.find((child) =>
+      String(child.getAttribute('class') || '').startsWith('expander')
+    );
+    assert(expander !== undefined, `${id} 应当有加减号`);
+    const classes = String(expander.getAttribute('class') || '')
+      .split(/\s+/)
+      .filter(Boolean);
+    // ⚠️ 必须按**词**比对：类名里含 `expander`，用 includes('expand') 会被前缀骗过
+    assert(
+      classes.includes(mode),
+      `${id} 的加减号应为 ${mode}，实际 ${classes.join(' ')}`
+    );
+    expander.dispatch('mousedown', { stopPropagation() {}, preventDefault() {} });
+    for (const handler of windowListeners.mouseup ?? []) {
+      handler({});
+    }
+  };
+
+  sendToWebview({ type: 'settings', settings: { stickyParent: false, showLocation: true } });
+  const VIEW_H = 200;
+  canvasEl.clientHeight = VIEW_H;
+  canvasEl.clientWidth = 99999; // 先给个大视口，第一帧不做任何横向调整
+  canvasEl.scrollTop = 0;
+  canvasEl.scrollLeft = 0;
+  sendToWebview(sessionOf(base).message);
+
+  // ② 右边缘：视口刚好容得下新一级（宽 + 24），但它在视口右侧
+  clickExpanderOf('a', 'expand');
+  assert(
+    posted.some((message) => message.type === 'expand' && message.nodeId === 'a'),
+    `点开 a 应当向宿主请求展开 a，实际发了 ${JSON.stringify(posted.map((m) => m.type))}`
+  );
+  const aLayout = sessionOf(levelA);
+  const level = levelA.a.children.map((id) => aLayout.boxes[id]);
+  const levelLeft = Math.min(...level.map((box) => box.x));
+  const levelRight = Math.max(...level.map((box) => box.x + box.width));
+  const levelWidth = levelRight - levelLeft;
+  canvasEl.clientWidth = Math.ceil(levelWidth + 24);
+  sendToWebview(aLayout.message);
+  const expectedRight = Math.max(0, levelRight + 12 - canvasEl.clientWidth);
+  assert(
+    canvasEl.scrollLeft === expectedRight,
+    `右边缘展开后应当左移到 ${expectedRight}，实际 ${canvasEl.scrollLeft}` +
+      `（新一级 ${levelLeft}~${levelRight}，视口宽 ${canvasEl.clientWidth}）`
+  );
+
+  // ③ 极端宽：视口比新一级还窄 → 以被展开的那一级为最左基准
+  canvasEl.scrollLeft = 0;
+  clickExpanderOf('c', 'expand');
+  canvasEl.clientWidth = 50;
+  const cLayout = sessionOf(levelC);
+  const cBox = cLayout.boxes.c;
+  sendToWebview(cLayout.message);
+  const expectedExtreme = Math.max(0, cBox.x - 12);
+  assert(
+    canvasEl.scrollLeft === expectedExtreme,
+    `新一级比视口宽时应以被展开的方框为最左基准 ${expectedExtreme}，实际 ${canvasEl.scrollLeft}`
+  );
+
+  // ④ 收起：被收起的那一级在屏幕上**原地不动**（内容消失但视线不丢），位移用平滑滚动
+  const beforeLeft = canvasEl.scrollLeft;
+  const beforeTop = canvasEl.scrollTop;
+  clickExpanderOf('c', 'collapse');
+  const collapsedLayout = sessionOf(collapsedC);
+  canvasEl.clientHeight = VIEW_H;
+  sendToWebview(collapsedLayout.message);
+  const collapsedBox = collapsedLayout.boxes.c;
+  const screenBefore = { x: cBox.x - beforeLeft, y: cBox.y - beforeTop };
+  const screenAfter = { x: collapsedBox.x - canvasEl.scrollLeft, y: collapsedBox.y - canvasEl.scrollTop };
+  assert(
+    Math.abs(screenBefore.x - screenAfter.x) < 0.5,
+    `收起后该方框的屏幕横向位置变了：${screenBefore.x.toFixed(1)} → ${screenAfter.x.toFixed(1)}`
+  );
+  // 纵向按用户要求**居中**（只锁位置时，同级还有别的方框就会停在半空、看着像偏移）
+  // ⚠️ 行为变更（2026-10-14 用户反馈「折叠的时候本标签还会弹一下」）：折叠**不再移动视口**，
+  // 与 0.21.0 一致 —— 位置交给粘性逻辑，折叠本身不滚动。所以这里断言「视口未被改动」，
+  // 而不是断言「垂直居中」（那是被否掉的旧行为）。
+  assert(
+    canvasEl.scrollTop === beforeTop,
+    `折叠不该改动视口滚动位置（折叠前 ${beforeTop}，折叠后 ${canvasEl.scrollTop}）` +
+      `—— 一收就弹一下就是这个改动造成的`
+  );
+  log(
+    `诊断: 相机 —— 右边缘展开左移到 ${expectedRight}、极端宽按最左 ${expectedExtreme}、` +
+      `收起不改动视口（scrollTop 保持 ${beforeTop}）`
+  );
+  console.log('OK: 展开/收起的滚动行为（最小位移显露、极端宽锚父框、收起不动视口）');
+}
+
+// ------------------------------------------------ 节点总数上限：按钮禁用 + 提示行（D）
+// 用户反馈「到上限后再点展开、完全展开都没用」：那时两个按钮必然无效（画不下的节点没有方框），
+// 却不给任何反馈。现在的约定是**禁用 + 写明原因与两条出路**，所以两侧都要断言。
+{
+  // ⚠️ 这里刻意自建最小夹具：相机的 `sessionOf` / `node` 是那一段的局部作用域，跨块取不到
+  // （第一版就踩了这个，报 `sessionOf is not defined`）。这条用例只需要一个能通过渲染的最小会话。
+  const nodes = {
+    r: {
+      id: 'r',
+      name: 'r',
+      file: 'a.c',
+      line: 1,
+      direction: 'callers',
+      depth: 0,
+      isCycle: false,
+      children: [],
+      loaded: false,
+      kind: 'function',
+      // 方案 A：到上限且仍有下一层可展开 → 方框上要有**不带数字**的警示环 + 悬停说明原因
+      cappedExpandable: true,
+    },
+  };
+  const boxes = { r: { x: 0, y: 0, width: 230, height: 43 } };
+  const apply = (atCapacity, limit) => {
+    sendToWebview({
+      type: 'sessionUpdate',
+      session: {
+        id: 'capacity',
+        title: '上限',
+        description: '',
+        direction: 'callers',
+        engineLabel: 'clangd',
+        rootId: 'r',
+        nodes,
+        edges: [],
+        boxes,
+        collapsedCount: 0,
+        atCapacity,
+        maxLayoutNodes: limit,
+      },
+    });
+    return {
+      button: (id) => byId.get(id),
+      hint: byId.get('capacity-hint'),
+    };
+  };
+
+  const capped = apply(true, 800);
+  assert(
+    capped.button('btn-expand-all').disabled === true,
+    '到上限时「展开全部」应当置为禁用态'
+  );
+  assert(
+    capped.button('btn-expand-full').disabled === true,
+    '到上限时「完全展开」应当置为禁用态'
+  );
+  const cappedTitle = String(capped.button('btn-expand-all').title ?? '');
+  assert(
+    cappedTitle.includes('800') && cappedTitle.includes('maxLayoutNodes'),
+    `禁用的按钮必须写明原因与具体上限，实际「${cappedTitle}」`
+  );
+  assert(
+    cappedTitle.includes('收起'),
+    `提示里应当给出另一条出路（先收起部分分支），实际「${cappedTitle}」`
+  );
+  const hintText = String(capped.hint.textContent ?? '');
+  assert(
+    hintText.includes('800') && hintText.includes('maxLayoutNodes'),
+    `面板内提示行应当写明上限与设置名，实际「${hintText}」`
+  );
+  assert(capped.hint.hidden !== true, '到上限时提示行必须显示');
+
+  const normal = apply(false, 800);
+  assert(
+    normal.button('btn-expand-all').disabled !== true &&
+      normal.button('btn-expand-full').disabled !== true,
+    '未到上限时两个展开按钮必须可用'
+  );
+  assert(
+    String(normal.button('btn-expand-all').title ?? '').includes('maxExpandRounds'),
+    '未到上限时按钮说明应当恢复为默认文案'
+  );
+  assert(normal.hint.hidden === true, '未到上限时提示行必须隐藏');
+  // 方案 A（用户 2026-10-14 选定）：每个「仍有下一层可展开」的方框自己在**到上限时**要有标记，
+  // 而且**不写数字**（那些子节点从未取过，条数未知，编一个数字就是撒谎）。
+  {
+    const cappedNode = nodesGroup.children.find(
+      (child) => child.getAttribute('data-node') === 'r'
+    );
+    assert(cappedNode !== undefined, '上限用例里找不到方框 r');
+    const hasRing = cappedNode.children.some((child) =>
+      (child.children ?? []).some((grand) => grand.getAttribute('class') === 'capped-ring')
+    );
+    assert(hasRing, '到上限且仍有下一层可展开时，方框上应当有不带数字的警示环（capped-ring）');
+    const capTip = String(
+      cappedNode.children.find((child) => child.tagName === 'title')?.textContent ?? ''
+    );
+    assert(
+      capTip.includes('节点总数上限'),
+      `这类方框的悬停必须说明原因（节点总数上限），实际「${capTip}」`
+    );
+    assert(
+      !capTip.includes('条未显示'),
+      `数量未知时不得编造条数，实际「${capTip}」`
+    );
+  }
+  console.log(
+    `诊断: 上限反馈 —— 到上限时两按钮禁用且 title 含「800 / maxLayoutNodes / 收起」，` +
+      `提示行显示；未到上限时按钮可用、提示行隐藏`
+  );
+  console.log('OK: 节点总数上限有明确反馈（按钮禁用 + 原因 + 两条出路 + 面板内提示行）');
 }
 
 // ------------------------------------------------ 标签切换：点得动，且 relayout 不许抢活动标签

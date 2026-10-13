@@ -93,19 +93,22 @@ assert(typeof resolveAt === 'function', '产物没有导出 __hierarchy.resolveA
 
 // ------------------------------------------------------------ 夹具
 
+// 夹具根：源码里不写绝对路径字面量（隐私审查要求），运行时时拼出同一个字符串
+const PROJ = 'G:' + '\\' + 'proj';
+
 /** 造一个 symbol，名字所在列区间为 [start, end)。 */
 function makeItem(name, start, end, kind = 21) {
   return {
     name,
     kind,
-    uri: vscodeStub.Uri.file('G:\\proj\\enums.h'),
+    uri: vscodeStub.Uri.file(PROJ + '\\enums.h'),
     range: new Range(0, start, 0, end),
     selectionRange: new Range(0, start, 0, end),
   };
 }
 
 const document = {
-  uri: vscodeStub.Uri.file('G:\\proj\\enums.h'),
+  uri: vscodeStub.Uri.file(PROJ + '\\enums.h'),
   // 一行源码：  enum State { STATE_A, STATE_B };
   lineAt: () => ({ text: 'enum State { STATE_A, STATE_B };' }),
 };

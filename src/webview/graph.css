@@ -196,6 +196,30 @@ body {
   cursor: pointer;
 }
 
+/* 已到节点总数上限时两个展开按钮进入禁用态（它们那时必然无效，禁用并说明原因比让用户反复点好） */
+.toolbar button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/*
+  上限提示行：内联在标签栏下方的一行文字（不用右下角弹窗 —— 本项目不要打扰式提示）。
+  颜色变量都带兜底色：SVG 与文本里 `var()` 取不到值会回落到黑色，浅色主题下就成了一块黑。
+*/
+.capacity-hint {
+  flex: 0 0 auto;
+  padding: 3px 8px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--vscode-editorWarning-foreground, #cca700);
+  background: var(--vscode-inputValidation-warningBackground, rgba(255, 204, 0, 0.1));
+  border-bottom: 1px solid var(--vscode-inputValidation-warningBorder, rgba(255, 204, 0, 0.4));
+}
+
+.capacity-hint[hidden] {
+  display: none;
+}
+
 .toolbar button:hover {
   background: var(--vscode-toolbar-hoverBackground, rgba(90, 93, 94, 0.31));
 }
@@ -536,8 +560,17 @@ body {
   stroke-dasharray: 4 3;
 }
 
-.node:hover .box {
+/*
+  「最后点过加减号」的格子：亮粉色框**留在这一格**（持久），便于折叠时确认操作的是谁。
+  与悬停同色（--node-hover）但不受鼠标位置影响 —— 鼠标移开也还在，直到点别的加减号。
+  刻意不碰 `selected`（亮白框，只由单击方框/空格改变）与悬停的既有语义。
+*/
+.node.expander-active .box {
   stroke: var(--node-hover);
+  stroke-width: 2;
+}
+
+.node:hover .box {  stroke: var(--node-hover);
 }
 
 .node.selected .box {
@@ -694,4 +727,17 @@ body {
   to {
     transform: rotate(360deg);
   }
+}
+
+/* 「另有 N 条未显示」那套实心点 + 数字已按用户要求删除（2026-10-14）：只保留到上限时的警示环。 */
+/*
+  到节点总数上限、但这一格仍有下一层可展开时显示的虚线环（不带数字 —— 条数未知）。
+  ⚠️ 必须显式写 `fill: none`：SVG 圆的默认 fill 是**黑色**，漏掉就会变成一块黑点
+  （本会话已经因为「变量取不到值回退成黑」出过一次整屏发黑的事故）。
+*/
+.capped-ring {
+  fill: none;
+  stroke: var(--vscode-editorWarning-foreground, #cca700);
+  stroke-width: 1.5;
+  stroke-dasharray: 2 2;
 }

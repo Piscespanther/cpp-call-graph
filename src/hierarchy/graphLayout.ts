@@ -85,16 +85,19 @@ const MAX_LAYOUT_NODES = 800;
 /**
  * 方框宽度的上限。
  *
- * ⚠️ 不能只按 ASCII 估：路径截断上限是 40 个字符（再加 `:行号`），而**全角**字符的字身约 1 倍字号
- * —— 最坏情形 45 个全角字符 ≈ 540px 文字，加上左侧起点 22 与右侧留白（10+13+5+6）共 596px。
- * 上限若按 ASCII 的 400，这类路径会被钳住 → 文字画出方框右边、压到加减号。
- * 因此按「最坏字身 + 全部留白」定成 600（两侧各一份，renderCheck 有等值断言）。
+ * ⚠️ 0.22 起**没有方框宽度上限**：用户要求「要显示的内容必须完整显示」，所以宽度按实际文字
+ * 算，宁可把列推宽（画布可以横向滚动），也不许把名称或路径从中间截断
+ * （此前的 600px 钳制会把长度超过它的文字压出方框右边）。
  */
-export const MAX_BOX_WIDTH = 600;
 /** 方框最小宽度：太窄会显得像个方块，且放不下加减号。 */
 const MIN_BOX_WIDTH = 120;
-/** 文字截断上限，必须与 webview 里的一致，否则估宽会和实际文字对不上。 */
-const NAME_MAX_CHARS = 30;
+/**
+ * 「省略」模式（`pathTailLevels = 0`）下末尾目录段的字符预算。
+ *
+ * 这不是截断上限，而是**自动档选择保留几层**的判据：放不下就少留一层，
+ * 于是自动档的路径文字本身不会超过这个长度。显式给了层数或锚点时不受它约束，
+ * 宽度会照着实际文字长出来。
+ */
 const LOC_MAX_CHARS = 40;
 /**
  * 每字符宽度占字号的千分比，用于宿主侧估宽。
@@ -106,16 +109,6 @@ const LOC_MAX_CHARS = 40;
  * 中文字符比英文宽，0.8em 对中文偏小，但中文路径少见，且列间还有 COLUMN_GAP 兜底。
  */
 const CHAR_WIDTH_MILLI = 800;
-
-/** 与 webview 的 truncateMiddle 等价（用于估宽，必须同步改）。 */
-function truncateMiddle(text: string, max: number): string {
-  if (text.length <= max) {
-    return text;
-  }
-  const head = Math.ceil((max - 1) / 2);
-  const tail = Math.floor((max - 1) / 2);
-  return `${text.slice(0, head)}…${text.slice(text.length - tail)}`;
-}
 
 /** 与 webview 的 displayPathText 等价（用于估宽，必须同步改）。 */
 /**
@@ -129,6 +122,14 @@ export interface PathDisplayOptions {
   mode: 'tail' | 'full';
   /** 末尾保留几层（含文件名）；**0 = 按字符预算自动**，即 0.20 及以前的行为。 */
   tailLevels: number;
+  /**
+   * 方框里那行路径是否包含最后的文件名（设置 `cppCallGraph.pathShowFileName`）。
+   *
+   * 关掉后只显示目录部分，`:行号` 仍由调用方拼上；省略/锚点/层数规则照旧作用于目录段。
+   * 若去掉文件名后什么都不剩（例如 `main.c` 这种没有目录的路径），退回显示文件名 ——
+   * 否则那行会变成光秃秃的 `:12`。
+   */
+  showFileName?: boolean;
   /**
    * 必须显示的目录段，可任意组合多层。每条模式只保留**它自己解析出的那一段**，
    * 因此「基准目录不显示、只显示偏移出来的那一段」是天然支持的；要连基准一起显示，
@@ -150,6 +151,7 @@ export interface PathDisplayOptions {
 export const DEFAULT_PATH_OPTIONS: PathDisplayOptions = {
   mode: 'tail',
   tailLevels: 0,
+  showFileName: true,
   anchors: [],
 };
 
@@ -284,13 +286,22 @@ export function displayPathText(
   options: PathDisplayOptions = DEFAULT_PATH_OPTIONS,
   max = LOC_MAX_CHARS
 ): string {
-  const parts = file.split(/[\\/]/).filter((part) => part.length > 0);
-  if (parts.length <= 1) {
+  const segments = file.split(/[\\/]/).filter((part) => part.length > 0);
+  if (segments.length <= 1) {
     return file;
   }
+  // 只有显式传 false 才去掉文件名（未设置时按显示处理）
+  const keepFileName = options.showFileName !== false;
   if (options.mode === 'full') {
-    return file.length <= max ? file : truncateMiddle(file, max);
+    // 完整显示就是要整条：不给截断，方框按实际文字宽度长出来。
+    // 关掉文件名时去掉最后一段（若因此为空则仍显示原名，避免那行只剩 `:12`）。
+    const kept = keepFileName ? segments : segments.slice(0, -1);
+    return kept.length > 0 ? kept.join('/') : file;
   }
+  // 省略模式只对**目录段**做省略：关掉文件名时把最后一段（文件名）先摘掉，
+  // 层数、字符预算、锚点全部作用于目录段。
+  const dirs = keepFileName ? segments : segments.slice(0, -1);
+  const parts = dirs.length > 0 ? dirs : segments;
 
   const resolved = resolveAnchorIndexes(parts, options.anchors);
   const anchors = resolved.indexes;
@@ -306,12 +317,16 @@ export function displayPathText(
 
   let tailCount =
     options.tailLevels > 0 ? Math.min(options.tailLevels, parts.length) : budgetTailCount(parts, max);
-  // 锚点不能因为窗口太宽而被挤掉：先缩窗口（保留到只剩文件名那一层）
-  while (tailCount > 1 && assemblePath(parts, anchors, tailCount).length > max) {
-    tailCount -= 1;
+  // 锚点不能因为窗口太宽而被挤掉：先缩窗口（保留到只剩文件名那一层）。
+  // ⚠️ 只在**自动档**（tailLevels = 0）缩窗口：显式给了层数或锚点时，用户要的就是那些段，
+  // 缩了等于不显示；那种情况下由宽度自适应去容纳（0.22 起没有宽度上限）。
+  if (options.tailLevels <= 0) {
+    while (tailCount > 1 && assemblePath(parts, anchors, tailCount).length > max) {
+      tailCount -= 1;
+    }
   }
-  const text = assemblePath(parts, anchors, tailCount);
-  return text.length <= max ? text : truncateMiddle(file, max);
+  // 一律返回拼好的文字，**不截断**：长度超出预算时由方框加宽来容纳。
+  return assemblePath(parts, anchors, tailCount);
 }
 
 /** 一段文字的「宽度毫数」（每 1000 毫 = 1 倍字号）。
@@ -346,7 +361,8 @@ export function estimateBoxWidth(
   showLocation = true,
   pathOptions: PathDisplayOptions = DEFAULT_PATH_OPTIONS
 ): number {
-  const nameText = `${node.isCycle ? '↻ ' : ''}${truncateMiddle(node.name, NAME_MAX_CHARS)}`;
+  // 名称一律用全名：0.22 起不许从中间截断（长度由方框宽度去容纳）
+  const nameText = `${node.isCycle ? '↻ ' : ''}${node.name}`;
   const nameWidth = (textWidthMilli(nameText) * 13) / 1000;
   const locText = showLocation
     ? `${displayPathText(node.file, pathOptions, LOC_MAX_CHARS)}:${node.line}`
@@ -354,7 +370,7 @@ export function estimateBoxWidth(
   const locWidth = (textWidthMilli(locText) * 12) / 1000;
   // 22 是文字起点，13 是加减号，5 是右边距，6 是安全余量（与 webview 同口径）
   const total = 22 + Math.max(nameWidth, locWidth) + 10 + 13 + 5 + 6;
-  return Math.min(MAX_BOX_WIDTH, Math.max(MIN_BOX_WIDTH, Math.ceil(total)));
+  return Math.max(MIN_BOX_WIDTH, Math.ceil(total));
 }
 
 /**
@@ -379,7 +395,14 @@ export function createLayout(
   measuredWidths?: Map<string, number>,
   collapsed?: ReadonlySet<string>,
   showLocation = true,
-  pathOptions: PathDisplayOptions = DEFAULT_PATH_OPTIONS
+  pathOptions: PathDisplayOptions = DEFAULT_PATH_OPTIONS,
+  /**
+   * 节点总数上限（设置 `cppCallGraph.maxLayoutNodes`，默认 `MAX_LAYOUT_NODES`）。
+   *
+   * 超出部分**不上图**（没有坐标），并在输出通道里说明。上限越大越占内存与渲染时间：
+   * webview 一次整帧重绘在 400 节点约 8ms、1200 节点约 30ms（压测数字），所以别盲目调大。
+   */
+  maxNodes = MAX_LAYOUT_NODES
 ): GraphLayout {
   /** 被收起的节点当作叶子：子树既不给坐标，也不占高度。 */
   const kidsOf = (node: GraphNode): string[] => (collapsed?.has(node.id) ? [] : node.children);
@@ -402,7 +425,7 @@ export function createLayout(
     if (id === undefined || boxes[id] !== undefined) {
       continue;
     }
-    if (placed >= MAX_LAYOUT_NODES) {
+    if (placed >= maxNodes) {
       truncatedIds.add(id);
       continue;
     }
@@ -424,14 +447,74 @@ export function createLayout(
     }
   }
 
-  // 截断**不能静默**：以前用户只看到方框少了，不知道是图太大。走输出通道说明。
+  // 截断**不能静默**，而且要能落到方框上。
   // ⚠️ 这段判断必须放在循环**之后**：截断只发生在「已经排满上限」之后，而排满的那一瞬间
   // 还没有任何节点被跳过 —— 早先把警告写在循环内、判据是「已有跳过 && 刚好排满」，
   // 两个条件永远不会同时成立，警告从来没打印过（等于没兑现这条承诺）。
+  const omittedByCap: Record<string, number> = {};
   if (truncatedIds.size > 0) {
+    /**
+     * 沿 parent 上溯到第一个有方框的祖先（被丢弃的节点自己没有方框，计数记在它头上看不到）。
+     *
+     * ⚠️ 必须**记忆化 + 路径压缩**：不做的话每个被丢弃节点都要走上溯一遍，深链上总代价近似
+     * O(深度²) —— 实测 1000 层 4.9ms、2000 层 47.6ms（压测里唯一超线性的一项）。
+     */
+    const nearestPlacedCache = new Map<string, string | undefined>();
+    const nearestPlaced = (id: string): string | undefined => {
+      if (nearestPlacedCache.has(id)) {
+        return nearestPlacedCache.get(id);
+      }
+      const walked: string[] = [];
+      let cursor = nodes[id]?.parent;
+      let result: string | undefined;
+      let guard = 0;
+      while (cursor !== undefined && guard < 10000) {
+        if (boxes[cursor] !== undefined) {
+          result = cursor;
+          break;
+        }
+        if (nearestPlacedCache.has(cursor)) {
+          result = nearestPlacedCache.get(cursor);
+          break;
+        }
+        walked.push(cursor);
+        cursor = nodes[cursor]?.parent;
+        guard += 1;
+      }
+      nearestPlacedCache.set(id, result);
+      // 路径压缩：这一趟走过的中间节点共享同一个答案
+      for (const node of walked) {
+        nearestPlacedCache.set(node, result);
+      }
+      return result;
+    };
+    // ⚠️ 必须按**整棵子树**计数：被丢弃的节点在入栈前就被 `continue` 掉了，它们的子节点
+    // 从未入栈，只数 `truncatedIds` 会**少报**（上限 2 的用例里实际少 5 个，旧实现只报 2 个，
+    // 而且方框上的省略标记也会偏小 —— 是 layoutCheck 的新用例抓出来的）。
+    const counted = new Set<string>();
+    const pending: string[] = [...truncatedIds];
+    while (pending.length > 0) {
+      const id = pending.pop() as string;
+      if (counted.has(id)) {
+        continue;
+      }
+      counted.add(id);
+      const owner = nearestPlaced(id);
+      if (owner !== undefined) {
+        omittedByCap[owner] = (omittedByCap[owner] ?? 0) + 1;
+      }
+      const node = nodes[id];
+      if (node) {
+        for (const child of kidsOf(node)) {
+          if (boxes[child] === undefined) {
+            pending.push(child);
+          }
+        }
+      }
+    }
     logWarn(
-      `图过大：本次只排布了前 ${MAX_LAYOUT_NODES} 个方框，另有 ${truncatedIds.size} 个节点未显示` +
-        `（可先收起部分分支，或分次展开）。`
+      `图过大：本次只排布了前 ${maxNodes} 个方框，另有 ${counted.size} 个节点未显示` +
+        `（可先收起部分分支，或分次展开；也可在设置中调大 cppCallGraph.maxLayoutNodes）。`
     );
   }
 
@@ -489,9 +572,10 @@ export function createLayout(
     // 先按「零偏移」落位，等各列的预估宽度都收齐后再统一平移（见下面 shift 列）。
     // 优先用 webview 回传的实测宽度；没有才退回估宽。
     const measured = measuredWidths?.get(id);
+    // 实测宽度**不设上限**：webview 按完整文字量出来的宽就是要用的宽（0.22 起不截断）。
     const width =
       typeof measured === 'number' && Number.isFinite(measured) && measured > 0
-        ? Math.min(MAX_BOX_WIDTH, Math.max(MIN_BOX_WIDTH, Math.round(measured)))
+        ? Math.max(MIN_BOX_WIDTH, Math.round(measured))
         : estimateBoxWidth(node, showLocation, pathOptions);
     boxes[id] = { x: 0, y, width, height: nodeHeight };
     minY = Math.min(minY, y);
@@ -537,6 +621,7 @@ export function createLayout(
     minY,
     width: maxX - minX,
     height: maxY - minY,
+    omittedByCap,
   };
 }
 

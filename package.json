@@ -2,7 +2,7 @@
   "name": "cpp-call-graph",
   "displayName": "C/C++ 调用关系图 (Call Graph)",
   "description": "在底部面板以图形化方式浏览 C/C++ 函数的被调用关系与调用关系，每次查询一个标签页（基于 LSP Call Hierarchy / clangd）。",
-  "version": "0.21.0",
+  "version": "0.22.0",
   "publisher": "Piscespanther",
   "license": "MIT",
   "repository": {
@@ -148,6 +148,13 @@
           "default": "auto",
           "markdownDescription": "调用层级由哪个语言服务提供。\n\n- **自动**：由 VS Code 决定。\n- **clangd**：需同时具备 clangd 扩展与 `clangd` 可执行文件（仅安装 clang 编译器不满足要求），且工程提供 `compile_commands.json` 或 `compile_flags.txt`。\n- **cpptools**：C/C++ 扩展。\n- **不指定引擎**：按符号名范围与光标的距离挑选，多引擎共存时最安全。\n- **自定义**：使用 `cppCallGraph.customEngineId`。\n\n多个语言服务注册在同一个语言 ID 上，扩展无法强制指定；本设置只影响结果的认领与展示标注（另见 `cppCallGraph.enginePickPolicy`）。如需避免互相干扰，可只启用其中一个。"
         },
+        "cppCallGraph.maxLayoutNodes": {
+          "type": "number",
+          "default": 800,
+          "minimum": 100,
+          "maximum": 5000,
+          "markdownDescription": "整张图的**节点总数上限**。超出部分不上图（没有方框），并在输出通道中说明数量。\n\n它同时约束工具栏「展开全部」与「完全展开」的节点预算 —— 超过它的节点画不出来，预算算进去只会白占。数值越大越占内存与渲染时间（实测一次整帧重绘：约 400 个方框 8 毫秒、1200 个约 30 毫秒），建议按需适当调大。"
+        },
         "cppCallGraph.customEngineId": {
           "type": "string",
           "default": "",
@@ -253,7 +260,7 @@
             "宽度允许时显示整条路径"
           ],
           "default": "tail",
-          "markdownDescription": "方框内路径的显示方式。\n\n- **省略**：保留末尾若干层，另保留 `cppCallGraph.pathAnchors` 指定的目录段。\n- **完整**：宽度允许时显示整条路径，放不下时保留首尾。\n\n方框宽度上限为 600px；完整路径始终可在悬停提示中查看，右键「复制地址」复制的也是完整路径。"
+          "markdownDescription": "方框内路径的显示方式。\n\n- **省略**：保留末尾若干层，另保留 `cppCallGraph.pathAnchors` 指定的目录段。\n- **完整**：显示整条路径。\n\n两种方式都**不会截断文字**：要显示的内容有多少，方框就加多宽（画布可横向滚动）。完整路径始终也可在悬停提示中查看，右键「复制地址」复制的同样是完整路径。"
         },
         "cppCallGraph.pathTailLevels": {
           "type": "number",
@@ -261,6 +268,11 @@
           "minimum": 0,
           "maximum": 8,
           "markdownDescription": "「省略」模式下末尾保留的层数（含文件名）。`0` 表示按方框宽度自动。"
+        },
+        "cppCallGraph.pathShowFileName": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "方框里那行路径是否包含最后的**文件名**。关闭后只显示目录部分，`:行号` 仍在；省略、层数与锚点规则照旧作用于目录段。完整路径始终可在悬停提示与右键「复制地址」中查看。"
         },
         "cppCallGraph.pathAnchors": {
           "type": "string",

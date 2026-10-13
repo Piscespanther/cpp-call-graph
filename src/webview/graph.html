@@ -83,6 +83,12 @@
     </div>
     <div id="tabs" class="tabs" role="tablist"></div>
     <!--
+      节点总数上限提示：到上限时两个展开按钮会被置为禁用（它们那时必然无效），
+      这里显示一行说明与两条出路。用内联文字而不是右下角弹窗 —— 本项目明确不要打扰式提示。
+      默认 `hidden`，由 `applyCapacityState()` 按会话数据开关。
+    -->
+    <div id="capacity-hint" class="capacity-hint" role="status" aria-live="polite" hidden></div>
+    <!--
       `#stage` 是**不滚动**的外层：画布在里面滚动，加载遮罩挂在 stage 上。
       遮罩若挂在 `#canvas` 里（滚动容器），内容一滚动它就会跟着滚出可视区，
       正中也只是「内容盒」的正中，而不是眼前这块面板的正中。

@@ -21,8 +21,17 @@ interface GraphNode {
   id: string;
   name: string;
   detail?: string;
-  /** 展开时按 `maxChildrenPerNode` 省略掉的条数（>0 时在悬停提示里说明）。 */
+  /** 展开时省略掉的条数合计（`maxChildrenPerNode` + 节点总数上限），>0 时方框上有标记。 */
   omitted?: number;
+  /** `omitted` 中因节点总数上限（`maxLayoutNodes`）未显示的那部分，用于悬停里区分原因。 */
+  omittedByNodeCap?: number;
+  /**
+   * 已达节点总数上限、但这一格**仍有下一层可展开**（宿主在 atCapacity 时下发）。
+   *
+   * 方案 A：这种方框要有一个**不带数字**的标记（空心环）+ 悬停说明 —— 子节点从未取过，
+   * 条数未知，写数字就是编造。手动点它展开仍然可用（上限只拦住批量展开的预算，不拦单点）。
+   */
+  cappedExpandable?: boolean;
   file: string;
   line: number;
   callSite?: CallSite;
@@ -90,6 +99,10 @@ interface SessionPayload {
   edges: GraphEdge[];
   boxes: Record<string, Box>;
   collapsedCount: number;
+  /** 布局是否已吃满节点总数上限：为真时两个展开按钮置为禁用态并给出原因。 */
+  atCapacity?: boolean;
+  /** 生效的节点总数上限（用于把原因写成具体数字；缺省时不写数字）。 */
+  maxLayoutNodes?: number;
 }
 
 interface SessionSummary {
@@ -117,6 +130,8 @@ interface PathDisplayOptions {
   mode: 'tail' | 'full';
   /** 末尾保留几层（含文件名）；0 = 按字符预算自动（0.20 的行为）。 */
   tailLevels: number;
+  /** 那行路径是否包含最后的文件名（关闭后只显示目录部分）。 */
+  showFileName?: boolean;
   /**
    * 必须显示的目录段，可组合多层；每条模式只保留它自己解析出的那一段。
    * 写法见宿主 `graphLayout.ts` 的同名说明（两侧必须逐字同规则）。
@@ -132,6 +147,8 @@ interface WebviewSettings {
   /** 路径显示方式（见 PathDisplayOptions）。 */
   pathDisplay?: 'tail' | 'full';
   pathTailLevels?: number;
+  /** 那行路径是否包含文件名（关闭后只显示目录部分）。 */
+  pathShowFileName?: boolean;
   pathAnchors?: string[];
 }
 
@@ -287,6 +304,7 @@ const state = {
   pathOptions: {
     mode: 'tail',
     tailLevels: 0,
+    showFileName: true,
     anchors: [],
   } as PathDisplayOptions,
 };
@@ -369,26 +387,22 @@ const NAME_HIT_PAD_X = 2;
 const NAME_HIT_ABOVE = 11;
 const NAME_HIT_HEIGHT = 16;
 
-/** 常量：文字截断上限与方框宽度范围。 */
-const NAME_MAX_CHARS = 30;
+/**
+ * 「省略」模式（`pathTailLevels = 0`）下末尾目录段的字符预算。
+ *
+ * 不是截断上限：它只决定自动档保留几层。显式给了层数或锚点时不受它约束，
+ * 方框宽度会照着完整文字长出来（0.22 起没有宽度上限，见下方说明）。
+ */
 const LOC_MAX_CHARS = 40;
 /** 方框最小宽度：太窄会显得像个方块，且放不下加减号。 */
 const MIN_BOX_WIDTH = 120;
 /**
- * 方框最大宽度：防病态长名把画布撑爆。
+ * ⚠️ 0.22 起**没有方框宽度上限**。
  *
- * 这个值必须**明显大于**「文字上限宽 + 加减号预留」，否则会把方框钳窄，
- * 文字被截断后仍顶到加减号上（曾经取 320 就踩了这个坑，实测压住 0.8px）。
- * 当前文字上限约 40 字符 ≈ 300px，加两侧预留约 320，故取 400 留出余量。
+ * 需求原话：「如果碰到超长函数名或者变量名会直接省略中间的，这是不允许的；
+ * 路径显示全部或层数超过当前宽度时，也要动态增宽保证完整显示」。
+ * 所以这里不再有宽度上限常量，宽度一律按完整文字量出来（画布可横向滚动）。
  */
-/**
- * 方框宽度的上限（与宿主 `graphLayout.ts` 的同名常量必须一致，renderCheck 有等值断言）。
- *
- * ⚠️ 要按**最坏字身**定：路径截断上限 40 个字符（再加 `:行号`），全角字符约 1 倍字号
- * → 最坏 45 个全角 ≈ 540px 文字，加左侧起点 22 与右侧留白 34 共 596px。
- * 用 ASCII 口径的 400 会让全角长路径溢出方框。
- */
-const MAX_BOX_WIDTH = 600;
 /** 几何缺失时的兜底宽度（正常路径下不会用到）。 */
 const DEFAULT_BOX_WIDTH = 200;
 /** 文字右端到加减号之间的最小间隙（保证加减号不压文字）。 */
@@ -403,13 +417,22 @@ const EXPANDER_GAP = 10;
 const WIDTH_SAFETY = 6;
 /** 加减号小方块的宽度（与 ICON_BOX 一致）。 */
 const EXPANDER_BOX = ICON_BOX;
+/** 「已达上限、仍有下一层」警示环的半径（数字那套已按用户要求删除，故不再需要字号常量）。 */
+const OMITTED_MARK_RADIUS = 4;
+/**
+ * 内容尾部余量（右与下各留这么多）：VS Code 的滚动条是**覆盖式**的，浮在内容之上且不占布局空间，
+ * 所以 `clientWidth` 把滚动条底下那一条也算进可视宽度。没有这段余量时，滚到最右/最下仍会被
+ * 滚动条压住十几像素（用户 2026-10-14 的实测反馈：「没到右边底部」其实是被上下拖动条挡住）。
+ */
+const TRAILING_SCROLLBAR_SLACK = 16;
+
 /** 两行文字的字号，与 graph.css 里的 .name / .loc 保持一致（量宽要用）。 */
 const NAME_FONT_SIZE = 13;
 const LOC_FONT_SIZE = 12;
 
-/** 节点上显示的名称（与 renderNode 里的写法保持一致，含循环标记）。 */
+/** 节点上显示的名称（与 renderNode 里的写法保持一致，含循环标记）。全名，不截断。 */
 function nodeNameText(node: GraphNode): string {
-  return `${node.isCycle ? '↻ ' : ''}${truncateMiddle(node.name, NAME_MAX_CHARS)}`;
+  return `${node.isCycle ? '↻ ' : ''}${node.name}`;
 }
 
 /** 节点上显示的「路径:行号」（按设置的路径显示方式，与宿主估宽同一份逻辑）。 */
@@ -430,13 +453,39 @@ function nodeLocText(node: GraphNode): string {
  *
  * ⚠️ 性能：这里每帧要为「每个可见方框的名称 + 路径」各量一次（几百节点 = 上千次），
  * 而每次量宽都会触发一次**强制同步布局**。所以：
- *   ① 结果按「文字 + 字号 + 粗细」缓存（同名元素在后续帧里直接命中，开销归零）；
+ *   ① 结果按「字体族 + 字号 + 粗细 + 文字」缓存（同名元素在后续帧里直接命中，开销归零）；
  *   ② 探测节点常驻复用，不再每次新建 / 挂载 / 摘除（少大量 DOM 变更）。
  * 只缓存**量成功**的结果：退到估算时不缓存，免得一帧的失败被永久记住。
  */
 const MEASURE_CACHE_LIMIT = 4000;
 const measureCache = new Map<string, number>();
 let measureProbe: SVGTextElement | undefined;
+/**
+ * 当前字体族签名（缓存键的一部分）。
+ *
+ * 缓存键以前只有「字号 + 粗细 + 文字」，而字体族是从 `--vscode-font-family` 继承来的：
+ * 用户换字体时字号没变，旧宽度会被继续命中 —— 方框宽度就与文字对不上了。
+ * 每帧 `render()` 开始时清空一次，于是字体一变即失效（旧键不再命中，由 LRU 自然淘汰）。
+ */
+let measureFontSignature: string | undefined;
+
+/** 取探测节点实际生效的字体族；取不到就返回空串（桩里没有 getComputedStyle 也安全）。 */
+function fontSignature(probe: SVGTextElement | undefined): string {
+  if (measureFontSignature !== undefined) {
+    return measureFontSignature;
+  }
+  let family = '';
+  try {
+    const view = probe?.ownerDocument?.defaultView;
+    if (probe && view && typeof view.getComputedStyle === 'function') {
+      family = view.getComputedStyle(probe).fontFamily ?? '';
+    }
+  } catch {
+    family = '';
+  }
+  measureFontSignature = family;
+  return family;
+}
 
 /** 常驻探测节点（挂在 <svg> 下、visibility:hidden，不参与节点/连线的遍历）。 */
 function probeElement(): SVGTextElement | undefined {
@@ -458,12 +507,12 @@ function measureTextWidth(text: string, fontSize: number, bold: boolean): number
   if (!text) {
     return 0;
   }
-  const key = `${fontSize}|${bold ? 'b' : 'n'}|${text}`;
+  const probe = probeElement();
+  const key = `${fontSignature(probe)}|${fontSize}|${bold ? 'b' : 'n'}|${text}`;
   const cached = measureCache.get(key);
   if (cached !== undefined) {
     return cached;
   }
-  const probe = probeElement();
   let measured = 0;
   if (probe) {
     probe.setAttribute('font-size', `${fontSize}px`);
@@ -529,7 +578,8 @@ function measureBoxWidth(node: GraphNode): number {
     : 0;
   const content = Math.max(nameWidth, locWidth);
   const total = TEXT_X + content + EXPANDER_GAP + EXPANDER_BOX + ICON_X + WIDTH_SAFETY;
-  return Math.min(MAX_BOX_WIDTH, Math.max(MIN_BOX_WIDTH, Math.ceil(total)));
+  // 不设上限：文字有多宽、方框就有多宽（0.22 起不许截断）
+  return Math.max(MIN_BOX_WIDTH, Math.ceil(total));
 }
 
 /**
@@ -789,11 +839,18 @@ function reanchor(session: SessionPayload): void {
   }
   const dx = bounds.x - previous.x;
   const dy = bounds.y - previous.y;
+  // 补偿方向：viewBox 原点增大 dx 时，同一个内容点在屏幕上的位置会**左移** dx
+  // （屏幕位置 = 内容坐标 − 原点 − 滚动量），所以滚动量要**减去** dx 才能抵消。
+  // ⚠️ 原实现写的是 `+= dx`，方向反了 —— 一旦原点真的会动，等于把位移加倍。
+  //
+  // ⚠️ 目前 `contentBounds()` 的原点恒为负的留白量：根固定在第 0 列、最上方那条子链的 y 恒为 0，
+  // 与展开/收起哪些节点无关，因此 dx = dy = 0，这段补偿实际不会执行。
+  // 保留它是为了原点将来会动时不至于跳动，方向按上面的推导已修正。
   if (dx !== 0) {
-    canvasEl.scrollLeft += dx;
+    canvasEl.scrollLeft -= dx;
   }
   if (dy !== 0) {
-    canvasEl.scrollTop += dy;
+    canvasEl.scrollTop -= dy;
   }
 }
 
@@ -801,6 +858,263 @@ function activeSession(): SessionPayload | undefined {
   return state.activeId ? state.sessions.get(state.activeId) : undefined;
 }
 
+// ------------------------------------------------------------ 相机：展开/收起后的滚动
+
+/**
+ * 点击 `+` / `−` 时记下的相机动作，等新一帧（本地重排或宿主 `sessionUpdate`）后执行。
+ *
+ * 用户需求（0.22）：
+ *   ① 收起某一级后，把该方框滚到视口**垂直中央**；
+ *   ② 在右边缘继续展开时，自动把内容整体左移，完整显示新一级；
+ *   ③ 新一级比视口还宽（极端长方框）时，**以最左侧为基准**显示被展开的那一级；
+ *   ④ 收起时横向滑回上一个展开前的位置（即展开的逆过程）。
+ */
+interface CameraIntent {
+  kind: 'expand' | 'collapse';
+  sessionId: string;
+  nodeId: string;
+  /** 点击时该方框的**屏幕**坐标：之后每帧按绝对目标还原它，保证幂等（不会重复补偿）。 */
+  screenXBefore: number;
+  screenYBefore: number;
+  /** 记下的时刻：宿主迟迟不回消息时不至于在很久之后突然跳一下。 */
+  at: number;
+}
+
+/** 内容与视口边缘之间留的余量。 */
+const CAMERA_PADDING = 12;
+/** 相机动作的过期时间。 */
+const CAMERA_STALE_MS = 2000;
+/**
+ * 相机动作的重放窗口。
+ *
+ * ⚠️ 一次展开会来**两帧**：第一帧的方框宽度是宿主**估算**的，webview 量准后回传
+ * `reportWidths`，宿主再用实测宽度重排一次。只在第一帧调整滚动量，第二帧列位置一变
+ * 右边就又被切掉一点（用户实测反馈「还得自己拖一下横条」）。所以在窗口内**每帧重放**；
+ * 补偿与显露都是幂等的（同一布局重放不会叠加位移）。
+ */
+const CAMERA_REPLAY_MS = 800;
+let cameraIntent: CameraIntent | undefined;
+/** 已应用过的重放窗口截止时刻（0 表示没有活动动作）。 */
+let cameraReplayUntil = 0;
+
+/** 记一次相机动作（在点击处调用，读的是点击时的坐标）。 */
+function startCameraIntent(
+  kind: 'expand' | 'collapse',
+  sessionId: string,
+  nodeId: string
+): void {
+  const box = state.sessions.get(sessionId)?.boxes[nodeId];
+  cameraIntent = {
+    kind,
+    sessionId,
+    nodeId,
+    // ⚠️ 记**屏幕**坐标而不是内容坐标：重放窗口里会按绝对目标反复应用，
+    // 用内容位移做增量补偿会被叠加两次（表现是「收起时抖一下、然后位置偏了」）。
+    screenXBefore: box ? box.x - canvasEl.scrollLeft : Number.NaN,
+    screenYBefore: box ? box.y - canvasEl.scrollTop : Number.NaN,
+    at: Date.now(),
+  };
+  cameraReplayUntil = Date.now() + CAMERA_REPLAY_MS;
+  // 相机已整体停用（见 applyCameraIntent 的说明）：这里的动作只被记录，不会移动视口。
+  void cameraReplayUntil;
+  void revealNewLevel;
+  void centerChainSpan;
+}
+
+/**
+ * 平移视口。
+ *
+ * 有 `scrollTo` 就用**平滑滚动**：收起/展开会让内容整体位移，瞬时跳变时用户会找不到
+ * 自己刚才在看的方框，平滑滚动让位移可被眼睛跟随。测试桩没有 `scrollTo`，走直接赋值
+ * （所以用例断言的是**目标值**与「屏幕位置不变」这条性质，动画本身不断言）。
+ */
+function panTo(left: number, top: number): void {
+  // ⚠️ 必须夹在**当前可滚动范围**内：平滑滚动的目标是按内容坐标算的，而重排可能让内容变窄
+  // （实测宽度回传后的第二帧常比宿主估算的窄），此时视口会滑到内容之外 —— 那块没有绘制，
+  // 深色主题下就是一块黑（用户实测反馈「右边有一块像没渲染出来」）。
+  const clamp = (value: number, limit: number | undefined): number => {
+    const rounded = Math.max(0, Math.round(value));
+    return Number.isFinite(limit) && (limit as number) > 0
+      ? Math.min(rounded, limit as number)
+      : rounded;
+  };
+  const nextLeft = clamp(left, canvasEl.scrollWidth - canvasEl.clientWidth);
+  const nextTop = clamp(top, canvasEl.scrollHeight - canvasEl.clientHeight);
+  if (nextLeft === canvasEl.scrollLeft && nextTop === canvasEl.scrollTop) {
+    return;
+  }
+  const scrollTo = (canvasEl as unknown as { scrollTo?: (options: ScrollToOptions) => void })
+    .scrollTo;
+  if (typeof scrollTo === 'function') {
+    scrollTo.call(canvasEl, { left: nextLeft, top: nextTop, behavior: 'smooth' });
+  } else {
+    canvasEl.scrollLeft = nextLeft;
+    canvasEl.scrollTop = nextTop;
+  }
+}
+
+/*
+ * 【已删除的「重排淡入」，留档以免重蹈覆辙】
+ *
+ * 曾经在点击展开/收起时把 `#nodes` / `#edges` 压到 0.3 不透明度，等相机动作那一帧再淡回，
+ * 用来弱化「内容瞬移」的硬切感。2026-10-13 出事：**淡回只写在相机执行路径上**，那一帧没来
+ * （会话 id 不匹配 / 动作过期 / 途中抛异常）时图层就永久停在暗态，用户看到整幅图发黑。
+ * 因此整套删掉（连同 `graph.css` 里那条 `transition: opacity`）。
+ *
+ * 若将来要恢复这类「自愈式」的视觉过渡，必须满足：副作用的解除**不依赖另一段代码一定跑到**
+ * —— 例如压暗时同时挂一个兜底定时器。C2 的位移动画就是按这个原则重做的（见「粘性位移的逐帧插值」）。
+ */
+
+/** 让被点的方框在屏幕上原地不动：按**绝对目标**算视口位置（幂等，重放不会叠加）。 */
+function compensatedView(session: SessionPayload, intent: CameraIntent): { left: number; top: number } {
+  const box = session.boxes[intent.nodeId];
+  if (!box) {
+    return { left: canvasEl.scrollLeft, top: canvasEl.scrollTop };
+  }
+  return {
+    left: Number.isFinite(intent.screenXBefore) ? box.x - intent.screenXBefore : canvasEl.scrollLeft,
+    top: Number.isFinite(intent.screenYBefore) ? box.y - intent.screenYBefore : canvasEl.scrollTop,
+  };
+}
+
+/** 展开：先让被点的方框原地不动，再最小位移地让新一级露出来。 */
+function revealNewLevel(session: SessionPayload, intent: CameraIntent): void {
+  const parent = session.boxes[intent.nodeId];
+  const children = (session.nodes[intent.nodeId]?.children ?? [])
+    .map((id) => session.boxes[id])
+    .filter((box): box is NonNullable<typeof box> => box !== undefined);
+  const view = compensatedView(session, intent);
+  // ⚠️ 横向只允许**右移**，且不做「把被点方框按回原位」的补偿：
+  // 那个补偿会把视口往左推，与「把新一级露出来」的右移方向相反 —— 用户实测到的
+  // 「第三级整个往右跳一下再回来」与「最右侧展开却没有滚到最右边」都是这两股运动叠加的结果。
+  // 横向的唯一动作者就是本函数下面的显露逻辑（用户 2026-10-14 确认的口径）。
+  view.left = canvasEl.scrollLeft;
+  // ⚠️ 粘性父框开着时，纵向**完全交给粘性**：它会把被展开的父框用 transform 拉到视口中央，
+  // 而相机若再用滚动去锁它的屏幕位置，两次运动叠加 → 用户看到整行「大幅抖一下」（视疲劳）。
+  // 所以这里连同**位置补偿**一起撤掉，只保留横向的显露。
+  if (state.stickyParent) {
+    view.top = canvasEl.scrollTop;
+  }
+  if (!parent || children.length === 0) {
+    panTo(view.left, view.top);
+    return;
+  }
+  const levelLeft = Math.min(...children.map((box) => box.x));
+  const levelRight = Math.max(...children.map((box) => box.x + box.width));
+  const levelTop = Math.min(...children.map((box) => box.y));
+  const viewportWidth = canvasEl.clientWidth;
+  const viewportHeight = canvasEl.clientHeight;
+
+  if (viewportWidth > 0 && levelRight + CAMERA_PADDING > view.left + viewportWidth) {
+    // 最小必要量：让最右的新方框刚好进来
+    const wanted = levelRight + CAMERA_PADDING - viewportWidth;
+    // ⚠️ 「父框可见」只在**新一级放不下**时才是硬约束：那种情况下不再追求把整级露完，
+    // 而是把父框贴到左边缘、从它右侧尽量多露出新一级，其余交给横向滚动条。
+    // 放得下时若也套这条约束，正常情形反而看不全新一级。
+    const tooWide = levelRight - levelLeft > viewportWidth - CAMERA_PADDING * 2;
+    const limit = tooWide ? Math.max(0, parent.x - CAMERA_PADDING) : wanted;
+    view.left = Math.max(view.left, Math.min(wanted, limit));
+  }
+
+  // ⚠️ 粘性父框开着时**不动纵向**：那条不变式是「被展开的父框钉在视口中央」，
+  // 由 sticky 逻辑负责；这里再插一手会把它的位移算乱（renderCheck 里有用例钉住）。
+  if (!state.stickyParent && viewportHeight > 0) {
+    const viewTop = view.top;
+    const viewBottom = viewTop + viewportHeight;
+    // 父框优先保持可见；新一级只保证**起点**可见（同列纵向堆叠，滚一下就能看全），
+    // 否则子节点一多就会为了「全看到」而做一次很大的纵向位移。
+    if (parent.y + parent.height + CAMERA_PADDING > viewBottom) {
+      view.top = parent.y + parent.height + CAMERA_PADDING - viewportHeight;
+    } else if (parent.y - CAMERA_PADDING < viewTop) {
+      view.top = Math.max(0, parent.y - CAMERA_PADDING);
+    } else if (levelTop - CAMERA_PADDING < viewTop) {
+      view.top = Math.max(0, levelTop - CAMERA_PADDING);
+    }
+  }
+  panTo(view.left, view.top);
+}
+
+/**
+ * 收起：横向让该级在屏幕上原地不动，**纵向把它滚到视口中央**。
+ *
+ * 用户原始需求就是「某一级收起后垂直居中到这个级」，实测也印证：只锁位置时，
+ * 若同级还有别的方框，收起后它停在半空、看着像「抖了一下还偏了」。
+ * 纵向用**绝对目标**（居中），因此重放多少次结果都一样，不会叠加位移。
+ */
+/*
+ * 【已删除的「折叠后把该格滚到视口中央」】留档：用户 2026-10-14 反馈「折叠的时候本标签还会弹一下」。
+ * 那个做法与粘性位移叠加成两股反向运动，所以整套去掉 —— 折叠后的纵向定位改由
+ * `centerChainSpan()` 统一负责（链跨度居中、单一权威）。
+ */
+
+/**
+ * 执行待处理的相机动作。
+ *
+ * 口径（2026-10-14 用户确认）：
+ *   - **展开**：调用 `revealNewLevel()` —— 用户早先明确要的「右侧新内容被切时自动带进视野」；
+ *   - **折叠**：**不动视口**。曾试过「折叠后把该格滚到中央」，用户反馈「一收就弹一下」，
+ *     已去掉；位置由粘性父框负责。
+ *   - **链跨度居中那套不做**（用户 2026-10-14 明确：那一版不做）。
+ * 粘性位移的逐帧插值（C2）保持开启，负责把布局重排造成的位移平滑过渡。
+ */
+function applyCameraIntent(session: SessionPayload): void {
+  const intent = cameraIntent;
+  if (!intent) {
+    return;
+  }
+  if (intent.sessionId !== session.id || Date.now() - intent.at > CAMERA_STALE_MS) {
+    cameraIntent = undefined;
+    return;
+  }
+  cameraIntent = undefined;
+  if (intent.kind === 'expand') {
+    revealNewLevel(session, intent);
+  }
+  // 折叠：有意什么都不做（见上）。
+}
+
+/**
+ * 把「根 → 被操作的那一格」这条**调用链的纵向跨度**居中到视口（用户 2026-10-14 选定的口径）。
+ *
+ * 为什么用滚动而不是粘性位移：
+ *   - 链上各格分布在不同列、不同 y，粘性位移（只能在本子树空挡内滑动）**无法表达**这条链，
+ *     所以靠近内容顶/底时用粘性永远居中不了；
+ *   - 用滚动则是无条件可达的（受内容范围夹取），而且**一次操作只有一种运动** → 不会回弹。
+ *
+ * 实现约束：本函数在冻结粘性位移（`stickyFrozenUntil`）之后调用，且**不做插值动画**
+ * （瞬时到位），保证「一个机制、一次到位」。
+ */
+function centerChainSpan(session: SessionPayload, nodeId: string): void {
+  const chain: string[] = [];
+  let cursor: string | undefined = nodeId;
+  let guard = 0;
+  while (cursor !== undefined && guard < 10000) {
+    const box = session.boxes[cursor];
+    if (box) {
+      chain.push(cursor);
+    }
+    cursor = session.nodes[cursor]?.parent;
+    guard += 1;
+  }
+  if (chain.length === 0) {
+    return;
+  }
+  const tops = chain.map((id) => session.boxes[id].y);
+  const bottoms = chain.map((id) => session.boxes[id].y + session.boxes[id].height);
+  const spanTop = Math.min(...tops);
+  const spanBottom = Math.max(...bottoms);
+  const viewportHeight = Number(canvasEl.clientHeight) || 0;
+  if (viewportHeight <= 0) {
+    return;
+  }
+  // 冻结粘性并把显示位移清零：这一帧的方框按布局原样摆，纵向定位只由滚动负责
+  stickyFrozenUntil = Date.now() + CAMERA_FREEZE_MS;
+  stopStickyAnimation();
+  displayedShifts = new Map();
+  lastPaintedTotal = new Map();
+  const wanted = (spanTop + spanBottom) / 2 - viewportHeight / 2;
+  canvasEl.scrollTop = Math.max(0, wanted);
+}
 function collapsedSet(sessionId: string): Set<string> {
   let set = state.collapsed.get(sessionId);
   if (!set) {
@@ -1099,6 +1413,9 @@ function shortEngine(label: string): string {
 let pendingExpandAll: string | undefined;
 
 function render(): void {
+  // 每帧重取一次字体签名：用户换了编辑器字体（--vscode-font-family）而字号未变时，
+  // 量宽缓存必须失效，否则方框宽度会按旧字体算。
+  measureFontSignature = undefined;
   const session = activeSession();
   renderTabs();
 
@@ -1140,13 +1457,38 @@ function render(): void {
   // 宿主只在宽度变化时才重排，因此这里每帧回报也不会死循环。
   reportMeasuredWidths(session);
 
+  // 位移插值只用于**几何真的变了**的帧（展开/收起、实测宽度回传后的重排）：
+  // 改设置（例如重新打开粘性）不该有 180ms 的过渡，否则「打开设置后立刻居中」这条
+  // 既有的不变式会被动画拖慢（renderCheck 里有断言钉住）。放在量宽之后，
+  // 因为宽度也是几何的一部分 —— 第二帧（实测宽度）正需要动画。
+  const signature = geometrySignature(session);
+  if (signature !== lastGeometrySignature) {
+    lastGeometrySignature = signature;
+    beginLayoutStickyAnimation(session);
+  } else if (animFrame === undefined && animFrom === undefined) {
+    // ⚠️ 同一几何常常会连着渲染两帧（宿主回传宽度、相机执行都会再 render 一次）。
+    // 那时**不能落位**：落位会把正在跑的插值当场结束（表现就是「还是瞬移」）。
+    snapStickyShifts();
+  }
+  // 几何没变、但动画在自己的窗口内：不动它（由 tick 续帧）。
+  // ⚠️ 动画过期后**必须落位而不是只停掉**：只 stop 会把 `displayedShifts` 留在插值中间值上，
+  // 于是展开后的方框永远差一点没居中（2026-10-14 用户实测「展开某个节点时当前节点不居中了」）。
+  // `snapStickyShifts()` 会同时停动画并把显示值落成目标值。
+  else if (Date.now() - animStart >= ANIM_DURATION_MS + 100) {
+    snapStickyShifts();
+  }
+
   // 视口（见最上方「视口模型」的说明）：
   //   SVG 元素尺寸 = viewBox 尺寸 = 内容尺寸，1 内容单位恒等于 1 像素。
   //   没有缩放功能，平移交给滚动条；界面尺寸永远与实际像素 1:1。
   const view = readView(session);
   const contentSize = contentBounds(session);
-  const width = Math.max(1, contentSize.width);
-  const height = Math.max(1, contentSize.height);
+  // 尾部余量：VS Code 的滚动条是**覆盖式**的（浮在内容上、不占布局空间），`clientWidth` 把
+  // 滚动条底下那一条也算作可视宽度 —— 于是「对准右边缘」的内容会被滚动条压住十几像素，
+  // 看起来就是「没滚到最右边」（用户 2026-10-14 实测反馈）。给内容加尾部余量，
+  // 最右侧/最下方的方框就能滚到滚动条之外。
+  const width = Math.max(1, contentSize.width + TRAILING_SCROLLBAR_SLACK);
+  const height = Math.max(1, contentSize.height + TRAILING_SCROLLBAR_SLACK);
   svgEl.setAttribute('viewBox', `${view.x} ${view.y} ${width} ${height}`);
   svgEl.setAttribute('width', String(width));
   svgEl.setAttribute('height', String(height));
@@ -1219,6 +1561,8 @@ function renderNode(
       node.depth === 0 ? 'root' : '',
       node.isCycle ? 'cycle' : '',
       selected ? 'selected' : '',
+    // 最后点过加减号的格子带上粉框（持久）：折叠时一眼看出操作的是谁（用户 2026-10-14 要求）
+    isExpanderTarget(session.id, node.id) ? 'expander-active' : '',
       searchState.hits.has(node.id) ? 'match' : '',
       currentMatchId() === node.id ? 'match-current' : '',
     ]
@@ -1226,13 +1570,16 @@ function renderNode(
       .join(' '),
     // 链上节点各自带上自己的粘性位移：纵向滚动时它们都停在视口垂直中央（见「粘性父框」一节）
     transform: `translate(${position.x} ${position.y + stickyShiftOf(node.id)})`,
-    'data-node': node.id,
-    // 键盘可达：方框进 Tab 序列；回车跳转、空格选中（见下面的 keydown 处理）。
+    'data-node': node.id,    // 键盘可达：方框进 Tab 序列；回车跳转、空格选中（见下面的 keydown 处理）。
     tabindex: '0',
     role: 'button',
     'aria-label': `${node.name}，${node.file}:${node.line}，回车键跳转，空格键选中`,
     'aria-pressed': selected ? 'true' : 'false',
   });
+  // 记下这一帧这一格画出来的**总绘制 y**：它是下一次布局插值的起点。
+  // ⚠️ 少了这一步，布局帧上 `lastPaintedTotal` 是空的，插值起点只能回落到目标 → 永远不动
+  // （C2 前一版就是这样：闸门开着、诊断却始终显示「send 后 = 终点」）。
+  lastPaintedTotal.set(node.id, position.y + stickyShiftOf(node.id));
 
   // 键盘操作：与鼠标的单击（选中）与双击（跳转）等价。
   // ⚠️ 展开/收起目前仍只能用鼠标点加减号（那条路径要经 pointer.expandTarget + window 的
@@ -1284,6 +1631,12 @@ function renderNode(
   const title = svg('title', {});
   title.textContent = buildTooltip(node);
   group.appendChild(title);
+
+  // 「还有多少同级节点没显示」的可见标记（小圆点 + +N）
+  const omittedMark = buildOmittedMark(node, { width: geometry.width, height: boxHeight });
+  if (omittedMark) {
+    group.appendChild(omittedMark);
+  }
 
   // 单击选中、双击跳转（按需求：单击不再打开文件）。
   //
@@ -1463,21 +1816,67 @@ function buildSignShape(mode: ExpanderMode): SVGGElement {
 /** 悬停提示：只保留函数名、完整路径、位置行数。 */
 function buildTooltip(node: GraphNode): string {
   const lines = [node.name, `${node.file}:${node.line}`];
-  // 按设置截断过就在悬停提示里说明（方框里不加东西，避免影响布局）
-  if (node.omitted && node.omitted > 0) {
-    lines.push(`（另有 ${node.omitted} 条未显示，受 maxChildrenPerNode 限制）`);
+  // 省略条数除了这里的文字，方框右下角还有个可见标记（见 buildOmittedMark）。
+  // ⚠️ 两种原因必须分开写：合并成一个数字，用户不知道该调 maxChildrenPerNode 还是 maxLayoutNodes。
+  const total = node.omitted ?? 0;
+  if (total > 0) {
+    const byNodeCap = Math.min(total, Math.max(0, node.omittedByNodeCap ?? 0));
+    const byChildrenCap = total - byNodeCap;
+    if (byChildrenCap > 0) {
+      lines.push(`（另有 ${byChildrenCap} 条未显示，受 maxChildrenPerNode 限制）`);
+    }
+    if (byNodeCap > 0) {
+      lines.push(
+        `（另有 ${byNodeCap} 条未显示，因节点总数上限 maxLayoutNodes 未排布；可在设置中调大上限）`
+      );
+    }
+  }
+  // 方案 A：到上限且这一格仍有下一层可展开 —— 悬停里如实说明「数量未知、原因是什么」
+  if (node.cappedExpandable === true && total === 0) {
+    lines.push(
+      '（仍有下一层未展开，但已达节点总数上限；可在设置中调大 maxLayoutNodes，' +
+        '或先收起部分分支后重试）'
+    );
   }
   return lines.join('\n');
 }
 
-/** 从中间截断，保留首尾，适合函数名（如 veryLongFunctionName → veryLong…Name）。 */
-function truncateMiddle(text: string, max: number): string {
-  if (text.length <= max) {
-    return text;
+/**
+ * 方框右下角的「还有未显示的同级节点」标记：一个小圆点 + `+N`。
+ *
+ * 需求（0.22）原话：省略条数只在悬停提示里说不够，要在方框上给个更醒目的标记。
+ * 位置选**右下角**：右侧那一条留白本来就是给加减号预留的，而加减号在第一行，
+ * 第二行右边是空的，所以这里不会压到名称或路径。
+ *
+ * ⚠️ 不用 codicon：合规计数已用满（31 条），圆点与数字都是直接画的几何/文字。
+ */
+function buildOmittedMark(
+  node: GraphNode,
+  geometry: { width: number; height: number }
+): SVGElement | undefined {
+  // 方案 A（用户 2026-10-14 选定，并明确要求**去掉**原先的「小圆点 + 数字」那套）：
+  // 只有一种标记 —— 到节点总数上限、且这一格**仍有下一层可展开**时，画一个不带数字的虚线环。
+  // 不写数字的理由：那些子节点从未取过、条数未知，编一个数字就是撒谎。
+  if (node.cappedExpandable !== true) {
+    return undefined;
   }
-  const head = Math.ceil((max - 1) / 2);
-  const tail = Math.floor((max - 1) / 2);
-  return `${text.slice(0, head)}…${text.slice(text.length - tail)}`;
+  const mark = svg('g', { class: 'omitted-mark capped-mark' });
+  const ringY = geometry.height - OMITTED_MARK_RADIUS - 5;
+  const ringX = geometry.width - OMITTED_MARK_RADIUS - 22;
+  mark.appendChild(
+    svg('circle', {
+      class: 'capped-ring',
+      cx: ringX,
+      cy: ringY,
+      r: OMITTED_MARK_RADIUS,
+    })
+  );
+  const tip = svg('title', {});
+  tip.textContent =
+    '仍有下一层未展开，但已达节点总数上限（可在设置中调大 cppCallGraph.maxLayoutNodes，' +
+    '或先收起部分分支后重试）';
+  mark.appendChild(tip);
+  return mark;
 }
 
 /**
@@ -1486,30 +1885,40 @@ function truncateMiddle(text: string, max: number): string {
  * ⚠️ 与宿主 `graphLayout.ts` 的 `displayPathText` **必须逐字同步**：宿主用同一份逻辑估宽，
  * 两边算出的字符串一旦不同，列宽与实际文字就对不上（renderCheck 有跨侧等值断言）。
  *
- * - `full`：整条放得下就用整条；放不下则保留首尾（首部是能区分 chip/board 的那几段，
- *   尾部是文件名）—— 完整路径始终在悬停提示里。
+ * - `full`：整条原样显示（不截断，方框按完整路径加宽）。
  * - `tail`：末尾窗口（固定层数，或 `tailLevels = 0` 时按字符预算，即 0.20 的行为）+ 锚点段；
- *   锚点优先保留，窗口放不下时先缩窗口。
+ *   只有自动档会为了塞进预算而缩窗口，显式给了层数或锚点时一律完整显示。
  */
 function displayPathText(file: string, options: PathDisplayOptions, max: number): string {
-  const parts = file.split(/[\\/]/).filter((part) => part.length > 0);
-  if (parts.length <= 1) {
+  const segments = file.split(/[\\/]/).filter((part) => part.length > 0);
+  if (segments.length <= 1) {
     return file;
   }
+  // 只有显式传 false 才去掉文件名（未设置时按显示处理）
+  const keepFileName = options.showFileName !== false;
   if (options.mode === 'full') {
-    return file.length <= max ? file : truncateMiddle(file, max);
+    // 完整显示就是要整条：不截断，方框按完整文字宽度长出来；
+    // 关掉文件名时去掉最后一段（若因此为空则仍显示原名，避免那行只剩 `:12`）
+    const kept = keepFileName ? segments : segments.slice(0, -1);
+    return kept.length > 0 ? kept.join('/') : file;
   }
+  // 省略模式只对目录段做省略：关掉文件名时先摘掉文件名那一段
+  const dirs = keepFileName ? segments : segments.slice(0, -1);
+  const parts = dirs.length > 0 ? dirs : segments;
 
   const anchors = resolveAnchorIndexes(parts, options.anchors);
   let tailCount =
     options.tailLevels > 0
       ? Math.min(options.tailLevels, parts.length)
       : budgetTailCount(parts, max);
-  while (tailCount > 1 && assemblePath(parts, anchors, tailCount).length > max) {
-    tailCount -= 1;
+  // 只在自动档缩窗口；显式给了层数或锚点时用户要的就是那些段，缩了等于不显示
+  if (options.tailLevels <= 0) {
+    while (tailCount > 1 && assemblePath(parts, anchors, tailCount).length > max) {
+      tailCount -= 1;
+    }
   }
-  const text = assemblePath(parts, anchors, tailCount);
-  return text.length <= max ? text : truncateMiddle(file, max);
+  // 不截断：超出预算的长度由方框加宽容纳
+  return assemblePath(parts, anchors, tailCount);
 }
 
 /**
@@ -1639,7 +2048,13 @@ window.addEventListener('mouseup', () => {
     const { sessionId, nodeId, mode } = pointer.expandTarget;
     pointer.expandTarget = undefined;
     if (mode === 'collapse') {
+      // 点加减号时把「亮粉色框」留在这一格（用户要求：折叠时能看清操作的是谁）。
+      // 只记状态，不动选中（白框）与悬停语义。
+      rememberExpanderTarget(sessionId, nodeId);
       collapsedSet(sessionId).add(nodeId);
+      // 相机：让被收起的那一级在屏幕上**原地不动**（内容消失但视线不丢），
+      // 位移用平滑滚动，眼睛能跟上；坐标要等宿主的重排结果，所以收到 sessionUpdate 再执行。
+      startCameraIntent('collapse', sessionId, nodeId);
       // 收起状态变了：让宿主按「收起的子树不占高度」重算一次坐标
       postCollapsed(sessionId);
       render();
@@ -1650,8 +2065,10 @@ window.addEventListener('mouseup', () => {
         if (node.loaded) {
           // 数据已有，只是被收起过：直接展开，不需要再问语言服务
           collapsedSet(sessionId).delete(nodeId);
+          startCameraIntent('expand', sessionId, nodeId);
           postCollapsed(sessionId);
           render();
+          applyCameraIntent(session);
         } else {
           state.loading.add(loadingKey(sessionId, nodeId));
           // 超时兜底：宿主在「会话已关闭」等异常路径下**不会回任何消息**
@@ -1665,6 +2082,9 @@ window.addEventListener('mouseup', () => {
           // 以被点的方框为基准，展开后它不要在屏幕上跳动。
           // （粘性父框开着时，紧接着这一帧会把它钉到视口中央 —— 以那条不变式为准；
           //   关掉设置或内容本来就不高时，才由这里保住它的屏幕位置。）
+          // 新一级回来后由相机动作把它露出来（见 applyCameraIntent）。
+          rememberExpanderTarget(sessionId, nodeId);
+          startCameraIntent('expand', sessionId, nodeId);
           anchorOn(session, nodeId);
           post({ type: 'expand', sessionId, nodeId });
           render();
@@ -1821,8 +2241,20 @@ let stickyShifts = new Map<string, number>();
 /** 会被粘性位移影响的可见连线：位移一变就得重画它们。 */
 let stickyEdges: Array<{ path: SVGPathElement; from: string; to: string }> = [];
 
-/** 某个节点这一帧的粘性位移（没被钉住就是 0）。 */
+/**
+ * 某个节点这一帧**显示**的粘性位移（没被钉住就是 0）。
+ *
+ * ⚠️ 返回的是 `displayedShifts` 而不是 `stickyShifts`（目标值）：方框的 transform 与连线的
+ * 锚点都读这个函数，所以插值动画只需要在这里反映出来，其余渲染路径一行都不用改。
+ */
 function stickyShiftOf(nodeId: string): number {
+  // ⚠️ 动画**不在跑时一律用目标位移**（0.21.0 的语义）。0.22 早先无条件读 `displayedShifts`，
+  // 于是只要有一条路径没更新那张表（滚动帧走「动画中」分支、布局帧提前返回、冻结窗口等），
+  // 位置就停在旧值上 —— 用户实测的「展开多级后滑不到与下一级平齐」正是这个：
+  // **0.21.0 可以，0.22 不行**，说明是我加的这层间接造成的，而不是布局/空挡的限制。
+  if (animFrame !== undefined || animFrom !== undefined) {
+    return displayedShifts.get(nodeId) ?? 0;
+  }
   return stickyShifts.get(nodeId) ?? 0;
 }
 
@@ -1950,9 +2382,29 @@ function computeStickyShifts(session: SessionPayload): Map<string, number> {
 }
 
 /** 重算这一帧「钉住哪些方框、各自移多少」。渲染前与滚动时都走这里。 */
+/**
+ * 展开/收起后「冻结粘性位移」的时长。
+ *
+ * 用户 2026-10-14 定的硬约束：**同一次操作只允许一个机制动视口**。回弹的根因就是
+ * 粘性用 transform 把内容往下推、相机又用滚动往上拉，两股运动方向相反。
+ * 所以操作后这段时间内粘性位移视为 0，只由滚动把「链的跨度」居中；之后粘性再按新滚动位置接管。
+ */
+const CAMERA_FREEZE_MS = 400;
+let stickyFrozenUntil = 0;
+
 function refreshSticky(session: SessionPayload): void {
   stickyPinned = stickyPinnedIds(session);
-  stickyShifts = stickyEnabled(session) ? computeStickyShifts(session) : new Map<string, number>();
+  const frozen = Date.now() < stickyFrozenUntil;
+  stickyShifts =
+    !frozen && stickyEnabled(session) ? computeStickyShifts(session) : new Map<string, number>();
+  // ⚠️ 目标一变就**同步给正在跑的动画**：否则动画继续朝启动时的**过期目标**收敛，误差正好是
+  // 「Δ视口高度 / 2」—— 用户实测的「窗口拉得越扁越能对上」就是这条（2026-10-14）。
+  // 同步后：目标每变一次，动画下一帧就朝新目标走；结束那一帧落成目标值，因此静止时与 0.21.0 一致。
+  if (animFrom !== undefined) {
+    animTarget = new Map(
+      Object.entries(session.boxes).map(([id, box]) => [id, box.y + (stickyShifts.get(id) ?? 0)])
+    );
+  }
 }
 
 /**
@@ -2024,8 +2476,216 @@ function scheduleStickyFrame(): void {
   });
 }
 
+/**
+ * 最近点过加减号的方框（用户 2026-10-14 要求）：**亮粉色框留在这一格**，便于折叠时确认操作的是谁。
+ *
+ * 与已有两种状态刻意区分、互不干扰：
+ *   - 悬停（`.node:hover .box`）是瞬时的，鼠标移开就没了；
+ *   - 选中（`selected`，亮白框）只由「单击方框」或「空格」改变。
+ * 这里只记住「最后操作的那一格」，点别的加减号即转移，不触碰选中状态。
+ */
+let lastExpanderTarget: { sessionId: string; nodeId: string } | undefined;
+
+function rememberExpanderTarget(sessionId: string, nodeId: string): void {
+  lastExpanderTarget = { sessionId, nodeId };
+}
+
+/** 该方框是否是「最后点过加减号」的那一格（仅对当前会话有效）。 */
+function isExpanderTarget(sessionId: string, nodeId: string): boolean {
+  return lastExpanderTarget?.sessionId === sessionId && lastExpanderTarget.nodeId === nodeId;
+}
+
 /** 上一次写进 transform 的字符串：没变就不写 DOM（写 attribute 会触发重新布局）。 */
 const lastStickyTransform = new WeakMap<Element, string>();
+/** 上一次写进连线 `d` 的字符串：逐帧动画里绝大多数连线没变，白写会重算整条路径。 */
+const lastStickyPath = new WeakMap<SVGPathElement, string>();
+
+// ------------------------------------------------------------ 粘性位移的逐帧插值（C2）
+
+/**
+ * 为什么需要插值：粘性把「已展开下一层的父框」钉在视口中央，而展开一级会让它的子链变高 →
+ * 居中位移量随之改变 → 整行连同后面的内容**瞬间平移**。连开多级就是连续跳，很伤眼睛
+ * （用户实测反馈）。这里把位移在 ~180ms 内插值过去，连线用同一个插值后的位移重算 `d`，
+ * 所以方框与连线是一起动的 —— 只动方框会变成「框在动、线在跳」，比不动更糟。
+ *
+ * 实现要点：`stickyShiftOf()` 是**唯一**的显示位移来源（方框 transform 与连线锚点都读它），
+ * 所以只要让它返回插值中的值，其余代码一行都不用改。
+ */
+const ANIM_DURATION_MS = 180;
+/**
+ * 超过这么多可见方框就**不插值**（直接落位）。
+ *
+ * 逐帧重画要改每个方框的 transform 与每条连线的 `d`，成本随可见方框数线性增长；大图上
+ * 掉帧比瞬移更难受。250 是「开到最大档位仍远低于每帧 4ms 预算」的经验值，
+ * 实测口径见 renderCheck 的逐帧计时探针。
+ */
+const ANIM_GATE_NODES = 250;
+/** 位移插值的可见方框数闸门（见 ANIM_GATE_NODES）；导出便于断言与自查。 */
+export const ANIM_GATE_NOTE = '位移插值：可见方框 ≤ 250 时按 180ms 插值，超过则直接落位';
+
+/** 当前**显示**的位移（DOM 里就是这个值；动画在跑时它落在起点与目标之间）。 */
+let displayedShifts = new Map<string, number>();
+/**
+ * 每个节点**上一帧真正画出来的总绘制 y**（`box.y + 当时的位移`）。
+ *
+ * ⚠️ 这是 C2 重做的关键：用户看到的「整行平移」主要来自布局自身的 `box.y` 重排，
+ * 而不是粘性位移（第三轮探针实测：粘性位移为 0 时位置仍变了 220px）。
+ * 所以插值对象必须是这个**总绘制 y**，而不是位移本身。
+ */
+let lastPaintedTotal = new Map<string, number>();
+/** 动画起点快照；`undefined` 表示没有动画在跑。 */
+let animFrom: Map<string, number> | undefined;
+/** 动画目标位移。 */
+let animTarget: Map<string, number> | undefined;
+let animStart = 0;
+let animFrame: number | undefined;
+
+/** 缓动：三次方缓出（起始快、收尾稳，位移大时观感更像「滑过去」而不是「弹过去」）。 */
+function easeOutCubic(progress: number): number {
+  const t = progress <= 0 ? 0 : progress >= 1 ? 1 : progress;
+  return 1 - (1 - t) * (1 - t) * (1 - t);
+}
+
+/** 插值本身是**纯函数**：测试直接断言它（测试桩没有时间轴，动画时序无法断言）。 */
+function lerpShift(from: number, to: number, progress: number): number {
+  return from + (to - from) * easeOutCubic(progress);
+}
+
+function stopStickyAnimation(): void {
+  if (animFrame !== undefined) {
+    if (typeof cancelAnimationFrame === 'function') {
+      cancelAnimationFrame(animFrame);
+    }
+    animFrame = undefined;
+  }
+  animFrom = undefined;
+  animTarget = undefined;
+}
+
+/** 直接落到目标位移（滚动路径与「不该动画」的场合走这里）。 */
+function snapStickyShifts(): void {
+  stopStickyAnimation();
+  displayedShifts = new Map(stickyShifts);
+}
+
+/** 上一次做过布局动画的会话 id：换会话（首次渲染、切标签）时不该有入场动画。 */
+let animatedSessionId: string | undefined;
+/** 上一帧的几何签名（见 `geometrySignature`）。 */
+let lastGeometrySignature = '';
+
+/**
+ * 这一帧的几何签名：会话 id + 每个方框的 y 与高度（宽度也会影响排列，所以一并算进来）。
+ *
+ * 只比较几何、不比较设置：改设置（打开/关闭粘性或路径显示）造成的重绘不该有位移过渡。
+ */
+function geometrySignature(session: SessionPayload): string {
+  const parts: string[] = [];
+  for (const [id, box] of Object.entries(session.boxes)) {
+    parts.push(`${id}:${Math.round(box.y)}:${Math.round(box.height)}:${Math.round(box.width)}`);
+  }
+  return `${session.id}|${parts.join(',')}`;
+}
+
+/**
+ * 布局路径的入口（`render()` 在算完目标位移后调用）。
+ *
+ * - 首次渲染这个会话 / 不能动画 / 没有位移差 → 直接落位；
+ * - 否则从**当前显示值**插值到新目标，由 `stickyAnimationTick()` 逐帧重画方框与连线。
+ */
+function beginLayoutStickyAnimation(session: SessionPayload): void {
+  if (animatedSessionId !== session.id) {
+    animatedSessionId = session.id;
+    snapStickyShifts();
+    lastPaintedTotal = new Map();
+    return;
+  }
+  beginOrContinueStickyAnimation(session);
+}
+/** 动画一帧：把显示位移推向目标，重画方框与连线；到点后收尾并停止。 */
+function stickyAnimationTick(): void {
+  animFrame = undefined;
+  const session = activeSession();
+  if (!session || !animFrom || !animTarget) {
+    stopStickyAnimation();
+    return;
+  }
+  const progress = (Date.now() - animStart) / ANIM_DURATION_MS;
+  const next = new Map<string, number>();
+  const totals = new Map<string, number>();
+  for (const [id, target] of animTarget) {
+    const start = animFrom.get(id) ?? target;
+    const total = progress >= 1 ? target : lerpShift(start, target, progress);
+    totals.set(id, total);
+    const box = session.boxes[id];
+    // 存回「加在 box.y 上的偏移」：这样 paintStickyFrame 与 edgeGeometry 一行都不用改，
+    // 连线读的正是同一个偏移，所以方框与连线必然同帧同步。
+    next.set(id, box ? total - box.y : 0);
+  }
+  displayedShifts = next;
+  lastPaintedTotal = totals;
+  if (progress >= 1) {
+    displayedShifts = new Map(stickyShifts);
+    stopStickyAnimation();
+  }
+  paintStickyFrame(session);
+  if (progress < 1) {
+    scheduleStickyAnimationFrame();
+  }
+}
+
+function scheduleStickyAnimationFrame(): void {
+  if (animFrame !== undefined || typeof requestAnimationFrame !== 'function') {
+    return;
+  }
+  animFrame = requestAnimationFrame(stickyAnimationTick);
+}
+
+/**
+ * 决定这一帧的显示位移从哪来：能插值且有位移差就起动画，否则直接落到目标。
+ *
+ * ⚠️ 必须能「中途换目标」：展开会连着来两帧（估算宽度一帧、实测宽度一帧），
+ * 若第二帧无视正在跑的动画直接落位，用户看到的还是跳。这里以**当前显示值**为新起点重起，
+ * 位移方向一致，观感连续。
+ */
+function beginOrContinueStickyAnimation(session: SessionPayload): void {
+  const targets = stickyShifts;
+  const canAnimate =
+    typeof requestAnimationFrame === 'function' && nodesEl.children.length <= ANIM_GATE_NODES;
+  // ⚠️ 插值对象是**总绘制 y**（新的 box.y + 新位移），起点是**上一帧真正画出来的**总绘制 y。
+  // 用户看到的「整行平移」主要来自 box.y 的重排：实测过「粘性位移为 0 时位置仍变了 220px」，
+  // 所以只插值位移是无效的（这正是 C2 前一版失败的原因）。
+  const start = new Map<string, number>();
+  const target = new Map<string, number>();
+  let moved = false;
+  for (const [id, box] of Object.entries(session.boxes)) {
+    const targetTotal = box.y + (targets.get(id) ?? 0);
+    const startTotal = lastPaintedTotal.get(id) ?? targetTotal;
+    start.set(id, startTotal);
+    target.set(id, targetTotal);
+    if (Math.abs(targetTotal - startTotal) > 0.5) {
+      moved = true;
+    }
+  }
+  if (!canAnimate || !moved) {
+    stopStickyAnimation();
+    displayedShifts = new Map(targets);
+    lastPaintedTotal = new Map(target);
+    return;
+  }
+  animFrom = start;
+  animTarget = target;
+  // ⚠️ 首帧必须画在**起点**：位移是相对**新的** `box.y` 的，若沿用上一帧的偏移，
+  // render() 会按「新 box.y + 旧偏移」立刻画在终点 —— 这正是 C2 前一版「看起来完全没插值」的原因
+  // （诊断输出一直是 `send 后 = 终点`）。所以要用起点总量反算出偏移。
+  const initial = new Map<string, number>();
+  for (const [id, startTotal] of start) {
+    const box = session.boxes[id];
+    initial.set(id, box ? startTotal - box.y : 0);
+  }
+  displayedShifts = initial;
+  animStart = Date.now();
+  scheduleStickyAnimationFrame();
+}
 
 /**
  * 滚动时逐帧调用：只改「方框的位置」与「被钉住方框相关的连线」，不重建整棵树。
@@ -2036,6 +2696,11 @@ const lastStickyTransform = new WeakMap<Element, string>();
  */
 function applyStickyFrame(): void {
   if (!state.stickyParent || stickyPinned.length === 0) {
+    // 没有可钉的方框：显示位移必须清零，否则「收起全部」/关掉粘性之后会残留旧位移
+    stopStickyAnimation();
+    if (displayedShifts.size > 0) {
+      displayedShifts = new Map();
+    }
     return;
   }
   const session = activeSession();
@@ -2043,6 +2708,27 @@ function applyStickyFrame(): void {
     return;
   }
   refreshSticky(session);
+  // ⚠️ 布局动画正在跑时**不要落位**：展开会让相机平移视口，于是紧跟一串滚动帧；
+  // 若滚动帧直接 snap，动画会被当场掐断 —— 真机上就等于没有插值（renderCheck 的用例抓到了这点）。
+  // 但**必须加时间上限**：动画窗口之外仍有滚动帧走「动画中」分支的话，画的是一直不变的目标值，
+  // 而滚动本身每帧都在更新目标 —— 两边互相争，用户看到的就是**居中方框高频抖动**
+  // （2026-10-14 反馈）。所以超期就落位并清空动画状态，让滚动路径重新说了算。
+  if (
+    (animFrame !== undefined || animFrom !== undefined) &&
+    Date.now() - animStart < ANIM_DURATION_MS + 100
+  ) {
+    paintStickyFrame(session);
+    return;
+  }
+  stopStickyAnimation();
+  // 滚动路径**立即落位、不插值**：滚动时位移目标是每帧连续变化的，插值会变成「橡皮筋」，
+  // 手感反而更差（而且用户此刻的注意力在滚动上，不需要过渡）。插值只用于布局变化（展开/收起）。
+  snapStickyShifts();
+  paintStickyFrame(session);
+}
+
+/** 把当前显示位移写进 DOM：方框的 transform 与相关连线的 `d`（两处都读 stickyShiftOf）。 */
+function paintStickyFrame(session: SessionPayload): void {
   // 每个可见方框都按自己的位移摆好（被钉住的父框在中央，叶子跟着自己的父框）
   for (const element of nodesEl.children) {
     const id = element.getAttribute?.('data-node');
@@ -2050,7 +2736,10 @@ function applyStickyFrame(): void {
     if (!id || !box) {
       continue;
     }
-    const transform = `translate(${box.x} ${box.y + stickyShiftOf(id)})`;
+    const total = box.y + stickyShiftOf(id);
+    // 记下这一帧真正画出来的总绘制 y：下一次布局动画的起点就是它
+    lastPaintedTotal.set(id, total);
+    const transform = `translate(${box.x} ${total})`;
     // 位移没变就别写 DOM：写 attribute 会让浏览器重新布局这一棵子树
     if (lastStickyTransform.get(element) !== transform) {
       lastStickyTransform.set(element, transform);
@@ -2060,7 +2749,12 @@ function applyStickyFrame(): void {
   for (const item of stickyEdges) {
     const geometry = edgeGeometry(session, item);
     if (geometry) {
-      item.path.setAttribute('d', geometry.d);
+      const d = geometry.d;
+      // 连线同样「没变就不写」：逐帧动画会调用这里几十次，白写 d 会重算整条路径
+      if (lastStickyPath.get(item.path) !== d) {
+        lastStickyPath.set(item.path, d);
+        item.path.setAttribute('d', d);
+      }
     }
   }
 }
@@ -2334,6 +3028,41 @@ if (searchInputEl) {
   });
 }
 
+/**
+ * 到节点总数上限时：两个展开按钮置为禁用态并写明原因，另在工具栏下显示一行提示。
+ *
+ * 用户反馈「到上限后再点展开、完全展开都没用」—— 病因是那时两个按钮**必然无效**（画不下的
+ * 节点不会有方框），却不给任何反馈。禁用 + 写清原因与两条出路，比让用户反复点要好。
+ * 不用右下角弹窗：本项目明确不要打扰式提示，改成面板内的一行内联文字。
+ */
+function applyCapacityState(session: SessionPayload): void {
+  const atCapacity = session.atCapacity === true;
+  const limit = session.maxLayoutNodes;
+  const reason = atCapacity
+    ? `已达节点总数上限${limit === undefined ? '' : ` ${limit}`}：` +
+      '可在设置中调大 cppCallGraph.maxLayoutNodes，或先收起部分分支后重试'
+    : '';
+  const defaults: Record<string, string> = {
+    'btn-expand-all': '展开全部（受 maxExpandRounds 层数上限约束）',
+    'btn-expand-full': '完全展开（不受层数上限约束）',
+  };
+  for (const [id, defaultTitle] of Object.entries(defaults)) {
+    const button = document.getElementById(id) as
+      | (HTMLElement & { disabled?: boolean })
+      | null;
+    if (!button) {
+      continue;
+    }
+    button.disabled = atCapacity;
+    button.title = atCapacity ? reason : defaultTitle;
+  }
+  const hint = document.getElementById('capacity-hint');
+  if (hint) {
+    hint.textContent = reason;
+    hint.hidden = !atCapacity;
+  }
+}
+
 // 工具栏最左边的按钮：关闭**全部**标签并把整个「调用关系图」视图收起来。
 // 按需求，它的行为等同于原来面板标题栏上的「关闭全部调用关系标签」，
 // 而不是只关掉当前这一个标签（单个标签的关闭在标签自己的 ✕ 上）。
@@ -2358,8 +3087,7 @@ document.getElementById('btn-expand-all')?.addEventListener('click', () => {
   post({ type: 'expandAll', sessionId: session.id });
 });
 
-// 「完全展开」：与「展开全部」同一套本地准备（清掉收起标记 + 记 pending），
-// 区别只在宿主那一侧 —— 它不再受设置里的层数上限约束，会一直展开到没有可展开的节点。
+// 「完全展开」：与「展开全部」同一套本地准备（清掉收起标记 + 记 pending），// 区别只在宿主那一侧 —— 它不再受设置里的层数上限约束，会一直展开到没有可展开的节点。
 document.getElementById('btn-expand-full')?.addEventListener('click', () => {
   const session = activeSession();
   if (!session) {
@@ -2428,6 +3156,9 @@ function applyPathSettings(settings: WebviewSettings | undefined): void {
     state.pathOptions.anchors = settings.pathAnchors.filter(
       (pattern): pattern is string => typeof pattern === 'string'
     );
+  }
+  if (typeof settings.pathShowFileName === 'boolean') {
+    state.pathOptions.showFileName = settings.pathShowFileName;
   }
 }
 
@@ -2520,9 +3251,13 @@ function handleHostMessage(message: HostMessage): void {
       }
       // 本会话的本地「正在展开」标记：这次 sessionUpdate 说明这一层数据已经回来了。
       clearSessionLoading(session.id);
+      // 到上限时把两个展开按钮置为禁用并写明原因（否则用户点一个必然无效的按钮）
+      applyCapacityState(session);
       // 图变了：把 viewBox 原点复位到内容左上角。
       reanchor(session);
       render();
+      // 相机：这一帧拿到了新的坐标，展开/收起的滚动调整在这里执行
+      applyCameraIntent(session);
       break;
     }
     case 'selectTab': {

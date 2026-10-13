@@ -29,8 +29,98 @@ import {
 } from './graphTypes';
 import { collectEdges } from './graphLayout';
 
-export interface RootDescriptor {
-  name: string;
+/**
+ * 单次展开的等待上限。
+ *
+ * 语言服务若挂住不返回（大工程首次解析、clangd 卡在索引上），`await` 会一直悬着：
+ * 节点永久点不开、`inflight` 永久占位，而日志还会写成「没有下一层调用关系」——
+ * 等于把「没响应」伪装成「本来就没有」。加上限后至少能放弃并让用户重试。
+ *
+ * 写成可变对象是为了让测试把它调小（生产用默认值 20 秒）；
+ * `smoke.js` 通过产物导出的 `__session.expandTimeout` 读它。
+ */
+export const expandTimeout = { ms: 20000 };
+
+/** 展开超时（与真正的失败区分开：超时只记警告、不标记节点已加载）。 */
+class ExpandTimeoutError extends Error {}
+
+/** 给展开请求加超时；超时抛 ExpandTimeoutError，底层请求继续跑但不再改状态。 */
+async function withExpandTimeout<T>(work: Promise<T>, nodeName: string): Promise<T> {
+  const limit = expandTimeout.ms;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          // 亚秒上限只在测试里出现；生产是 20 秒。别写成「超过 0 秒」。
+          const waited = limit >= 1000 ? `${Math.round(limit / 1000)} 秒` : `${limit} 毫秒`;
+          reject(new ExpandTimeoutError(`展开「${nodeName}」等待语言服务超过 ${waited}`));
+        }, limit);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+/**
+ * 两条路径的「亲疏」分值：同文件最高，其次同目录，再次按公共目录段数。
+ *
+ * 用途是同级排序：并列目录下常有同名的文件与函数，把与父项**路径最接近**的那个放在
+ * 兄弟序列的正中，视线不用来回找（用户 2026-10-13 的需求）。
+ */
+export function pathCloseness(parentFile: string, childFile: string): number {
+  if (!parentFile || !childFile) {
+    return 0;
+  }
+  if (parentFile === childFile) {
+    return 100000;
+  }
+  const parentDirs = parentFile.split(/[\\/]/).slice(0, -1);
+  const childDirs = childFile.split(/[\\/]/).slice(0, -1);
+  if (parentDirs.join('/') === childDirs.join('/')) {
+    return 90000;
+  }
+  let common = 0;
+  while (
+    common < parentDirs.length &&
+    common < childDirs.length &&
+    parentDirs[common] === childDirs[common]
+  ) {
+    common += 1;
+  }
+  return common;
+}
+
+/**
+ * 把子项排成「最亲的居中」：最亲的一组放中段，其余保持原相对顺序上下分摊。
+ *
+ * 只动顺序，不动数据；布局按 `children` 的顺序纵向堆叠，所以这里就是最终的上下顺序。
+ */
+export function arrangeByProximity(
+  parentFile: string,
+  childIds: string[],
+  fileOf: (id: string) => string
+): string[] {
+  if (childIds.length <= 2) {
+    return childIds;
+  }
+  const scored = childIds.map((id) => ({ id, score: pathCloseness(parentFile, fileOf(id)) }));
+  const best = Math.max(...scored.map((item) => item.score));
+  const centerIds = new Set(scored.filter((item) => item.score === best).map((item) => item.id));
+  if (centerIds.size === 0 || centerIds.size === childIds.length) {
+    return childIds;
+  }
+  const center = childIds.filter((id) => centerIds.has(id));
+  const rest = childIds.filter((id) => !centerIds.has(id));
+  const half = Math.floor(rest.length / 2);
+  return [...rest.slice(0, half), ...center, ...rest.slice(half)];
+}
+
+export interface RootDescriptor {  name: string;
   detail?: string;
   kind: vscode.SymbolKind;
   uri: string;
@@ -252,8 +342,19 @@ export class CallSession {
     this.inflight.add(nodeId);
     try {
       const ancestors = this.ancestorKeys(node);
-      const results = await expandRelation(this.query, this.direction, item);
+      const results = await withExpandTimeout(
+        expandRelation(this.query, this.direction, item),
+        node.name
+      );
       return this.applyResults(node, results, ancestors, maxNew);
+    } catch (error) {
+      if (error instanceof ExpandTimeoutError) {
+        // ⚠️ 不能把超时当成「没有下一层」：那会把「语言服务没响应」写成「这一层本来就没有调用关系」，
+        // 用户据此以为结果正确。这里只记警告，且**不标记 node.loaded** —— 节点仍可再点一次重试。
+        logWarn(`${error.message}；本次展开已放弃（节点未标记为已加载，可重试）。`);
+        return 0;
+      }
+      throw error;
     } finally {
       this.inflight.delete(nodeId);
     }
@@ -337,6 +438,11 @@ export class CallSession {
       added += 1;
     }
     node.loaded = true;
+    node.children = arrangeByProximity(
+      node.file,
+      node.children,
+      (id) => this.nodes.get(id)?.file ?? ''
+    );
     return added;
   }
 
