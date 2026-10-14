@@ -14,7 +14,7 @@
 import * as vscode from 'vscode';
 import { Answer } from './relations';
 import { pickByChoice } from './callHierarchy';
-import { logWarn } from '../util/log';
+import { isCancellation, logWarn } from '../util/log';
 
 /** 引用点数量上限：宏常被广泛使用，避免一次抓回上千个把画布撑爆。 */
 export const MAX_REFERENCE_HITS = 200;
@@ -164,11 +164,14 @@ async function queryReferences(
     } catch (error) {
       // ⚠️ 不能静默跳过：吞掉异常会让「语言服务报错」在下游被当成「这里没有引用」，
       // 用户与排查者看到的都是一个错误结论（输出通道里连一行线索都没有）。
-      logWarn(
-        `引用查询失败（${document.uri.fsPath} @ ${position.line + 1}:${position.character + 1}）：${
-          error instanceof Error ? error.message : String(error)
-        }`
-      );
+      // 但**取消类**错误除外：窗口重载时每个在途请求都会以 Canceled 结束，逐条告警只是噪音。
+      if (!isCancellation(error)) {
+        logWarn(
+          `引用查询失败（${document.uri.fsPath} @ ${position.line + 1}:${position.character + 1}）：${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+      }
       continue;
     }
     for (const location of list ?? []) {
@@ -263,9 +266,11 @@ async function readLines(uri: vscode.Uri): Promise<string[] | undefined> {
     const bytes = await vscode.workspace.fs.readFile(uri);
     return Buffer.from(bytes).toString('utf8').split(/\r?\n/);
   } catch (error) {
-    logWarn(
-      `读取引用所在文件失败（${uri.fsPath}）：${error instanceof Error ? error.message : String(error)}`
-    );
+    if (!isCancellation(error)) {
+      logWarn(
+        `读取引用所在文件失败（${uri.fsPath}）：${error instanceof Error ? error.message : String(error)}`
+      );
+    }
     return undefined;
   }
 }
@@ -283,9 +288,11 @@ async function symbolsOf(uri: vscode.Uri, cache: SymbolCache): Promise<readonly 
         uri
       );
     } catch (error) {
-      logWarn(
-        `取文档符号失败（${uri.fsPath}）：${error instanceof Error ? error.message : String(error)}`
-      );
+      if (!isCancellation(error)) {
+        logWarn(
+          `取文档符号失败（${uri.fsPath}）：${error instanceof Error ? error.message : String(error)}`
+        );
+      }
       symbols = undefined;
     }
     cache.set(key, symbols);

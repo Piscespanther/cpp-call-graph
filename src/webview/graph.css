@@ -9,7 +9,7 @@
   --edge-active: var(--vscode-charts-blue, #3794ff);
   --tab-bg: var(--vscode-panel-background, #1e1e1e);
   --tab-active-bg: var(--vscode-editor-background, #1e1e1e);
-  /* 根方框：同色但深一档 + 线更粗，便于一眼认出起点 */
+  /* 根方框：同色但深一档 + 线更粗，便于立即识别起点 */
   --root-border: #9552c4;
   --node-hover: #b06fe0;
   --cycle: var(--vscode-charts-orange, #d18616);
@@ -258,6 +258,11 @@ body {
 .search {
   display: flex;
   align-items: center;
+  /* 面板窄的时候必须能折行：这一栏里现在装着搜索框、五个开关、计数、两个箭头和临时过滤，
+     内容宽度已经超过窄面板（400px 上下）的宽度。不折行的话它作为**不可再缩的** flex 项会把
+     整个工具栏顶出水平滚动条。折行后临时过滤那一组换到第二行，仍然右对齐。 */
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 2px;
   margin-left: auto;
   padding-left: 6px;
@@ -303,7 +308,7 @@ body {
   border: 1px solid transparent;
 }
 
-/* 开关处于开启状态：加边框与底色，一眼看出「这个模式生效中」 */
+/* 开关处于开启状态：加边框与底色，可立即看出「这个模式生效中」 */
 .toolbar .search-toggle.on {
   border-color: var(--vscode-inputOption-activeBorder, #007fd4);
   background: var(--vscode-inputOption-activeBackground, rgba(255, 255, 255, 0.12));
@@ -326,6 +331,30 @@ body {
 /* 无命中 / 正则写错：计数用警示色 */
 .search-count.empty {
   color: var(--vscode-errorForeground, #f48771);
+}
+
+/* ------------------------------------------------------------ 临时路径过滤 */
+
+/* 与搜索挤在同一栏，但**是两件事**（用户口径：过滤和搜索分开）：搜索只改高亮与计数，
+   过滤改哪些方框存在。因此用一条分隔线把它们在视觉上分开，输入框另给一个更窄的宽度。 */
+.path-filter {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: 6px;
+  padding-left: 8px;
+  border-left: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+}
+
+.path-filter-input {
+  width: 118px;
+}
+
+/* 「已隐藏 N 个」比「第 1/2 处」宽，不能沿用 .search-count 的居中与最小宽度 */
+.path-filter-count {
+  min-width: 0;
+  text-align: left;
+  white-space: nowrap;
 }
 
 /* ------------------------------------------------------------ 方框右键菜单 */
@@ -447,7 +476,7 @@ body {
  *
  * 解析较慢的查询（宏、结构体、变量这类要走引用查找的符号）时盖在画布上：
  * 背景轻微压暗 + 模糊，正中一张卡片（转圈 + 文案 + 取消）。
- * 由 graph.ts 延迟 ~240ms 才显示 —— 快查询不会闪一下。
+ * 由 graph.ts 延迟 ~240ms 才显示 —— 快查询不会出现瞬时闪烁。
  */
 .busy {
   position: absolute;
@@ -683,6 +712,17 @@ body {
   font-family: var(--vscode-font-family);
   font-size: 12px;
   fill: var(--muted);
+}
+
+/*
+  名称行的路径标签（设置 cppCallGraph.nameFolderTag）：与路径那行同色（--muted），
+  但在同一行里比元素名细，读起来是"附注"而不是名字的一部分。
+  ⚠️ 颜色必须带兜底色：`:root` 一旦失效（曾因 BOM 整表被丢），SVG 的 fill 会回落到黑色。
+*/
+.node .name-tag-before,
+.node .name-tag-after {
+  font-weight: 400;
+  fill: var(--muted, #8a8a8a);
 }
 
 /* ------------------------------------------------------------ 展开按钮 */

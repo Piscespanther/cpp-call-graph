@@ -39,7 +39,7 @@ export type EngineChoice = string;
 export type PickPolicy = 'nearest' | 'preferSelected' | 'onlySelected';
 
 export interface EngineProfile {
-  /** 唯一 id（设置里填的就是它）。 */
+  /** 唯一 id（即设置中填写的内容）。 */
   id: string;
   /** 展示名（不含版本）。 */
   label: string;

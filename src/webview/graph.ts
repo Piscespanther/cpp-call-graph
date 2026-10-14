@@ -26,6 +26,13 @@ interface GraphNode {
   /** `omitted` 中因节点总数上限（`maxLayoutNodes`）未显示的那部分，用于悬停里区分原因。 */
   omittedByNodeCap?: number;
   /**
+   * 名称行标签的两段文字（设置 `cppCallGraph.nameFolderTag`），由**宿主**用
+   * `nameTagPartsFor()` 算好随 payload 下发：`arrow` 摆法只有前缀（`[core] → `），
+   * 三种后置摆法只有后缀（` (core)` 等）。webview 只渲染，不参与格式拼装。
+   */
+  nameTagPrefix?: string;
+  nameTagSuffix?: string;
+  /**
    * 已达节点总数上限、但这一格**仍有下一层可展开**（宿主在 atCapacity 时下发）。
    *
    * 方案 A：这种方框要有一个**不带数字**的标记（空心环）+ 悬停说明 —— 子节点从未取过，
@@ -103,6 +110,13 @@ interface SessionPayload {
   atCapacity?: boolean;
   /** 生效的节点总数上限（用于把原因写成具体数字；缺省时不写数字）。 */
   maxLayoutNodes?: number;
+  /**
+   * 本标签被**临时路径过滤**隐藏的节点数（含子树；缺省 = 没有隐藏）。
+   *
+   * 由宿主算并下发：命中与否是宿主按完整会话数据判的，面板手上的 `nodes` 已经被裁掉那些
+   * 节点，自己数不出来。面板只用它显示「已隐藏 N 个」。
+   */
+  filteredCount?: number;
 }
 
 interface SessionSummary {
@@ -122,6 +136,17 @@ interface InitMessage {
   activeId: string;
   /** 宿主读到的设置（webview 自己读不到 VS Code 设置）。 */
   settings?: WebviewSettings;
+  /**
+   * 临时路径过滤的查询（宿主侧那一份）。面板重建时输入框是空的，靠它把文字还原回来 ——
+   * 否则会出现「界面看着没过滤、图却是过滤后的」这种没法解释、也没法清掉的状态。
+   */
+  pathFilterQuery?: string;
+  /**
+   * 宿主手里的**收起状态**（按标签）。面板重建或可见性变化时，本地的收起表会被清空，
+   * 而宿主的仍在按它算坐标（收起的子树没有坐标、不占高度）—— 不下发就会出现
+   * 「父框画着 − 号、子框一个都不画」，要点两下才恢复。据此还原即可两边一致。
+   */
+  collapsed?: Array<{ sessionId: string; ids: string[] }>;
 }
 
 /** 需要下发给 webview 的设置项（与宿主 settingsPayload() 一一对应）。 */
@@ -216,7 +241,7 @@ const nodesEl = document.getElementById('nodes') as unknown as SVGGElement;
 const busyEl = document.getElementById('busy') as HTMLDivElement | null;
 const busyLabelEl = document.getElementById('busy-label') as HTMLParagraphElement | null;
 
-/** 遮罩延迟：快查询不闪一下（毫秒）。 */
+/** 遮罩延迟：快查询不出现瞬时闪烁（毫秒）。 */
 const BUSY_DELAY_MS = 240;
 
 /**
@@ -237,7 +262,7 @@ let busyTimer: ReturnType<typeof setTimeout> | undefined;
  * 按当前状态决定遮罩的显隐。
  *
  * 两个来源都要算：宿主正在解析（`hostBusy`，宏/结构体/变量这类掉进引用查找的查询）
- * 与本地正在展开某个方框（`state.loading`）。延迟一小会儿才显示，避免快查询闪一下。
+ * 与本地正在展开某个方框（`state.loading`）。延迟一小会儿才显示，避免快查询出现瞬时闪烁。
  */
 function updateBusy(): void {
   if (!busyEl) {
@@ -422,7 +447,7 @@ const OMITTED_MARK_RADIUS = 4;
 /**
  * 内容尾部余量（右与下各留这么多）：VS Code 的滚动条是**覆盖式**的，浮在内容之上且不占布局空间，
  * 所以 `clientWidth` 把滚动条底下那一条也算进可视宽度。没有这段余量时，滚到最右/最下仍会被
- * 滚动条压住十几像素（用户 2026-10-14 的实测反馈：「没到右边底部」其实是被上下拖动条挡住）。
+ * 滚动条压住十几像素（用户 2026-10-14 的实测反馈：「没到右边底部」实为被上下滚动条遮挡）。
  */
 const TRAILING_SCROLLBAR_SLACK = 16;
 
@@ -543,7 +568,7 @@ function measureTextWidth(text: string, fontSize: number, bold: boolean): number
   }
   if (measured > 0) {
     // 超限时**淘汰最旧的一条**（Map 保持插入顺序），而不是整表清空 ——
-    // 整表清空会让接下来那一帧把上千段文字重新量一遍，等于把优化退回去。
+    // 整表清空会让接下来那一帧把上千段文字重新测量一次，等于把优化退回去。
     if (measureCache.size >= MEASURE_CACHE_LIMIT) {
       const oldest = measureCache.keys().next();
       if (!oldest.done) {
@@ -571,7 +596,10 @@ function measureTextWidth(text: string, fontSize: number, bold: boolean): number
  * 右边给加减号留出固定位置（不让它压到文字上）。
  */
 function measureBoxWidth(node: GraphNode): number {
-  const nameWidth = measureTextWidth(nodeNameText(node), NAME_FONT_SIZE, true);
+  // 名称行可能带路径标签（设置 `cppCallGraph.nameFolderTag`）：实测宽必须与宿主估宽、与真实
+  // 渲染三者同口径 —— 漏掉标签，方框就会窄到压住标签。
+  const nameLine = `${node.nameTagPrefix ?? ''}${nodeNameText(node)}${node.nameTagSuffix ?? ''}`;
+  const nameWidth = measureTextWidth(nameLine, NAME_FONT_SIZE, true);
   // 关掉「显示路径」时方框只按名称算宽 —— 否则右边会空出一整块（路径那一行的宽度）
   const locWidth = state.showLocation
     ? measureTextWidth(nodeLocText(node), LOC_FONT_SIZE, false)
@@ -826,8 +854,8 @@ function readView(session: SessionPayload): Viewport {
  * 图变了：把 viewBox 原点复位到内容左上角，并**补偿滚动**以免视口跳动。
  *
  * ⚠️ 宿主不只在「图真的变了」时发 `sessionUpdate`：改设置（`postSettings(true)`）与
- * 宽度重排（`reportWidths` 触发）都会把整张会话重发一遍。此时内容并没有移动，
- * 但 `view.y` 被复位而 `scrollTop` 不变 → 用户会看到画面整体跳一下（平滑滚动还会演成动画）。
+ * 宽度重排（`reportWidths` 触发）都会把整张会话重新下发一次。此时内容并没有移动，
+ * 但 `view.y` 被复位而 `scrollTop` 不变 → 用户会看到画面整体跳动一次（平滑滚动还会演成动画）。
  * 所以：锚点没变就什么都不做；变了就把滚动量同步补偿同样的位移。
  */
 function reanchor(session: SessionPayload): void {
@@ -876,7 +904,7 @@ interface CameraIntent {
   /** 点击时该方框的**屏幕**坐标：之后每帧按绝对目标还原它，保证幂等（不会重复补偿）。 */
   screenXBefore: number;
   screenYBefore: number;
-  /** 记下的时刻：宿主迟迟不回消息时不至于在很久之后突然跳一下。 */
+  /** 记下的时刻：宿主迟迟不回消息时不至于在很久之后突然跳动一次。 */
   at: number;
 }
 
@@ -986,11 +1014,11 @@ function revealNewLevel(session: SessionPayload, intent: CameraIntent): void {
   const view = compensatedView(session, intent);
   // ⚠️ 横向只允许**右移**，且不做「把被点方框按回原位」的补偿：
   // 那个补偿会把视口往左推，与「把新一级露出来」的右移方向相反 —— 用户实测到的
-  // 「第三级整个往右跳一下再回来」与「最右侧展开却没有滚到最右边」都是这两股运动叠加的结果。
+  // 「第三级整体右移后回弹」与「最右侧展开却没有滚到最右边」都是这两股运动叠加的结果。
   // 横向的唯一动作者就是本函数下面的显露逻辑（用户 2026-10-14 确认的口径）。
   view.left = canvasEl.scrollLeft;
   // ⚠️ 粘性父框开着时，纵向**完全交给粘性**：它会把被展开的父框用 transform 拉到视口中央，
-  // 而相机若再用滚动去锁它的屏幕位置，两次运动叠加 → 用户看到整行「大幅抖一下」（视疲劳）。
+  // 而相机若再用滚动去锁它的屏幕位置，两次运动叠加 → 用户看到整行「大幅抖动」（视觉疲劳）。
   // 所以这里连同**位置补偿**一起撤掉，只保留横向的显露。
   if (state.stickyParent) {
     view.top = canvasEl.scrollTop;
@@ -1021,7 +1049,7 @@ function revealNewLevel(session: SessionPayload, intent: CameraIntent): void {
   if (!state.stickyParent && viewportHeight > 0) {
     const viewTop = view.top;
     const viewBottom = viewTop + viewportHeight;
-    // 父框优先保持可见；新一级只保证**起点**可见（同列纵向堆叠，滚一下就能看全），
+    // 父框优先保持可见；新一级只保证**起点**可见（同列纵向堆叠，滚动即可看全），
     // 否则子节点一多就会为了「全看到」而做一次很大的纵向位移。
     if (parent.y + parent.height + CAMERA_PADDING > viewBottom) {
       view.top = parent.y + parent.height + CAMERA_PADDING - viewportHeight;
@@ -1038,7 +1066,7 @@ function revealNewLevel(session: SessionPayload, intent: CameraIntent): void {
  * 收起：横向让该级在屏幕上原地不动，**纵向把它滚到视口中央**。
  *
  * 用户原始需求就是「某一级收起后垂直居中到这个级」，实测也印证：只锁位置时，
- * 若同级还有别的方框，收起后它停在半空、看着像「抖了一下还偏了」。
+ * 若同级还有别的方框，收起后它停在半空，表现为「抖动后位置偏移」。
  * 纵向用**绝对目标**（居中），因此重放多少次结果都一样，不会叠加位移。
  */
 /*
@@ -1167,7 +1195,7 @@ function visibleNodes(session: SessionPayload): GraphNode[] {
  * 且兄弟节点按 `children` 的声明顺序 —— 与宿主排布兄弟节点的顺序一致，
  * 所以搜索的「下一个 / 上一个」就是用户从上往下看到的顺序。
  *
- * 注意别写成 `visibleNodes` 那种直接 pop 的栈式遍历：那样兄弟节点是**倒序**的。
+ * 注意不要写成 `visibleNodes` 那种直接 pop 的栈式遍历：那样兄弟节点是**倒序**的。
  *
  * 与 `visibleNodes` 的另一处区别：后者遇到被收起的节点就停止下探，这个不。
  * 搜索需要它来找「命中但当前被收起」的节点，好在计数里提示用户。
@@ -1301,6 +1329,9 @@ function renderTabs(): void {
     // 键盘用漫游 tabindex：只有活动标签在 Tab 序列里，其余靠方向键切换（见下）。
     tab.setAttribute('role', 'tab');
     tab.setAttribute('aria-selected', id === state.activeId ? 'true' : 'false');
+    // 标签栏右键菜单按这个属性定位目标（早期按 DOM 下标对齐 `state.order`，两表一旦不同步
+    // 就会关错标签 —— 见 `renderTabs` 里 `continue` 那条分支）。
+    tab.setAttribute('data-tab-id', id);
     tab.tabIndex = id === state.activeId ? 0 : -1;
     tab.title = `${session.direction === 'callers' ? '被调用关系' : '调用关系'} · ${session.description}${session.engineLabel ? ` · ${session.engineLabel}` : ''}`;
 
@@ -1313,7 +1344,7 @@ function renderTabs(): void {
     // 方向原先是用「被调用:名字」这种前缀表达的，既啰嗦又占地方，改成图标。
     tab.appendChild(createDirectionIcon(session.direction));
 
-    // 引擎角标：多标签时才有意义（单标签一眼就知道是哪个引擎）。
+    // 引擎角标：多标签时才有意义（单标签可立即看出是哪个引擎）。
     const engineBadge = state.order.length > 1 ? badgeOf(session) : '';
     if (engineBadge) {
       const engine = document.createElement('span');
@@ -1427,6 +1458,8 @@ function render(): void {
     // 标签全关掉时把搜索也复位，免得下次打开还留着上一张图的命中计数
     refreshSearchMatches(undefined);
     updateSearchUi();
+    // 临时过滤的计数同理：没有标签时不该留着上一张图的「已隐藏 N 个」
+    updatePathFilterUi(undefined);
     // 没有会话了：任何「正在展开」的标记都失效。必须在这里清掉并刷新遮罩，
     // 否则已排队的定时器会把遮罩显示在空状态上，而且此后再也无人把它关掉。
     state.loading.clear();
@@ -1535,6 +1568,8 @@ function render(): void {
   }
 
   updateSearchUi();
+  // 临时过滤的计数：按**当前标签**的 payload 显示（宿主每次构负载都会重新算）
+  updatePathFilterUi(session);
 
   // 加载遮罩：本地的展开状态（state.loading）也在这一帧变化，一并刷新
   updateBusy();
@@ -1561,7 +1596,7 @@ function renderNode(
       node.depth === 0 ? 'root' : '',
       node.isCycle ? 'cycle' : '',
       selected ? 'selected' : '',
-    // 最后点过加减号的格子带上粉框（持久）：折叠时一眼看出操作的是谁（用户 2026-10-14 要求）
+    // 最后点过加减号的格子带上粉框（持久）：折叠时可立即看出操作对象（用户 2026-10-14 要求）
     isExpanderTarget(session.id, node.id) ? 'expander-active' : '',
       searchState.hits.has(node.id) ? 'match' : '',
       currentMatchId() === node.id ? 'match-current' : '',
@@ -1614,11 +1649,33 @@ function renderNode(
   // 必须先 append 底纹、再 append 文字，底纹才画在文字下面。
   const displayName = nodeNameText(node);
   if (searchState.hits.has(node.id)) {
-    group.appendChild(hitRectFor(displayName, nameBaseline));
+    // 标签在名称前面时（`arrow` 摆法），底纹要右移标签那么宽 ——
+    // 否则底纹会盖住标签、只压住元素名的后半截。
+    group.appendChild(hitRectFor(displayName, nameBaseline, node.nameTagPrefix));
   }
 
+  // 名称行 = 标签（宿主算好的文字）+ 元素名。用独立 tspan 是为了给标签弱化颜色，
+  // 同时让搜索底纹仍然只覆盖元素名本身。
   const nameText = svg('text', { x: TEXT_X, y: nameBaseline, class: 'name' });
-  nameText.textContent = displayName;
+  if (!node.nameTagPrefix && !node.nameTagSuffix) {
+    // 没有标签时**保持原样**：单个 textContent，不引入 tspan ——
+    // 既有断言与测试桩都按 textContent 读元素名，多包一层只是徒增差异。
+    nameText.textContent = displayName;
+  } else {
+    if (node.nameTagPrefix) {
+      const tag = svg('tspan', { class: 'name-tag-before' });
+      tag.textContent = node.nameTagPrefix;
+      nameText.appendChild(tag);
+    }
+    const nameSpan = svg('tspan', { class: 'name-text' });
+    nameSpan.textContent = displayName;
+    nameText.appendChild(nameSpan);
+    if (node.nameTagSuffix) {
+      const tag = svg('tspan', { class: 'name-tag-after' });
+      tag.textContent = node.nameTagSuffix;
+      nameText.appendChild(tag);
+    }
+  }
   group.appendChild(nameText);
 
   // 「文件路径:行号」那一行由设置控制：关掉后每个方框里只有元素名
@@ -1663,7 +1720,7 @@ function renderNode(
   });
 
   // 加减号与函数名同一行，放在方框右侧。
-  // 用 mousedown 记录、window mouseup 统一处理，避免冒泡顺序把点击吃掉。
+  // 用 mousedown 记录、window mouseup 统一处理，避免点击被冒泡顺序拦截。
   //
   // 模式判定顺序很关键（曾经写错导致「减号永远不出现、折叠不了」）：
   //   node.canExpand 在**子节点已加载**后依然是 true，所以不能把它放在前面，
@@ -1921,43 +1978,411 @@ function displayPathText(file: string, options: PathDisplayOptions, max: number)
   return assemblePath(parts, anchors, tailCount);
 }
 
+/** 编译好的段匹配正则缓存（同一批模式逐帧复用，避免每个节点都重新编译）。 */
+const globRegexCache = new Map<string, RegExp>();
+
 /**
- * 把锚点模式解析成段下标（与宿主 `graphLayout.ts` 的 `resolveAnchorIndexes` 逐字同规则）。
+ * 把通配形式的段匹配器编成正则：`*` = 任意长、`?` = 单字符，其余一律当字面量。
  *
- * 写法：`名字` / `名字+N` / `名字-N` / `+N`（从根数）/ `-N`（从文件名往上数）。
- * 解析顺序：整串名字精确匹配 → 名字+偏移 → 纯偏移（避免 `chip-01` 这类目录名被误判）。
- * 越界的模式直接忽略；宿主那份会另外记警告，这里只忽略以保证两侧输出一致。
+ * 大小写不敏感（与既有锚点口径一致）。带缓存：同一批模式在 800 个节点上会被调用很多次。
  */
-function resolveAnchorIndexes(parts: string[], patterns: readonly string[]): Set<number> {
-  const indexes = new Set<number>();
-  const lower = parts.map((part) => part.toLowerCase());
-  for (const raw of patterns) {
-    const pattern = String(raw ?? '').trim();
-    if (!pattern) {
+function globRegex(glob: string): RegExp {
+  const cached = globRegexCache.get(glob);
+  if (cached) {
+    return cached;
+  }
+  let source = '';
+  for (const character of glob) {
+    if (character === '*') {
+      source += '.*';
+    } else if (character === '?') {
+      source += '.';
+    } else {
+      source += character.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    }
+  }
+  const regex = new RegExp(`^${source}$`, 'i');
+  // 简单上限：手写几百条模式时不至于无界增长（超出就整表清掉，代价只是重新编译）
+  if (globRegexCache.size > 200) {
+    globRegexCache.clear();
+  }
+  globRegexCache.set(glob, regex);
+  return regex;
+}
+
+/**
+ * 段匹配器的解析结果。支持的段写法（宿主 `cppCallGraph.pathAnchors` 的条目用这一套，
+ * 面板只收到**已经剥过括号**的那份，两侧逐字同规则）：
+ *
+ *   `src`              字面量（大小写不敏感）
+ *   `group_*` / `a?c`  通配：`*` 任意长、`?` 单字符
+ *   `a|b`              多选（段内，不嵌套）
+ *   `"a*b"`            引号 = **字面量**（不解释任何元字符；名字真的带 `*` `|` `(` 时用它）
+ *   `re:^group_[ab]$`  正则（整段都是正则，不参与 `|` 拆分；`+` `-` `*` 在正则里原样有效）
+ *   `**`               任意层（含 0 层）
+ */
+type SegmentSpec =
+  | { kind: 'anyDepth' }
+  | { kind: 'regex'; regex: RegExp }
+  | { kind: 'literal'; value: string }
+  | { kind: 'glob'; branches: string[] }
+  | { kind: 'invalid' };
+
+/** 解析一个段；正则写错时返回 `invalid`（调用方据此提示，而不是静默失效）。 */
+function parseSegmentSpec(raw: string): SegmentSpec {
+  const trimmed = raw.trim();
+  if (trimmed === '**') {
+    return { kind: 'anyDepth' };
+  }
+  if (trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    return { kind: 'literal', value: trimmed.slice(1, -1).toLowerCase() };
+  }
+  if (/^re:/i.test(trimmed)) {
+    try {
+      return { kind: 'regex', regex: new RegExp(trimmed.replace(/^re:/i, ''), 'i') };
+    } catch {
+      return { kind: 'invalid' };
+    }
+  }
+  const branches = trimmed
+    .split('|')
+    .map((branch) => branch.trim())
+    .filter((branch) => branch.length > 0);
+  return branches.length === 0 ? { kind: 'invalid' } : { kind: 'glob', branches };
+}
+
+/** 该段匹配器是否命中某个段名（`**` 由 `matchSpans` 单独处理，不在这里比较）。 */
+function specMatches(spec: SegmentSpec, segment: string): boolean {
+  switch (spec.kind) {
+    case 'anyDepth':
+      return true;
+    case 'literal':
+      return segment.toLowerCase() === spec.value;
+    case 'regex':
+      return spec.regex.test(segment);
+    case 'glob':
+      return spec.branches.some((branch) => globRegex(branch).test(segment));
+    default:
+      return false;
+  }
+}
+
+/** 一条模式解析后的计划。 */
+interface PatternPlan {
+  /** 原始写法（提示用）。 */
+  raw: string;
+  /** `!` 前缀：排除（任一排除模式命中该路径 → 整条路径不出锚点/标签）。 */
+  exclude: boolean;
+  /** `all:` 前缀：该模式的**所有**命中。 */
+  all: boolean;
+  /** `keep:` 前缀：命中区间整体保留（只作用于标签；路径那行会关掉它）。 */
+  keep: boolean;
+  /** 以分隔符开头：必须从工作区根开始。 */
+  fromRoot: boolean;
+  /** 末段 `+N` / `-N`；`all:` 时每个命中各偏移。 */
+  offset: number;
+  /** 单独写的 `+N` / `-N`（没有段）：按段数定位。 */
+  pureOffset?: { sign: '+' | '-'; count: number };
+  /**
+   * 末段既能当**整段名字**、也能当「名字 ± N」时（例如 `lib-2`），这里放偏移那一种解释。
+   *
+   * ⚠️ 必须先按整段试、整段命中不了才用它 —— 这条「整段优先」是 0.22 的既有规则，
+   * 丢掉的后果是真实目录名 `lib-2` 永远匹配不上（统一匹配器时曾出现一次）。
+   */
+  offsetCandidate?: { specs: SegmentSpec[]; offset: number };
+  specs: SegmentSpec[];
+}
+
+/**
+ * 解析一条模式。语法（三层，可任意组合）：
+ *
+ *   前缀：`!`（排除）/ `all:`（所有命中）/ `keep:`（整段保留）—— 顺序任意、可叠加
+ *   段：见 `SegmentSpec`；`父/名字` 要求这些段**连续出现**，以 `/` 开头要求从工作区根开始
+ *   偏移：末尾 `+N` / `-N`；单独写 `+N` / `-N` 表示「从根数第 N 段 / 从文件名往上第 N 段」
+ *
+ * ⚠️ 末段是正则（`re:`）或引号段时不解析偏移：`re:a+1`、`"a+1"` 里的 `+1` 是内容而不是偏移。
+ */
+function parsePattern(raw: string): PatternPlan | undefined {
+  let text = String(raw ?? '').trim();
+  if (text.length === 0) {
+    return undefined;
+  }
+  let exclude = false;
+  if (text.startsWith('!')) {
+    exclude = true;
+    text = text.slice(1).trim();
+  }
+  let all = false;
+  let keep = false;
+  for (;;) {
+    if (/^all:/i.test(text)) {
+      all = true;
+      text = text.replace(/^all:/i, '').trim();
       continue;
     }
-    const exact = lower.indexOf(pattern.toLowerCase());
-    if (exact >= 0) {
-      indexes.add(exact);
+    if (/^keep:/i.test(text)) {
+      keep = true;
+      text = text.replace(/^keep:/i, '').trim();
       continue;
     }
-    const named = /^(.+?)([+-])(\d+)$/.exec(pattern);
-    if (named) {
-      const base = lower.indexOf(named[1].toLowerCase());
-      if (base >= 0) {
-        const offset = Number.parseInt(named[3], 10) * (named[2] === '-' ? -1 : 1);
-        const index = base + offset;
-        if (index >= 0 && index < parts.length) {
-          indexes.add(index);
+    break;
+  }
+  if (text.length === 0) {
+    return undefined;
+  }
+  // 整体加引号 = 一条**字面量路径**：各段按字面量匹配，并整段一起显示（等价 keep:）
+  if (isWhollyQuoted(text)) {
+    const specs = quoteEachSegment(text).split('/').map(parseSegmentSpec);
+    return { raw, exclude, all, keep: true, fromRoot: false, offset: 0, specs };
+  }
+  // 单独写的偏移：没有段，按段数定位
+  const plain = /^([+-])(\d+)$/.exec(text.replace(/^[\\/]+/, ''));
+  if (plain) {
+    return {
+      raw,
+      exclude,
+      all,
+      keep,
+      fromRoot: false,
+      offset: 0,
+      pureOffset: { sign: plain[1] === '-' ? '-' : '+', count: Number.parseInt(plain[2], 10) },
+      // ⚠️ 字面解释**也要留着**：真的存在名为 `+3` 的目录时必须先按整段命中
+      //（与 `lib-2` 同一条「整段优先」规则，见 offsetCandidate）。
+      specs: [parseSegmentSpec(text)],
+    };
+  }
+  const fromRoot = /^[\\/]/.test(text);
+  const body = text.replace(/^[\\/]+/, '');
+  const segments = body.split(/[\\/]/);
+  const lastIndex = segments.length - 1;
+  const last = segments[lastIndex].trim();
+  const canOffset = last !== '**' && !/^re:/i.test(last) && !isWhollyQuoted(last);
+  const named = canOffset ? /^(.+?)([+-])(\d+)$/.exec(last) : null;
+  // 先把**整段**当名字（`lib-2` 是真实目录名，不能一开始就当成「mods 减 1」）；
+  // 整段命中不了时才退回「名字 + 偏移」这一种解释（见 PatternPlan.offsetCandidate）。
+  const specs = segments.map(parseSegmentSpec);
+  if (!named) {
+    return { raw, exclude, all, keep, fromRoot, offset: 0, specs };
+  }
+  const offsetSegments = segments.slice();
+  offsetSegments[lastIndex] = named[1];
+  return {
+    raw,
+    exclude,
+    all,
+    keep,
+    fromRoot,
+    offset: 0,
+    specs,
+    offsetCandidate: {
+      specs: offsetSegments.map(parseSegmentSpec),
+      offset: Number.parseInt(named[3], 10) * (named[2] === '-' ? -1 : 1),
+    },
+  };
+}
+
+/**
+ * 在一条路径的段表上匹配一条模式，返回命中**区间**。
+ *
+ * - 非 `keep:`：区间只有一个元素（锚点段）；
+ * - `keep:`：区间 = 首个命中段…锚点段（含 `**` 跨过的中间段），用于整段保留显示；
+ * - `all:`：收集**全部**命中；否则只取最左一个；
+ * - `**`：匹配任意层（含 0 层）。写法上它自己占一段，例如「`**` 后接 `/se`」表示任意层里的 se，
+ *   「`a` 后接 `/**`」表示 a 以下的任意层，中间夹一层也可以（`a` 后接 `/**` 再接 `/se`）。
+ *   ⚠️ 文档里不能直接写连在一起的星号加斜杠：那会提前结束块注释（本项目曾出现过一次）。
+ */
+function matchSpansOnce(parts: string[], plan: PatternPlan): number[][] {
+  // 纯偏移只在「没有段」时生效：带段的模式要走下面的匹配（`+3` 可能真的是目录名）
+  if (plan.pureOffset && plan.specs.length === 0) {
+    const { sign, count } = plan.pureOffset;
+    // `+N` 从根数（1 = 最左一段）；`-N` 从文件名往上数（1 = 文件所在目录）
+    const index = sign === '+' ? count - 1 : parts.length - 2 - (count - 1);
+    return index >= 0 && index < parts.length ? [[index]] : [];
+  }
+  const specs = plan.specs;
+  if (specs.length === 0 || parts.length === 0) {
+    return [];
+  }
+  const spans: number[][] = [];
+  const seen = new Set<string>();
+  const record = (first: number, last: number): void => {
+    if (last < 0) {
+      return; // 整条模式只由 `**` 组成：没有可锚定的段
+    }
+    const anchor = last + plan.offset;
+    if (anchor < 0 || anchor >= parts.length) {
+      return;
+    }
+    const start = first + plan.offset;
+    if (plan.keep && start < 0) {
+      return;
+    }
+    const span: number[] = [];
+    if (plan.keep) {
+      for (let index = start; index <= anchor; index += 1) {
+        span.push(index);
+      }
+    } else {
+      span.push(anchor);
+    }
+    const key = span.join(',');
+    if (!seen.has(key)) {
+      seen.add(key);
+      spans.push(span);
+    }
+  };
+  const walk = (specIndex: number, pathIndex: number, first: number, last: number): void => {
+    if (!plan.all && spans.length > 0) {
+      return; // 只要最左一个：第一个命中就收工
+    }
+    if (specIndex === specs.length) {
+      record(first, last);
+      return;
+    }
+    const spec = specs[specIndex];
+    if (spec.kind === 'anyDepth') {
+      // `**` 匹配 0..N 段：从当前位置起逐个试（含“一段都不吃”）
+      for (let next = pathIndex; next <= parts.length; next += 1) {
+        walk(specIndex + 1, next, first, last);
+        if (!plan.all && spans.length > 0) {
+          return;
         }
       }
+      return;
+    }
+    if (pathIndex >= parts.length || !specMatches(spec, parts[pathIndex])) {
+      return;
+    }
+    walk(specIndex + 1, pathIndex + 1, first < 0 ? pathIndex : first, pathIndex);
+  };
+  const starts = plan.fromRoot ? [0] : parts.map((_part, index) => index);
+  for (const start of starts) {
+    walk(0, start, -1, -1);
+    if (!plan.all && spans.length > 0) {
+      break;
+    }
+  }
+  return spans;
+}
+
+/**
+ * 匹配一条模式：**先按整段名字试**，整段命中不了才退回「名字 ± N」那一种解释。
+ *
+ * 这条顺序是 0.22 的既有规则（`lib-2` 这类真实目录名不能被当成「mods 减 1」），
+ * 统一匹配器时必须显式保留 —— 解析阶段无法判断该用哪种解释，只有匹配结果能。
+ */
+function matchSpans(parts: string[], plan: PatternPlan): number[][] {
+  const primary = matchSpansOnce(parts, plan);
+  if (primary.length > 0) {
+    return primary;
+  }
+  if (plan.offsetCandidate) {
+    const retry = matchSpansOnce(parts, {
+      ...plan,
+      specs: plan.offsetCandidate.specs,
+      offset: plan.offsetCandidate.offset,
+      offsetCandidate: undefined,
+    });
+    if (retry.length > 0) {
+      return retry;
+    }
+  }
+  if (plan.pureOffset) {
+    // 最后才把 `+N` / `-N` 当偏移：真的存在同名目录时上面已经命中了
+    return matchSpansOnce(parts, { ...plan, specs: [], offset: 0, offsetCandidate: undefined });
+  }
+  return primary;
+}
+
+/** 该路径是否被**任一排除模式**（`!...`）命中；命中则整条路径不出任何锚点/标签。 */
+function isPathExcluded(parts: string[], plans: readonly PatternPlan[]): boolean {
+  return plans.some(
+    (plan) => plan.exclude && matchSpans(parts, { ...plan, all: true, keep: false }).length > 0
+  );
+}
+
+/**
+ * 逐条模式给出命中区间（标签链路用：**一条模式可能出多个标签**，所以不能把各模式合并）。
+ *
+ * @param keepEnabled 路径那行传 `false`：`keep:` 在那里不生效（区间被拍平成单段），
+ *   因为路径那行本来就靠列举相邻锚点显示多段（`LIB` + `LIB+1`），否则同一写法在两条链路里
+ *   语义就不同了 —— 这条有断言钉住。
+ */
+function planAnchorPatterns(
+  parts: string[],
+  patterns: readonly string[],
+  keepEnabled = true,
+  collectAll = false
+): { groups: Array<{ raw: string; all: boolean; spans: number[][] }>; invalid: string[]; excluded: boolean } {
+  const invalid: string[] = [];
+  const plans: PatternPlan[] = [];
+  for (const pattern of patterns) {
+    const text = String(pattern ?? '').trim();
+    if (text.length === 0) {
       continue;
     }
-    const plain = /^([+-])(\d+)$/.exec(pattern);
-    if (plain) {
-      const count = Number.parseInt(plain[2], 10);
-      const index = plain[1] === '+' ? count - 1 : parts.length - 2 - (count - 1);
-      if (index >= 0 && index < parts.length) {
+    const plan = parsePattern(text);
+    if (!plan || plan.specs.some((spec) => spec.kind === 'invalid')) {
+      invalid.push(text);
+      continue;
+    }
+    plans.push(plan);
+  }
+  // 排除优先：任一排除模式命中，这条路径就整体作废
+  if (isPathExcluded(parts, plans)) {
+    return { groups: [], invalid, excluded: true };
+  }
+  const groups: Array<{ raw: string; all: boolean; spans: number[][] }> = [];
+  for (const plan of plans) {
+    if (plan.exclude) {
+      continue;
+    }
+    // 与宿主同规则：`collectAll` 只在标签链路用（路径那行不传，保持「只保留最左一个」）
+    const spans = matchSpans(parts, {
+      ...plan,
+      // 与宿主同规则：`keepEnabled` 表示「尊重计划里的 keep」，不是强制 keep
+      keep: keepEnabled ? plan.keep : false,
+      all: collectAll ? true : plan.all,
+    });
+    if (spans.length === 0) {
+      // 命中不了的模式要出声（`!` 排除型不算：排除本来就可能不命中）
+      invalid.push(plan.raw);
+      continue;
+    }
+    groups.push({ raw: plan.raw, all: plan.all, spans });
+  }
+  return { groups, invalid, excluded: false };
+}
+
+/** 整串是否被一对引号包住（引号内允许有分隔符，表示一条**字面量路径**）。 */
+function isWhollyQuoted(text: string): boolean {
+  const trimmed = text.trim();
+  return trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"');
+}
+
+/** 把 `"aa/se"` 展开成 `"aa"/"se"`：每一段各自按**字面量**匹配。 */
+function quoteEachSegment(text: string): string {
+  return text
+    .trim()
+    .slice(1, -1)
+    .split(/[\\/]/)
+    .filter((segment) => segment.length > 0)
+    .map((segment) => `"${segment}"`)
+    .join('/');
+}
+
+/**
+ * 把锚点模式解析成段下标（与宿主 `graphLayout.ts` 的 `resolveAnchorIndexes` **逐字同规则**）。
+ *
+ * 路径那行只认单段锚点，因此这里同样关掉 `keep:` 的整段保留；`!` 排除模式在这里也生效
+ * （命中则整条路径不出锚点，与宿主一致）。
+ */
+function resolveAnchorIndexes(parts: string[], patterns: readonly string[]): Set<number> {
+  const { groups } = planAnchorPatterns(parts, patterns, false);
+  const indexes = new Set<number>();
+  for (const group of groups) {
+    for (const span of group.spans) {
+      for (const index of span) {
         indexes.add(index);
       }
     }
@@ -2062,11 +2487,18 @@ window.addEventListener('mouseup', () => {
       const session = state.sessions.get(sessionId);
       const node = session?.nodes[nodeId];
       if (session && node && !state.loading.has(loadingKey(sessionId, nodeId))) {
+        // ⚠️ **先把「已收起」标记清掉**，无论这次是要直接展开还是要新建语言服务请求。
+        // 曾经的写法只在「数据已加载」那条分支里清标记，于是：收起全部（会把根标成收起）→ 点第一级 `+`
+        // 发出请求、拿到数据，但节点仍被当成收起 → 新一级不显示，用户必须再点一次才亮
+        // （用户 2026-10-15 实测「折叠按钮点击后，再点第一级展开要点两遍」）。
+        // 标记必须**随展开请求一起**同步给宿主：它按这个集合决定哪些子树不占高度，
+        // 晚一步同步的话，新一级会拿不到坐标（就是历史上「只展开到第二级」那类现象）。
+        if (collapsedSet(sessionId).delete(nodeId)) {
+          postCollapsed(sessionId);
+        }
         if (node.loaded) {
           // 数据已有，只是被收起过：直接展开，不需要再问语言服务
-          collapsedSet(sessionId).delete(nodeId);
           startCameraIntent('expand', sessionId, nodeId);
-          postCollapsed(sessionId);
           render();
           applyCameraIntent(session);
         } else {
@@ -2132,23 +2564,28 @@ function closeBoxMenu(): void {
 }
 
 /**
- * 从事件目标往上找带 data-action 的菜单项。
+ * 从事件目标往上找带指定 `data-*` 属性的元素，返回它的值。
  *
  * 不用 `closest()`：它属于 Element 接口，测试桩与部分环境不一定提供，
  * 自己走 parentNode 更稳，逻辑也只有几行。
  */
-function findMenuAction(target: EventTarget | null): string | undefined {
+function findMenuAttribute(target: EventTarget | null, name: string): string | undefined {
   let node = target as (HTMLElement & { parentNode?: Node | null }) | null;
   const guard = new Set<unknown>();
   while (node && !guard.has(node)) {
     guard.add(node);
-    const action = (node as HTMLElement).getAttribute?.('data-action');
-    if (action) {
-      return action;
+    const value = (node as HTMLElement).getAttribute?.(name);
+    if (value) {
+      return value;
     }
     node = (node.parentNode as typeof node) ?? null;
   }
   return undefined;
+}
+
+/** 方框菜单项的动作（`data-action`）。 */
+function findMenuAction(target: EventTarget | null): string | undefined {
+  return findMenuAttribute(target, 'data-action');
 }
 
 boxMenuEl.addEventListener('click', (event) => {
@@ -2178,7 +2615,7 @@ window.addEventListener('keydown', (event) => {
 });
 canvasEl.addEventListener('scroll', closeBoxMenu, { passive: true });
 // 纵向滚动时把「已展开下一层」的方框钉在视口垂直中央（只改位置与相关连线，见「粘性父框」一节）。
-// 用 scheduleStickyFrame 合并：滚动事件密度远高于帧率，逐个处理等于白做几十次。
+// 用 scheduleStickyFrame 合并：滚动事件密度远高于帧率，逐个处理等于重复计算数十次。
 canvasEl.addEventListener('scroll', scheduleStickyFrame, { passive: true });
 
 // ------------------------------------------------------------ 工具栏
@@ -2208,6 +2645,11 @@ function collapseAll(): void {
   //    改设置触发 relayout）都会继续把那些子树排除在布局之外，画面上表现为
   //    「只展开到第二级、第二级的加号点不开」（节点没有坐标 → 整棵被跳过）。
   postCollapsed(session.id);
+  // 「收起全部」= 完全复位（用户 2026-10-14 口径）：请宿主把**已加载的展开状态**丢掉
+  // （只留根，根标回未加载），这样之后点「展开全部」是重新读取，而不是把旧形状搬回来。
+  // 本地也要清掉按会话记的「正在展开」标记：那些节点马上就不存在了。
+  clearSessionLoading(session.id);
+  post({ type: 'resetExpansion', sessionId: session.id });
   render();
 }
 
@@ -2417,7 +2859,7 @@ function anchorCenterY(nodeId: string, top: number, height: number): number {
 /**
  * 一条连线的折线路径。
  *
- * 渲染时用它画、滚动时用它重画 —— 同一份几何，避免两处算法各写一遍后漂移。
+ * 渲染时用它画、滚动时用它重画 —— 同一份几何，避免两处算法各写一次后漂移。
  */
 function edgeGeometry(
   session: SessionPayload,
@@ -2441,7 +2883,7 @@ function edgeGeometry(
     x: backward ? toBox.x + toWidth : toBox.x,
     y: anchorCenterY(edge.to, toBox.y, toHeight),
   };
-  // 出/入方框各画一小段直奔线（直角拐弯）。14px 是视觉调出来的：太小会被方框边框吃掉。
+  // 出/入方框各画一小段直奔线（直角拐弯）。14px 是视觉调出来的：过小会被方框边框遮挡。
   const stub = 14;
   const startX = fromAnchor.x + (backward ? -stub : stub);
   const endX = toAnchor.x + (backward ? stub : -stub);
@@ -2692,7 +3134,7 @@ function beginOrContinueStickyAnimation(session: SessionPayload): void {
  * （重建要重新量所有方框宽度、重排连线，滚动时那样做会卡。）
  *
  * 两个早退：没开粘性、或这一帧没有任何「已展开下一层」的方框可钉 —— 此时各节点在
- * render() 里写下的 transform 已经是正确位置，白算一遍没有任何收益。
+ * render() 里写下的 transform 已经是正确位置，重复计算没有任何收益。
  */
 function applyStickyFrame(): void {
   if (!state.stickyParent || stickyPinned.length === 0) {
@@ -2737,10 +3179,10 @@ function paintStickyFrame(session: SessionPayload): void {
       continue;
     }
     const total = box.y + stickyShiftOf(id);
-    // 记下这一帧真正画出来的总绘制 y：下一次布局动画的起点就是它
+    // 记下这一帧真正画出来的总绘制 y：下一次布局动画的起点即为此值
     lastPaintedTotal.set(id, total);
     const transform = `translate(${box.x} ${total})`;
-    // 位移没变就别写 DOM：写 attribute 会让浏览器重新布局这一棵子树
+    // 位移未变则不写 DOM：写 attribute 会让浏览器重新布局这一棵子树
     if (lastStickyTransform.get(element) !== transform) {
       lastStickyTransform.set(element, transform);
       element.setAttribute('transform', transform);
@@ -2778,6 +3220,18 @@ const searchState = {
   caseSensitive: false,
   wholeWord: false,
   regex: false,
+  /**
+   * 搜索范围是否还包含路径（用户 2026-10-15 要求，两个独立开关，就是搜索栏那两个按钮）：
+   *   - `matchPath`：方框里那行路径的**显示文本**（`displayPathText` 的结果，
+   *     随 `pathDisplay` / `pathTailLevels` 变化 —— 被省略掉的目录名搜不到）；
+   *   - `matchFullPath`：**完整路径**（`node.file`，无论那行当前显示成什么样）。
+   * 两个都关 = 只搜元素名（0.22 之前的行为）。
+   *
+   * ⚠️ 命中后的高亮仍然是「方框 + 元素名底纹」：底纹只覆盖元素名那一小段（既有断言钉住），
+   * 路径命中时靠方框的 `.match` 框线表达，**不会**给路径那行加底纹。
+   */
+  matchPath: false,
+  matchFullPath: false,
   /** 当前会话里**可见**的命中节点 id（按显示顺序），上下箭头在这个数组里循环。 */
   matches: [] as string[],
   /** 命中的节点 id 集合：渲染时判 class 用，避免逐节点 includes 的平方复杂度。 */
@@ -2797,7 +3251,7 @@ function buildNameMatcher(): ((name: string) => boolean) | undefined {
     return undefined;
   }
   // 全字：两侧不能是「词字符」。这里用 lookaround 而不是 \b —— \b 只认 ASCII 词字符，
-  // 在中文或下划线相邻处判定很反直觉（例如 bsp_boot 里的 boot 不会被当成整词）。
+  // 在中文或下划线相邻处判定很反直觉（例如 lib_boot 里的 boot 不会被当成整词）。
   const left = searchState.wholeWord ? '(?<![\\w$])' : '';
   const right = searchState.wholeWord ? '(?![\\w$])' : '';
   const body = searchState.regex ? `(?:${query})` : query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -2815,14 +3269,16 @@ function buildNameMatcher(): ((name: string) => boolean) | undefined {
 /**
  * 元素名底纹矩形（搜索命中高亮）。
  *
- * `renderNode` 与增量刷新 `refreshSearchMarks()` **共用这一份**几何 —— 两处各写一遍迟早会走形
- * （这个工程已经因为"同一个口径写两遍"踩过坑）。宽度走量宽缓存，重复调用不会真的去量。
+ * `renderNode` 与增量刷新 `refreshSearchMarks()` **共用这一份**几何 —— 两处各写一次迟早走形
+ * （这个工程已因"同一口径写两遍"出现过问题）。宽度走量宽缓存，重复调用不会真的去量。
  */
-function hitRectFor(displayName: string, nameBaseline: number): SVGElement {
+function hitRectFor(displayName: string, nameBaseline: number, nameTagPrefix?: string): SVGElement {
+  // 标签在名称前面时必须右移：底纹只标元素名，不能盖到标签上（`arrow` 摆法）。
+  const offset = nameTagPrefix ? measureTextWidth(nameTagPrefix, NAME_FONT_SIZE, true) : 0;
   const hitWidth = measureTextWidth(displayName, NAME_FONT_SIZE, true);
   return svg('rect', {
     class: 'name-hit',
-    x: TEXT_X - NAME_HIT_PAD_X,
+    x: TEXT_X + offset - NAME_HIT_PAD_X,
     y: nameBaseline - NAME_HIT_ABOVE,
     width: Math.max(1, Math.ceil(hitWidth) + NAME_HIT_PAD_X * 2),
     height: NAME_HIT_HEIGHT,
@@ -2871,7 +3327,17 @@ function refreshSearchMarks(session: SessionPayload | undefined): void {
       const nameEl = children.find((child) => child.getAttribute('class') === 'name');
       if (nameEl) {
         const baseline = Number(nameEl.getAttribute('y') ?? '0');
-        group.appendChild(hitRectFor(nameEl.textContent ?? '', baseline));
+        // 名称行现在由 tspan 组成：底纹只量**元素名**那一段，并让开前面的标签。
+        const spans = Array.from(nameEl.children ?? []);
+        const nameSpan = spans.find((child) => child.getAttribute('class') === 'name-text');
+        const beforeSpan = spans.find((child) => child.getAttribute('class') === 'name-tag-before');
+        group.appendChild(
+          hitRectFor(
+            nameSpan?.textContent ?? nameEl.textContent ?? '',
+            baseline,
+            beforeSpan?.textContent ?? undefined
+          )
+        );
         group.appendChild(nameEl);
       }
     } else if (!hit && existing) {
@@ -2892,7 +3358,7 @@ function refreshSearchMatches(session: SessionPayload | undefined): void {
     return;
   }
   for (const node of allNodes(session)) {
-    if (!matcher(node.name)) {
+    if (!matchesNode(matcher, node)) {
       continue;
     }
     searchState.hits.add(node.id);
@@ -2905,6 +3371,25 @@ function refreshSearchMatches(session: SessionPayload | undefined): void {
   if (searchState.index >= searchState.matches.length) {
     searchState.index = 0;
   }
+}
+
+/**
+ * 一个节点是否命中当前查询：元素名，加上（按开关）路径的**显示文本** / **完整路径**。
+ *
+ * 作用域互斥说明：`matchPath` 用 `displayPathText` 的结果（与方框里那行逐字相同，
+ * 包括自动省略后剩下的窗口），`matchFullPath` 用 `node.file`。两者可同时开，
+ * 命中其一即算命中。它们与「显示路径那一行」的开关 `showLocation` **无关**：
+ * 关掉路径行时，文字仍然按同一份口径参与搜索（命中表现为方框框线高亮，
+ * 不依赖那行是否存在）。
+ */
+function matchesNode(matcher: (text: string) => boolean, node: GraphNode): boolean {
+  if (matcher(node.name)) {
+    return true;
+  }
+  if (searchState.matchPath && matcher(displayPathText(node.file, state.pathOptions, LOC_MAX_CHARS))) {
+    return true;
+  }
+  return searchState.matchFullPath && matcher(node.file);
 }
 
 /** 当前命中的节点 id（上下箭头落脚的地方）。 */
@@ -2938,6 +3423,8 @@ function updateSearchUi(): void {
     ['btn-search-case', searchState.caseSensitive],
     ['btn-search-word', searchState.wholeWord],
     ['btn-search-regex', searchState.regex],
+    ['btn-search-path', searchState.matchPath],
+    ['btn-search-full', searchState.matchFullPath],
   ];
   for (const [id, on] of toggles) {
     const button = document.getElementById(id);
@@ -2996,10 +3483,14 @@ if (searchInputEl) {
     }
   });
 
-  const toggleWiring: Array<[string, 'caseSensitive' | 'wholeWord' | 'regex']> = [
+  const toggleWiring: Array<
+    [string, 'caseSensitive' | 'wholeWord' | 'regex' | 'matchPath' | 'matchFullPath']
+  > = [
     ['btn-search-case', 'caseSensitive'],
     ['btn-search-word', 'wholeWord'],
     ['btn-search-regex', 'regex'],
+    ['btn-search-path', 'matchPath'],
+    ['btn-search-full', 'matchFullPath'],
   ];
   for (const [id, key] of toggleWiring) {
     document.getElementById(id)?.addEventListener('click', () => {
@@ -3015,7 +3506,7 @@ if (searchInputEl) {
   // Ctrl/Cmd+F 聚焦搜索框：webview 里没有 VS Code 自带的查找框，这里自己接管。
   window.addEventListener('keydown', (event) => {
     // 只在搜索框**未聚焦**时接管：输入框内本可用 Ctrl+F 选中框内文字，
-    // 一律拦截会吃掉该行为。另外 `event.key` 在按住 Ctrl 时仍是 'f'，
+    // 一律拦截会阻断该行为。另外 `event.key` 在按住 Ctrl 时仍是 'f'，
     // 原来的 'F' 分支是死代码。
     if (
       (event.ctrlKey || event.metaKey) &&
@@ -3024,6 +3515,89 @@ if (searchInputEl) {
     ) {
       event.preventDefault();
       searchInputEl.focus();
+    }
+  });
+}
+
+// ------------------------------------------------ 临时路径过滤（搜索栏区域，用户 2026-10-15）
+
+/**
+ * 临时路径过滤的输入框与计数。
+ *
+ * 与搜索**互不影响**（用户明确要求分开）：搜索只改高亮与「第 N/M 处」计数，
+ * 过滤改的是**哪些方框存在**。两者各有一个输入框、各自独立。
+ *
+ * 这是**窗口级**功能：查询发给宿主，由宿主裁剪**每个标签**的 payload 再重排 ——
+ * 因此切标签、新开标签都自动生效，也不需要面板自己维护一份「谁被隐藏了」的集合。
+ * 它同时是**临时**的：不写设置、不进会话快照，清空输入框立即恢复。
+ */
+const pathFilterInputEl = document.getElementById('path-filter-input') as HTMLInputElement | null;
+
+/** 输入防抖（毫秒）：宿主每个查询都要重算所有标签的布局，逐字符发会让大图明显卡顿。 */
+const PATH_FILTER_DEBOUNCE_MS = 200;
+
+let pathFilterTimer: ReturnType<typeof setTimeout> | undefined;
+
+/**
+ * 把当前查询发给宿主。清空时**不等**防抖（「清空即恢复」必须是立刻的）。
+ *
+ * 这样也顺带保证了对称性：输入框里的文字永远等于宿主手里的查询。
+ */
+function postPathFilter(query: string): void {
+  if (pathFilterTimer !== undefined) {
+    clearTimeout(pathFilterTimer);
+    pathFilterTimer = undefined;
+  }
+  if (query.trim().length === 0) {
+    post({ type: 'pathFilter', query });
+    return;
+  }
+  pathFilterTimer = setTimeout(() => {
+    pathFilterTimer = undefined;
+    post({ type: 'pathFilter', query });
+  }, PATH_FILTER_DEBOUNCE_MS);
+}
+
+/**
+ * 「已隐藏 N 个」。
+ *
+ * 数字来自**宿主**：命中与否要拿完整会话数据判（面板手上的 payload 已经被裁掉那些节点）。
+ * `pending` 用于「刚打完字、宿主还没回」的那一刻 —— 此时旧数字已经不对了，
+ * 与其显示一个错数，不如先说明正在过滤。
+ */
+function updatePathFilterUi(session: SessionPayload | undefined, pending = false): void {
+  const countEl = document.getElementById('path-filter-count');
+  if (!countEl) {
+    return;
+  }
+  if ((pathFilterInputEl?.value ?? '').trim().length === 0) {
+    countEl.textContent = '';
+    countEl.classList.remove('empty');
+    return;
+  }
+  if (pending) {
+    countEl.textContent = '过滤中…';
+    countEl.classList.remove('empty');
+    return;
+  }
+  const hidden = session?.filteredCount ?? 0;
+  countEl.textContent = `已隐藏 ${hidden} 个`;
+  // 一条都没命中时用警示色（与搜索的「无命中」同一套观感）：否则用户只会觉得「怎么没反应」
+  countEl.classList.toggle('empty', hidden === 0);
+}
+
+if (pathFilterInputEl) {
+  pathFilterInputEl.addEventListener('input', () => {
+    updatePathFilterUi(activeSession(), true);
+    postPathFilter(pathFilterInputEl.value);
+  });
+
+  pathFilterInputEl.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      pathFilterInputEl.value = '';
+      updatePathFilterUi(activeSession());
+      postPathFilter('');
     }
   });
 }
@@ -3062,6 +3636,68 @@ function applyCapacityState(session: SessionPayload): void {
     hint.hidden = !atCapacity;
   }
 }
+
+// 标签栏的自有右键菜单（用户 2026-10-14 要求）：VS Code 给 webview 的默认菜单（剪切/复制/粘贴）
+// 无法由扩展扩展，所以自建一套。动作全部复用既有消息（closeTab / closeAllTabs / copyTabText），
+// 因此**宿主侧无需改动**。目标标签按它自己的 `data-tab-id` 定位（不按 DOM 下标 ——
+// `renderTabs` 会跳过不在 `state.sessions` 里的 id，下标一旦错位就会关错标签）。
+let tabMenuTargetId: string | undefined;
+const tabMenuEl = document.getElementById('tab-menu');
+function hideTabMenu(): void {
+  if (tabMenuEl) {
+    tabMenuEl.hidden = true;
+  }
+}
+document.getElementById('tabs')?.addEventListener('contextmenu', (event) => {
+  const tab = (event.target as HTMLElement | null)?.closest?.('.tab');
+  const id = tab?.getAttribute?.('data-tab-id') ?? undefined;
+  if (!id || !tabMenuEl) {
+    return;
+  }
+  event.preventDefault();
+  tabMenuTargetId = id;
+  tabMenuEl.hidden = false;
+  tabMenuEl.style.left = `${event.clientX}px`;
+  tabMenuEl.style.top = `${event.clientY}px`;
+});
+tabMenuEl?.addEventListener('click', (event) => {
+  const action = (event.target as HTMLElement | null)
+    ?.closest?.('[data-action]')
+    ?.getAttribute('data-action');
+  const id = tabMenuTargetId;
+  hideTabMenu();
+  if (!action) {
+    return;
+  }
+  const order = [...state.order];
+  // 下标**当场按 id 反查**：菜单弹出后标签可能被别处关掉，DOM 与 order 都可能已经变了
+  const index = id === undefined ? -1 : order.indexOf(id);
+  const closeIds = (ids: string[]): void => {
+    for (const each of ids) {
+      post({ type: 'closeTab', id: each });
+    }
+  };
+  if (action === 'closeAll') {
+    post({ type: 'closeAllTabs' });
+    return;
+  }
+  if (!id || index < 0) {
+    return;
+  }
+  if (action === 'copyTabName') {
+    post({ type: 'copyTabText', sessionId: id });
+  } else if (action === 'closeSelf') {
+    closeIds([id]);
+  } else if (action === 'closeOthers') {
+    closeIds(order.filter((each) => each !== id));
+  } else if (action === 'closeLeft') {
+    closeIds(order.slice(0, index));
+  } else if (action === 'closeRight') {
+    closeIds(order.slice(index + 1));
+  }
+});
+// 点别处 / 滚动时收起标签菜单（与方框菜单同一口径，两者互不干扰）
+document.addEventListener('click', hideTabMenu, true);
 
 // 工具栏最左边的按钮：关闭**全部**标签并把整个「调用关系图」视图收起来。
 // 按需求，它的行为等同于原来面板标题栏上的「关闭全部调用关系标签」，
@@ -3134,6 +3770,660 @@ document.getElementById('btn-busy-cancel')?.addEventListener('click', () => {
   }
 });
 
+// ------------------------------------------------------------ 导出菜单
+
+/**
+ * 导出格式（与宿主 `commands/exportGraph.ts` 的 `ExportFormat` 取值一致）。
+ * 前端独立打包，故此处重复定义 —— 与 `Direction` / `NodeKind` 的处理相同。
+ */
+type ExportFormat = 'png' | 'svg' | 'md-tree' | 'md-table' | 'json';
+
+/** PNG 栅格化倍数：2 倍分辨率（用户要求）。 */
+const EXPORT_SCALE = 2;
+/** 导出图片四周的留白（内容单位与像素 1:1，所以这个数字既是留白也是像素）。 */
+const EXPORT_PADDING = 12;
+/**
+ * 画布面积上限（16384 × 16384，浏览器内核的既有上限）。
+ *
+ * 超过这个面积时 `toDataURL` 不会抛错，而是返回**空数据**（旧版内核）或直接失败，
+ * 于是用户会拿到一个 0 字节或全空的 PNG —— 属于「静默产出错文件」。
+ * 因此超限时主动报错，并指向不受此上限约束的矢量导出。
+ */
+const MAX_CANVAS_AREA = 16384 * 16384;
+/** PNG 数据 URL 的前缀；取到的数据不以它开头说明画布没有给出有效图像。 */
+const PNG_DATA_URL_PREFIX = 'data:image/png;base64,';
+/** 后备路径用的 SVG 数据 URL 前缀（主路径是 `blob:`，见 `rasterizePng` 的说明）。 */
+const SVG_DATA_URL_PREFIX = 'data:image/svg+xml;base64,';
+/**
+ * Blob 的 MIME 类型。
+ *
+ * 必须带 `charset=utf-8`：元素名与文件路径里有中文，不带字符集时部分环境会把
+ * SVG 文本按 latin-1 解码，导出的图里中文变成乱码。
+ */
+const SVG_BLOB_TYPE = 'image/svg+xml;charset=utf-8';
+
+/**
+ * 必须内联到导出 SVG 上的计算样式属性。
+ *
+ * 颜色、字号、字体族都来自外部样式表里的 CSS 变量（`--node-fg` 等），而
+ * `XMLSerializer` 只序列化属性 —— 不内联的话，导出的 SVG 丢掉全部样式，
+ * 结果是一张黑图或一堆黑方块。
+ *
+ * 其中**取值等于初始值的属性不必写**（见 `SVG_INITIAL_STYLE_VALUES`）。
+ */
+const EXPORT_STYLE_PROPERTIES = [
+  'fill',
+  'fill-opacity',
+  'stroke',
+  'stroke-width',
+  'stroke-dasharray',
+  'opacity',
+  'font-family',
+  'font-size',
+  'font-weight',
+  'font-style',
+  'text-anchor',
+  'dominant-baseline',
+];
+
+/**
+ * 不参与「等于初始值就跳过」的属性：**一律内联**。
+ *
+ * 为什么单独列出这两个：`font-family` / `font-size` 的 UA 默认值随浏览器、平台与
+ * 是否继承而变，并不存在一个稳定的初始值。一旦按某张初始值表把它们跳过，
+ * 导出的 SVG 换到另一个环境打开时可能落到另一套字体度量上，文字与方框就对不齐。
+ * 其余属性（颜色、描边、透明度）的初始值是规范固定值，跳过是安全的。
+ */
+const ALWAYS_INLINE_STYLE_PROPERTIES = ['font-family', 'font-size'];
+
+/**
+ * SVG 属性的**初始值**（规范值，不是继承值）。
+ *
+ * 用途：内联计算样式时，取值等于初始值的属性不必写进导出文件，以缩小体积 —— 大图里
+ * 每个元素都要写 12 个属性，而其中多数从来没被人设过，算出来正好是初始值
+ * （例如 `<path class="edge">` 的 `stroke-dasharray` 就是 `none`）。
+ *
+ * ⚠️ **适用前提（改动前务必先读这一段）**：`fill` / `stroke` / `stroke-width` /
+ * `stroke-dasharray` / `fill-opacity` / `font-weight` / `font-style` / `text-anchor` /
+ * `dominant-baseline` 在 SVG 里都是**可继承**属性。省略一个等于初始值的取值，只有在
+ * **祖先元素也没有携带该属性的非初始值**时才不改变渲染结果；反之（子元素算出来是初始值、
+ * 而某个祖先写了别的值）省略会让子元素在导出文件里**继承祖先的值**，颜色随之出错。
+ * 目前 `graph.css` 里颜色/描边规则**全部落在叶子上**（`.box` / `.name` / `.loc` /
+ * `.edge` / `.ring` / `.sign-shape` / `.icon-shape` / `.name-hit` / `.capped-ring`），
+ * 画布内的容器（`#svg`、`#nodes`、`#edges`、`.node`、`.expander`、`.kind-icon`）都没有
+ * 设置这些属性，因此这条省略是安全的。**一旦给容器加上颜色或描边规则，就必须把这里的
+ * 判定改成「与父元素的计算值相同才省略」**，否则导出图会出现静默的颜色偏差。
+ *
+ * `stroke-width` 在浏览器里算出来常带单位（`1px`），故两种写法都算初始值。
+ */
+const SVG_INITIAL_STYLE_VALUES: Record<string, readonly string[]> = {
+  fill: ['rgb(0, 0, 0)', '#000000', 'black'],
+  'fill-opacity': ['1'],
+  stroke: ['none'],
+  'stroke-width': ['1', '1px'],
+  'stroke-dasharray': ['none'],
+  opacity: ['1'],
+  'font-weight': ['400', 'normal'],
+  'font-style': ['normal'],
+  'text-anchor': ['start'],
+  'dominant-baseline': ['auto'],
+};
+
+const exportMenuEl = document.getElementById('export-menu') as HTMLDivElement | null;
+
+function hideExportMenu(): void {
+  if (exportMenuEl) {
+    exportMenuEl.hidden = true;
+  }
+}
+
+// 点「导出」按钮 → 贴着该按钮下沿弹出菜单（与方框菜单同一套边界收边写法）
+document.getElementById('btn-export')?.addEventListener('click', (event) => {
+  if (!exportMenuEl) {
+    return;
+  }
+  const button = event.currentTarget as HTMLElement | null;
+  const rect = button?.getBoundingClientRect?.();
+  // 先显示再量尺寸，否则 offsetWidth 是 0（与方框菜单一致）
+  exportMenuEl.hidden = false;
+  const width = exportMenuEl.offsetWidth || 180;
+  const height = exportMenuEl.offsetHeight || 150;
+  const left = Math.max(0, Math.min(rect?.left ?? 0, window.innerWidth - width - 4));
+  const bottom = rect ? rect.top + rect.height : 0;
+  const top = Math.max(0, Math.min(bottom + 4, window.innerHeight - height - 4));
+  exportMenuEl.style.left = `${left}px`;
+  exportMenuEl.style.top = `${top}px`;
+});
+
+/** 导出格式白名单：把菜单里的 `data-format` 收窄成 `ExportFormat`。 */
+function isExportFormat(value: string): value is ExportFormat {
+  return (
+    value === 'png' ||
+    value === 'svg' ||
+    value === 'md-tree' ||
+    value === 'md-table' ||
+    value === 'json'
+  );
+}
+
+exportMenuEl?.addEventListener('click', (event) => {
+  const format = findMenuAttribute(event.target, 'data-format');
+  hideExportMenu();
+  if (!format || !isExportFormat(format)) {
+    return;
+  }
+  const session = activeSession();
+  if (!session) {
+    // ⚠️ 这里过去是直接 `return`：点了菜单项什么都不发生、也不报告，用户会以为扩展坏了。
+    // 现在与其它导出失败走同一套机制（`error` 消息 → 宿主的输出通道），不留静默路径。
+    reportExportFailure(format, '当前没有活动标签，无法导出');
+    return;
+  }
+  beginExport(format, session.id);
+});
+
+// 点别处收起导出菜单（捕获阶段先收，按钮自己的点击随后再打开），按 Esc 同样收起。
+document.addEventListener('click', hideExportMenu, true);
+document.addEventListener('keydown', (event) => {
+  if ((event as KeyboardEvent).key === 'Escape') {
+    hideExportMenu();
+  }
+});
+
+/**
+ * 导出入口。
+ *
+ * `md-tree` / `md-table` / `json` 的正文由宿主生成（**不带 data**）；
+ * `png` / `svg` 必须先在 webview 里抓取画布（只有前端拿得到真实节点与计算样式）。
+ *
+ * PNG 与 SVG 共用同一份序列化逻辑，只有一处口径不同：克隆体里的 `<title>`。
+ *   - SVG 文件：**保留**（人要拿编辑器打开它，悬停提示是唯一的说明来源）；
+ *   - PNG：**剔除**（栅格图里根本没有悬停这回事，而大图里每个方框一条提示文本，
+ *     正是体积大户）。
+ */
+function beginExport(format: ExportFormat, sessionId: string): void {
+  try {
+    if (format === 'md-tree' || format === 'md-table' || format === 'json') {
+      post({ type: 'exportGraph', sessionId, format });
+      return;
+    }
+    if (format === 'svg') {
+      // 矢量导出：直接把序列化后的 SVG 交给宿主写盘（仍是矢量、可再编辑）。
+      const prepared = buildExportSvg({ stripTitles: false });
+      if (!prepared) {
+        reportExportFailure('svg', '当前没有可导出的图形（画布为空）');
+        return;
+      }
+      // ⚠️ 写盘之前必须先预检：序列化结果本身不合法时，写出去的文件打开就会报错。
+      // 因此这里**直接拒绝写文件**，只把诊断交给宿主（宿主写进输出通道）。
+      const problem = checkExportXml(prepared.text);
+      if (problem !== undefined) {
+        reportExportFailure(
+          'svg',
+          `序列化结果不是合法的 XML，已拒绝写出该文件：${problem}` +
+            `（序列化 ${serializedBytes(prepared.text)} 字节）`
+        );
+        return;
+      }
+      post({ type: 'exportGraph', sessionId, format, data: prepared.text });
+      return;
+    }
+    // 栅格导出：剔除 `<title>`（只作用于克隆体，真画布一个都不动）。
+    const prepared = buildExportSvg({ stripTitles: true });
+    if (!prepared) {
+      reportExportFailure('png', '当前没有可导出的图形（画布为空）');
+      return;
+    }
+    rasterizePng(prepared, sessionId);
+  } catch (error) {
+    // 不许静默：抓取 / 序列化任何一步失败都要留下可诊断的记录。
+    reportExportFailure(format, error);
+  }
+}
+
+/**
+ * 把当前画布（`#svg`，承载全部方框与连线）复制成一棵**自带样式**的 SVG。
+ *
+ * 关键点：
+ *   ① 样式必须内联（见 `EXPORT_STYLE_PROPERTIES`）；
+ *   ② 尺寸取**内容包围盒**加内边距，导出的是全部已渲染内容 ——
+ *      不做裁剪，也与当前滚动位置、面板大小无关；
+ *   ③ 克隆里保留 `<defs>` 的箭头 marker（`cloneNode(true)` 会一并带上）；
+ *   ④ `stripTitles` 只作用于**克隆体**：真画布上的 `<title>`（悬停提示）一个都不能少，
+ *      否则用户在面板里悬停方框就再没有提示了；
+ *   ⑤ 序列化之前把 XML 1.0 不允许的字符换掉（见 `sanitizeExportXmlChars`）—— 这是真机
+ *      「一展开就导出失败 / SVG 打开报错」的根因所在，不能省。
+ */
+function buildExportSvg(options: {
+  stripTitles: boolean;
+}): { text: string; width: number; height: number } | undefined {
+  const source = svgEl as SVGSVGElement | undefined;
+  if (
+    !source ||
+    typeof source.cloneNode !== 'function' ||
+    typeof source.getBBox !== 'function'
+  ) {
+    return undefined;
+  }
+  const box = source.getBBox();
+  const width = Math.max(1, Math.ceil(box.width + EXPORT_PADDING * 2));
+  const height = Math.max(1, Math.ceil(box.height + EXPORT_PADDING * 2));
+  const clone = source.cloneNode(true) as SVGSVGElement;
+  clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+  clone.setAttribute('width', String(width));
+  clone.setAttribute('height', String(height));
+  clone.setAttribute(
+    'viewBox',
+    `${box.x - EXPORT_PADDING} ${box.y - EXPORT_PADDING} ${width} ${height}`
+  );
+  // 模板上可能带 hidden 之类的状态属性；导出的是画布本身，一律去掉。
+  clone.removeAttribute('hidden');
+  // ⚠️ 顺序不可调换：内联样式要靠「原节点与克隆体按下标一一对应」，
+  // 必须先内联、再剔除元素（否则下标错位，样式写到别的元素上）。
+  inlineExportStyles(source, clone);
+  if (options.stripTitles) {
+    for (const title of Array.from(clone.querySelectorAll('title'))) {
+      title.remove();
+    }
+  }
+  // ⑤ 清掉 XML 1.0 不允许的字符（真机根因：属性值里带节点 id 的 NUL 分隔符）。
+  // 必须排在序列化之前，且只作用于克隆体。
+  sanitizeExportXmlChars(clone);
+  const body = new XMLSerializer().serializeToString(clone);
+  return { text: `<?xml version="1.0" encoding="UTF-8"?>\n${body}`, width, height };
+}
+
+/**
+ * 序列化文本的 UTF-8 字节数。
+ *
+ * 失败文案一律带上它：真机上「导出失败」既有可能是图本来就大，也有可能是别的原因，
+ * 有这个数字即可直接区分（276 个节点的图序列化后约 2.1 MB，小图只有几十 KB）。
+ */
+function serializedBytes(text: string): number {
+  return new TextEncoder().encode(text).length;
+}
+
+/**
+ * XML 1.0 不允许**直接出现**的控制字符（`\t`、`\n`、`\r` 是允许的，故不在其中）。
+ *
+ * 用途：各内核对这类字符的态度并不一致 —— 有的直接给出 parsererror，有的照单全收，
+ * 因此它必须作为一条**独立判据**，与解析器报错合并返回。
+ */
+const XML_INVALID_CONTROL_CHARS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g;
+
+/** 诊断片段里控制字符的可见替身：不可见字符原样写进输出通道，什么也看不出来。 */
+const CONTROL_CHAR_PLACEHOLDER = '·';
+/** 控制字符诊断片段在命中位置前后各取的字符数。 */
+const CONTROL_CHAR_CONTEXT = 40;
+/** 单次预检最多列出多少处控制字符：真机上一旦出现，往往每个节点都中，全列会把输出通道刷满。 */
+const CONTROL_CHAR_MAX_REPORTS = 5;
+/** 解析器报错文本的截断长度：部分内核会把整段输入附在报错里。 */
+const PARSE_ERROR_MAX_CHARS = 300;
+
+/** 该字符是否为 XML 1.0 不允许直接出现的控制字符（`\t`、`\n`、`\r` 除外）。 */
+function isInvalidXmlControlChar(character: string): boolean {
+  const code = character.codePointAt(0) ?? 0;
+  return code <= 0x08 || code === 0x0b || code === 0x0c || (code >= 0x0e && code <= 0x1f);
+}
+
+/**
+ * 与 `XML_INVALID_CONTROL_CHARS` 同一字符集，但**不带 `g`**。
+ *
+ * `g` 正则带 `lastIndex` 状态，拿它做 `test()` 会在连续调用之间漏判 —— 这里必然要被
+ * 反复调用（每个属性、每段文本各一次），所以判定另用这一个。
+ */
+const XML_INVALID_CONTROL_CHAR_TEST = /[\u0000-\u0008\u000B\u000C\u000E-\u001F]/;
+
+/** 非法控制字符在导出文本里的替身：`\u2400`（␀，SYMBOL FOR NULL）。 */
+const XML_INVALID_CHAR_PLACEHOLDER = '\u2400';
+
+/** 把一段文本里 XML 1.0 不允许的控制字符换成可见替身（没有命中时原样返回）。 */
+function sanitizeXmlChars(value: string): string {
+  return XML_INVALID_CONTROL_CHAR_TEST.test(value)
+    ? value.replace(XML_INVALID_CONTROL_CHARS, XML_INVALID_CHAR_PLACEHOLDER)
+    : value;
+}
+
+/**
+ * 把克隆体里 XML 1.0 不允许直接出现的字符替换掉（**只动克隆体，真画布一个字符不改**）。
+ *
+ * 为什么必须有这一步（真机根因，2026-10-14 定位）：
+ * 节点 id 以 NUL 作分隔符（宿主 `session.ts` 的 `ID_SEPARATOR`），而 id 会随属性值进入画布
+ * （真机命中的是 `lib_core_dev_read_byte\u0000file:///…` 这种形态）。裸 `U+0000` 写进属性值后，
+ * 序列化结果**不是合法 XML**：
+ *   - 浏览器报 `invalid character in attribute value`；
+ *   - PNG 走 `<img>` 加载同一份文本，因此必然 `onerror`，导出失败；
+ *   - SVG 文件能写出，但打开时「图不全 + 报错」—— 解析器在出错点就停止解析。
+ * root-only 时 id 不含 NUL，所以小图能导出、一旦有子节点就失败，与体积无关。
+ *
+ * 替身取 `␀` 而不是删掉：它若出现在导出文件里，可立即看出「这里原本有个 NUL」。
+ * 属性名不改（只改值），因此 `url(#id)` 这类引用不受影响。
+ */
+function sanitizeExportXmlChars(node: Element): void {
+  for (const attribute of Array.from(node.attributes)) {
+    const safe = sanitizeXmlChars(attribute.value);
+    if (safe !== attribute.value) {
+      node.setAttribute(attribute.name, safe);
+    }
+  }
+  // nodeType 用数字：1 = 元素、3 = 文本（测试桩不一定提供 Node.TEXT_NODE 常量）。
+  for (const child of Array.from(node.childNodes)) {
+    if (child.nodeType === 3) {
+      const text = child.nodeValue ?? '';
+      const safe = sanitizeXmlChars(text);
+      if (safe !== text) {
+        child.nodeValue = safe;
+      }
+    } else if (child.nodeType === 1) {
+      sanitizeExportXmlChars(child as Element);
+    }
+  }
+}
+
+/**
+ * 把诊断文本压成单行并截断。
+ *
+ * 压掉换行是必须的：内核的 parsererror 文本本身就是多行的，不压会把这句失败文案
+ * 在输出通道里摊成好几行，反而看不清；截断处补省略号，表明后面还有内容。
+ */
+function compactDiagnostic(text: string): string {
+  const compact = text.replace(/\s+/g, ' ').trim();
+  return compact.length > PARSE_ERROR_MAX_CHARS
+    ? `${compact.slice(0, PARSE_ERROR_MAX_CHARS)}…`
+    : compact;
+}
+
+/** 取命中位置前后的上下文片段：里面的控制字符换成可见替身，空白压成一个空格以保证只占一行。 */
+function controlCharSnippet(text: string, index: number): string {
+  const from = Math.max(0, index - CONTROL_CHAR_CONTEXT);
+  const to = Math.min(text.length, index + CONTROL_CHAR_CONTEXT + 1);
+  let snippet = '';
+  for (const character of text.slice(from, to)) {
+    if (isInvalidXmlControlChar(character)) {
+      snippet += CONTROL_CHAR_PLACEHOLDER;
+    } else if (/\s/.test(character)) {
+      snippet += ' ';
+    } else {
+      snippet += character;
+    }
+  }
+  return snippet;
+}
+
+/**
+ * 导出前的自检：序列化结果本身是否为合法 XML。返回 `undefined` 表示没有发现问题。
+ *
+ * 为什么需要这一层：真机反馈「导出 PNG（2×）失败、导出的 .svg 打开报错」时，
+ * 栅格化的 `onerror` 与「文件打开报错」都只是**症状**，真因可能就在序列化结果里
+ * （非法控制字符、结构不合法）。把预检放在导出路径最前面，失败文案一次说清，
+ * 不必再靠猜；本函数也因此**只在导出路径上调用**，不参与渲染、布局与动画（那些是热路径）。
+ *
+ * 两条判据**合并**返回：解析器报错（不同内核对 `parsererror` 的命名空间写法不同，
+ * 故同时按元素名与选择器兜住）与控制字符命中，两边都可能是真因。
+ *
+ * `DOMParser` 不存在时（测试桩、极简环境）**不阻断**：缺了解析器不等于结果不合法。
+ */
+function checkExportXml(text: string): string | undefined {
+  const problems: string[] = [];
+
+  // ① 交给内核自己的 XML 解析器判：「文档里取得到 parsererror 元素」是各内核的共同判据。
+  if (typeof DOMParser === 'function') {
+    try {
+      const doc = new DOMParser().parseFromString(text, 'image/svg+xml');
+      const error =
+        doc?.getElementsByTagName?.('parsererror')?.[0] ??
+        doc?.querySelector?.('parsererror') ??
+        undefined;
+      if (error) {
+        problems.push(`XML 解析器报错：${compactDiagnostic(String(error.textContent ?? ''))}`);
+      }
+    } catch (failure) {
+      problems.push(
+        `XML 解析器调用失败：${failure instanceof Error ? failure.message : String(failure)}`
+      );
+    }
+  }
+
+  // ② 控制字符扫描：只收集前若干处的位置，总数单独记 —— 大图里这类字符可能上万个。
+  let total = 0;
+  const positions: number[] = [];
+  XML_INVALID_CONTROL_CHARS.lastIndex = 0;
+  for (
+    let hit = XML_INVALID_CONTROL_CHARS.exec(text);
+    hit !== null;
+    hit = XML_INVALID_CONTROL_CHARS.exec(text)
+  ) {
+    total += 1;
+    if (positions.length < CONTROL_CHAR_MAX_REPORTS) {
+      positions.push(hit.index);
+    }
+  }
+  if (total > 0) {
+    const details = positions.map((index) => {
+      const code = (text.codePointAt(index) ?? 0).toString(16).toUpperCase().padStart(4, '0');
+      return `U+${code}（位置 ${index}，片段「${controlCharSnippet(text, index)}」）`;
+    });
+    const rest = total > positions.length ? `，另有 ${total - positions.length} 处未列出` : '';
+    problems.push(`含 XML 1.0 不允许的控制字符 ${total} 处：${details.join('；')}${rest}`);
+  }
+
+  return problems.length > 0 ? problems.join('；') : undefined;
+}
+
+/** 规范化样式取值：去首尾空白、折成小写、把连续空白压成一个空格，便于与初始值逐字比较。 */
+function normalizeStyleValue(value: string): string {
+  return value.trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+/**
+ * 该属性的取值是否与 SVG 初始值相同（相同就不必写进导出文件）。
+ *
+ * `font-family` / `font-size` 不在初始值表里，且由 `ALWAYS_INLINE_STYLE_PROPERTIES`
+ * 显式排除在跳过规则之外 —— 一律内联（理由见该常量的说明）。
+ */
+function isInitialStyleValue(property: string, value: string): boolean {
+  if (ALWAYS_INLINE_STYLE_PROPERTIES.includes(property)) {
+    return false;
+  }
+  const initials = SVG_INITIAL_STYLE_VALUES[property];
+  return initials !== undefined && initials.includes(normalizeStyleValue(value));
+}
+
+/**
+ * 把计算样式内联到克隆上。
+ *
+ * 原节点与克隆节点的 `querySelectorAll('*')` 都是**文档序**，因此按下标一一对应即可
+ * （两边结构相同，长度也相同）。
+ *
+ * ⚠️ 因此这一步必须在**任何增删克隆体元素之前**做完：先剔除 `<title>` 会让克隆体的元素
+ * 列表变短，下标随之错位，样式就会写到别的元素上（图整个走形）。
+ *
+ * 取值等于初始值的属性跳过不写（见 `isInitialStyleValue`）。
+ */
+function inlineExportStyles(source: Element, clone: Element): void {
+  const view = source.ownerDocument?.defaultView ?? window;
+  if (!view || typeof view.getComputedStyle !== 'function') {
+    return;
+  }
+  const origins: Element[] = [source, ...Array.from(source.querySelectorAll('*'))];
+  const copies: Element[] = [clone, ...Array.from(clone.querySelectorAll('*'))];
+  for (let index = 0; index < origins.length && index < copies.length; index += 1) {
+    const style = view.getComputedStyle(origins[index]);
+    // 测试桩的 getComputedStyle 可能只提供属性访问器；取不到就跳过，不能因此整段失败。
+    if (!style || typeof style.getPropertyValue !== 'function') {
+      continue;
+    }
+    for (const property of EXPORT_STYLE_PROPERTIES) {
+      const value = style.getPropertyValue(property);
+      if (!value || isInitialStyleValue(property, value)) {
+        continue;
+      }
+      copies[index].setAttribute(property, value);
+    }
+  }
+}
+
+/** UTF-8 文本 → base64（`btoa` 只接受 Latin-1，元素名/路径里的中文必须先编成字节）。 */
+function encodeBase64Utf8(text: string): string {
+  const bytes = new TextEncoder().encode(text);
+  let binary = '';
+  const chunk = 0x8000;
+  for (let index = 0; index < bytes.length; index += chunk) {
+    binary += String.fromCharCode(...Array.from(bytes.subarray(index, index + chunk)));
+  }
+  return btoa(binary);
+}
+
+/**
+ * 栅格化成 PNG：2 倍分辨率、**透明背景**（画布不画底色），再把 base64 交给宿主写盘。
+ *
+ * 五个阶段，顺序不可调换：
+ *   ⓪ 先对序列化结果做 XML 自检（`checkExportXml`）—— 结果本身不合法时，后面几步注定失败，
+ *      此时直接报错，不再建 blob / data URL；
+ *   ① 先建画布、先按 2 倍算尺寸、**先判面积闸门** —— 大图要在加载图像之前就拦掉，
+ *      否则白序列化、白编码一份超长 URL，最后才知道根本画不下；
+ *   ② 取 2D 上下文（拿不到就没有可画的地方，直接报错）；
+ *   ③ 用 **blob URL** 加载 SVG 图像（主路径）；
+ *   ④ `onload` 里画图并取 PNG；blob 加载失败时退回 data URL 再试一次，两次都失败才报错。
+ * 同步阶段（建画布 / 取上下文 / 建 blob）若抛错，同样走统一的失败出口 —— 所有 PNG 失败
+ * 都带序列化字节数，真机上不会只剩一句裸错误。
+ *
+ * **为什么主路径必须是 blob URL 而不是 data URL**：
+ *   Chromium 对 URL 长度有硬上限 **2 MB**（`url::kMaxURLChars = 2 * 1024 * 1024`）。
+ *   真机证据：276 个节点的图序列化后 **2154007 字节**，base64 后再涨约 1/3 ≈ 2.87 MB，
+ *   这个超长 data URL 会被截断 / 判为非法，`new Image()` 于是走 `onerror`；
+ *   而同一次会话里小图（如几十个节点）一切正常 —— 与 CSP 无关：`img-src data:` 本来就在
+ *   模板里，而且若真是 CSP 拦截，控制台会留一条 CSP 违规记录，而不是这样静默失败。
+ *   blob URL 只是一个指向内存 Blob 的短字符串，不受该上限约束。
+ *   data URL 仍保留为**后备**（小图照样能成，也覆盖 `createObjectURL` 不可用的环境）。
+ *
+ * 失败文案一律带上**序列化字节数**：下次再出问题，可立即判断是「图本来就大」还是其它原因。
+ */
+function rasterizePng(
+  prepared: { text: string; width: number; height: number },
+  sessionId: string
+): void {
+  const bytes = serializedBytes(prepared.text);
+  /** 统一的失败出口：每条 PNG 报错都带上序列化字节数。 */
+  const fail = (detail: unknown): void => {
+    const text = detail instanceof Error ? detail.message : String(detail);
+    reportExportFailure('png', `${text}（序列化 ${bytes} 字节）`);
+  };
+
+  try {
+    // ⓪ 序列化结果自检：必须在**加载图像之前**。
+    //    「SVG 图像加载失败」只是症状；序列化结果本身若不是合法 XML，blob URL 与 data URL
+    //    两条路都注定失败。这里直接失败并把诊断说清，**不再尝试 blob / data URL**。
+    const problem = checkExportXml(prepared.text);
+    if (problem !== undefined) {
+      fail(`序列化结果不是合法的 XML，栅格化未开始：${problem}`);
+      return;
+    }
+
+    // ① 画布与面积闸门：必须在加载图像之前。
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(prepared.width * EXPORT_SCALE));
+    canvas.height = Math.max(1, Math.round(prepared.height * EXPORT_SCALE));
+    if (canvas.width * canvas.height > MAX_CANVAS_AREA) {
+      fail(
+        `图形过大（导出尺寸 ${canvas.width} × ${canvas.height} 像素，超出画布面积上限），` +
+          `请改用「导出矢量图（SVG）」`
+      );
+      return;
+    }
+    // ② 2D 上下文。
+    const context = canvas.getContext('2d');
+    if (!context) {
+      fail('无法取得 2D 画布上下文');
+      return;
+    }
+
+    const image = new Image();
+    /** 当前用的 blob URL（用完必须释放，否则整份序列化文本会一直留在内存里）。 */
+    let objectUrl: string | undefined;
+    /** 是否已经退到 data URL 后备路径。 */
+    let triedDataUrl = false;
+
+    const releaseObjectUrl = (): void => {
+      if (objectUrl === undefined) {
+        return;
+      }
+      try {
+        URL.revokeObjectURL(objectUrl);
+      } catch {
+        // 释放失败不影响导出结果，忽略。
+      }
+      objectUrl = undefined;
+    };
+
+    /** 后备路径：小图仍可用 data URL 成功（也覆盖禁用 blob 的环境）。 */
+    const loadFromDataUrl = (): void => {
+      triedDataUrl = true;
+      image.src = `${SVG_DATA_URL_PREFIX}${encodeBase64Utf8(prepared.text)}`;
+    };
+
+    image.onload = () => {
+      // onload 之后这个 URL 已经没有用处，先释放再画图（画图用的是已解码的 image）。
+      releaseObjectUrl();
+      try {
+        // 刻意不填充底色：画布本身透明，导出的 PNG 背景因此是透明的。
+        context.drawImage(image, 0, 0, canvas.width, canvas.height);
+        const url = canvas.toDataURL('image/png');
+        if (!url.startsWith(PNG_DATA_URL_PREFIX) || url.length <= PNG_DATA_URL_PREFIX.length) {
+          // 面积虽然没超上限，画布仍可能拒绝给出图像；此时不能把空数据当成导出成功。
+          throw new Error('画布没有返回有效的 PNG 数据');
+        }
+        post({
+          type: 'exportGraph',
+          sessionId,
+          format: 'png',
+          data: url.slice(PNG_DATA_URL_PREFIX.length),
+        });
+      } catch (error) {
+        fail(error);
+      }
+    };
+    image.onerror = () => {
+      // onerror 之后这个 URL 同样要释放（不管是退到后备还是最终失败）。
+      releaseObjectUrl();
+      if (!triedDataUrl) {
+        // blob URL 没成，用 data URL 再试一次：小图仍可成功。
+        loadFromDataUrl();
+        return;
+      }
+      fail(
+        'SVG 图像加载失败（blob URL 与 data URL 两次都失败；请确认 CSP 含 img-src blob: data:，' +
+          '或图形内容不合法）'
+      );
+    };
+
+    // 主路径：blob URL。
+    try {
+      objectUrl = URL.createObjectURL(new Blob([prepared.text], { type: SVG_BLOB_TYPE }));
+      image.src = objectUrl;
+    } catch {
+      // 环境不支持 Blob / createObjectURL：直接走后备路径，而不是让整次导出失败。
+      objectUrl = undefined;
+      loadFromDataUrl();
+    }
+  } catch (error) {
+    // 同步阶段的意外抛错（环境不支持 canvas / Blob 之类）也要带上序列化字节数：
+    // 否则真机上只会看到一句裸错误，看不出「图本来就大」还是别的原因。
+    fail(error);
+  }
+}
+
+/**
+ * 导出失败必须留下可诊断的痕迹（不许静默什么都不做）。
+ *
+ * webview 没有输出通道 API，于是复用既有的 `error` 消息：宿主收到后写
+ * 「webview 报错：…」（logError），并转给视图的 onError（logWarn），两条都在输出通道里。
+ */
+function reportExportFailure(format: ExportFormat, error: unknown): void {
+  const detail = error instanceof Error ? error.message : String(error);
+  post({ type: 'error', message: `导出 ${format} 失败：${detail}` });
+}
+
 // ------------------------------------------------------------ 与宿主通信
 
 /**
@@ -3186,15 +4476,28 @@ function handleHostMessage(message: HostMessage): void {
       state.order = [];
       state.loading.clear();
       // 按会话索引的本地表也要一起清（与 update 的删除口径保持一致）：
-      // 留着只会白占内存，还可能在恢复出来的会话上套用上一次的收起状态。
+      // 留着只会在恢复出来的会话上套用上一次的收起状态。
       state.viewports.clear();
       state.collapsed.clear();
+      // 收起状态**必须用宿主那一份还原**（不是简单地清空）：宿主仍按它算坐标，
+      // 清空会让「收起的子树」既没有坐标、又不在本地的收起集合里 —— 父框画着 − 号、
+      // 子框一个都不画，用户要点两下才恢复（也是「界面与宿主分叉」）。
+      for (const entry of message.collapsed ?? []) {
+        if (typeof entry?.sessionId === 'string' && Array.isArray(entry.ids)) {
+          state.collapsed.set(entry.sessionId, new Set(entry.ids));
+        }
+      }
       pendingExpandAll = undefined;
       state.centerRequest = undefined;
       // 设置随 init 一起下发；字段缺失时保留当前值（旧宿主也能用）
       state.stickyParent = message.settings?.stickyParent ?? state.stickyParent;
       state.showLocation = message.settings?.showLocation ?? state.showLocation;
       applyPathSettings(message.settings);
+      // 临时路径过滤：把宿主那一份查询还原到输入框（面板重建时输入框是空的）。
+      // 只在宿主明确给了字段时改写 —— 旧宿主不带这个字段，不能把用户正在输入的文字清掉。
+      if (pathFilterInputEl && typeof message.pathFilterQuery === 'string') {
+        pathFilterInputEl.value = message.pathFilterQuery;
+      }
       for (const summary of message.summaries ?? []) {
         state.sessions.set(summary.id, {
           id: summary.id,
@@ -3244,7 +4547,7 @@ function handleHostMessage(message: HostMessage): void {
         state.centerRequest = session.id;
       }
       // ⚠️ 只有「新会话」才抢活动标签。宿主在 relayout（例如改「显示路径」）时会把
-      // 所有会话逐个重发一遍，无条件设 activeId 会让活动标签跳到最后一个 ——
+      // 所有会话逐个重新下发一次，无条件设 activeId 会让活动标签跳到最后一个 ——
       // 用户看到的是「标签自己跳了」，而宿主的 activeId 没变，两边就此分叉。
       if (isNew || state.activeId === undefined) {
         state.activeId = session.id;

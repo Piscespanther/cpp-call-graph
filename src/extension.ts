@@ -18,6 +18,12 @@
  */
 import * as vscode from 'vscode';
 import {
+  addFolderEntry,
+  isFolderFiltered,
+  removeFolderEntry,
+  toRelativeEntry,
+} from './hierarchy/folderFilter';
+import {
   EngineLabel,
   attributeProbeEngine,
   badgeFor,
@@ -53,13 +59,148 @@ import {
   createLayout as layoutCreateLayout,
   displayPathText as layoutDisplayPathText,
   DEFAULT_PATH_OPTIONS as layoutDefaultPathOptions,
+  pathOnlyAnchorPatterns as layoutPathOnlyAnchorPatterns,
+  parseTagPatterns as layoutParseTagPatterns,
+  resolveAnchorIndexes as layoutResolveAnchorIndexes,
+  unmatchedAnchorPatterns as layoutUnmatchedAnchorPatterns,
 } from './hierarchy/graphLayout';
 import { GraphViewProvider } from './views/graphView';
 import { renderGraphHtml } from './webview/webviewHtml';
 import { buildSessionText, copyNodeLocation, copyNodeName } from './commands/copyTree';
-import { disposeLog, logError, logInfo, logWarn, showLog } from './util/log';
+import {
+  buildExportFileName,
+  buildJsonText,
+  buildMarkdownTable,
+  buildMarkdownTree,
+} from './commands/exportGraph';
+import {
+  disposeLog,
+  isCancellation,
+  isShuttingDown,
+  logError,
+  logInfo,
+  logWarn,
+  markShuttingDown,
+  showLog,
+} from './util/log';
 
-export function activate(context: vscode.ExtensionContext): void {
+/**
+ * 供冒烟测试断言的纯函数集合（`scripts/smoke.js`）。
+ *
+ * 这些都是**不引用 vscode API** 的纯函数，但它们在打包产物里只作为内部依赖存在，
+ * 测试拿不到引用；因此由 `activate()` 的返回值交出去。返回对象同时成为本扩展对外
+ * 暴露的 API（VS Code 的约定：activate 的返回值即 `extension.exports`），
+ * 内容仅为这几个纯函数，不涉及任何状态。
+ */
+export interface ExtensionTestApi {
+  buildMarkdownTree: typeof buildMarkdownTree;
+  buildMarkdownTable: typeof buildMarkdownTable;
+  buildJsonText: typeof buildJsonText;
+  buildExportFileName: typeof buildExportFileName;
+  /** 取消类错误的判据（窗口重载时的 Canceled 不该写成警告）——供冒烟断言复用同一份实现。 */
+  isCancellation: typeof isCancellation;
+  isShuttingDown: typeof isShuttingDown;
+}
+
+/** 目录过滤设置项的键（两条右键命令共用）。 */
+const EXCLUDE_FOLDERS_KEY = 'excludeFolders';
+
+/** 读取「过滤目录」列表：数组按原样，字符串按逗号拆（手写 settings.json 时两种都能用）。 */
+function readExcludeFolders(): string[] {
+  const value = vscode.workspace
+    .getConfiguration('cppCallGraph')
+    .get<unknown>(EXCLUDE_FOLDERS_KEY, []);
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item ?? '')).filter((item) => item.trim().length > 0);
+  }
+  return typeof value === 'string' && value.trim().length > 0
+    ? value
+        .split(',')
+        .map((item) => item.trim())
+        .filter((item) => item.length > 0)
+    : [];
+}
+
+/** 写回「过滤目录」列表（写工作区设置；失败时把原因写进输出通道，不弹打扰式提示）。 */
+async function writeExcludeFolders(next: string[]): Promise<void> {
+  try {
+    await vscode.workspace
+      .getConfiguration('cppCallGraph')
+      .update(EXCLUDE_FOLDERS_KEY, next, vscode.ConfigurationTarget.Workspace);
+  } catch (error) {
+    logError('写入「过滤目录」设置失败', error);
+  }
+}
+
+/** 当前工作区根（绝对路径），用于把绝对路径换算成相对路径。 */
+function workspaceRoots(): string[] {
+  return (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath);
+}
+
+/**
+ * 资源管理器右键「添加到过滤目录」：先让用户选**相对路径**还是**绝对路径**。
+ *
+ * 相对路径写在设置里更好读、换机器也能用；绝对路径适合过滤工作区**之外**的目录
+ * （例如系统头文件目录）—— 注意那种条目匹配不到任何节点，会话里存的是相对路径，
+ * 这一点在设置说明里已写明。
+ */
+async function filterFolderCommand(uri?: vscode.Uri): Promise<void> {
+  if (!uri || uri.scheme !== 'file') {
+    logWarn('目录过滤：请在资源管理器的文件夹上使用。');
+    return;
+  }
+  const folderPath = uri.fsPath;
+  const relative = toRelativeEntry(folderPath, workspaceRoots()).relative;
+  const candidates: Array<{ label: string; description: string; value: string }> = [];
+  if (relative !== undefined) {
+    candidates.push({ label: '相对路径', description: relative, value: relative });
+  }
+  candidates.push({ label: '绝对路径', description: folderPath, value: folderPath });
+  const picked = await vscode.window.showQuickPick(candidates, {
+    title: '添加到过滤目录：写入设置的形式',
+    placeHolder: '相对路径便于阅读与换机；绝对路径适合工作区之外的目录',
+  });
+  if (!picked) {
+    return;
+  }
+  const next = addFolderEntry(readExcludeFolders(), picked.value);
+  await writeExcludeFolders(next);
+  logInfo(`目录过滤：已加入「${picked.value}」（当前 ${next.length} 条）。`);
+}
+
+/**
+ * 资源管理器右键「从过滤目录中移除」：把该目录**以及落在它内部的子条目**一并移除
+ * （用户 2026-10-15 口径）。相对形式与绝对形式都会尝试一次，因为用户加的时候可能选了任一种。
+ */
+async function unfilterFolderCommand(uri?: vscode.Uri): Promise<void> {
+  if (!uri || uri.scheme !== 'file') {
+    logWarn('目录过滤：请在资源管理器的文件夹上使用。');
+    return;
+  }
+  const folderPath = uri.fsPath;
+  const entries = readExcludeFolders();
+  const relative = toRelativeEntry(folderPath, workspaceRoots()).relative;
+  const forms = [relative, folderPath].filter(
+    (value): value is string => typeof value === 'string' && value.length > 0
+  );
+  if (!forms.some((form) => isFolderFiltered(entries, form))) {
+    logWarn(`目录过滤：该目录不在过滤列表中（${relative ?? folderPath}）。`);
+    return;
+  }
+  let next = entries;
+  let removed = 0;
+  for (const form of forms) {
+    const result = removeFolderEntry(next, form);
+    next = result.entries;
+    removed += result.removed;
+  }
+  await writeExcludeFolders(next);
+  logInfo(
+    `目录过滤：已移除 ${removed} 条（含落在该目录内部的子条目），当前剩 ${next.length} 条。`
+  );
+}
+
+export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
   logInfo('扩展已激活（底部面板 WebviewView）');
 
   // 状态栏提示已按需求完全去掉：所有信息只写输出通道（命令「显示日志」或「诊断」查看）。
@@ -297,7 +438,9 @@ export function activate(context: vscode.ExtensionContext): void {
       logWarn('复制失败：当前没有打开的调用关系标签。');
       return;
     }
-    const text = await buildSessionText(session);
+    // ⚠️ 用**所见视图**（与导出 Markdown/JSON 同一份口径）：被目录过滤或临时路径过滤
+    // 隐藏的节点不该出现在复制出来的文本里 —— 面板上根本看不到它们。
+    const text = await buildSessionText(graphPanel.exportView(session));
     if (!text) {
       logWarn('复制失败：当前标签没有可导出的内容。');
       return;
@@ -451,6 +594,13 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('cppCallGraph.copyActive', copyActive),
     vscode.commands.registerCommand('cppCallGraph.copyElement', copyElement),
     vscode.commands.registerCommand('cppCallGraph.copyLocation', copyLocation),
+    // 资源管理器右键：目录过滤的加/减（都在 `explorer/context` 里，仅对文件夹显示）
+    vscode.commands.registerCommand('cppCallGraph.filterFolder', (uri?: vscode.Uri) =>
+      filterFolderCommand(uri)
+    ),
+    vscode.commands.registerCommand('cppCallGraph.unfilterFolder', (uri?: vscode.Uri) =>
+      unfilterFolderCommand(uri)
+    ),
     vscode.commands.registerCommand('cppCallGraph.showLog', showLog),
     vscode.commands.registerCommand('cppCallGraph.diagnose', diagnose),
     // 跳转高亮用的装饰与定时器要随扩展一起释放
@@ -470,6 +620,12 @@ export function activate(context: vscode.ExtensionContext): void {
         event.affectsConfiguration('cppCallGraph.pathDisplay') ||
         event.affectsConfiguration('cppCallGraph.pathTailLevels') ||
         event.affectsConfiguration('cppCallGraph.pathAnchors') ||
+        // 名称行标签三项：改完要立刻重排，否则要重开标签才生效
+        event.affectsConfiguration('cppCallGraph.nameFolderTag') ||
+        event.affectsConfiguration('cppCallGraph.nameFolderTagStyle') ||
+        event.affectsConfiguration('cppCallGraph.nameFolderTagPick') ||
+        // 目录过滤：改完立刻重排（节点要不要显示取决于它）
+        event.affectsConfiguration('cppCallGraph.excludeFolders') ||
         event.affectsConfiguration('cppCallGraph.pathShowFileName') ||
         event.affectsConfiguration('cppCallGraph.maxLayoutNodes')
       ) {
@@ -503,9 +659,22 @@ export function activate(context: vscode.ExtensionContext): void {
     logInfo(`当前语言服务：${describeEngine(engine)}`);
   });
   void maybeWarnEngineConflict();
+
+  // 供 scripts/smoke.js 对导出的纯函数做内容断言（见 ExtensionTestApi 的说明）。
+  return {
+    buildMarkdownTree,
+    buildMarkdownTable,
+    buildJsonText,
+    buildExportFileName,
+    isCancellation,
+    isShuttingDown,
+  };
 }
 
 export function deactivate(): void {
+  // 先置停止标志：窗口重载时在途的引用/符号请求会以 Canceled 结束，
+  // 那些告警没有信息量（真机上曾一次刷出十几行）。
+  markShuttingDown();
   disposeLog();
 }
 
@@ -522,6 +691,20 @@ export const __layout = {
   /** 路径显示逻辑：让 renderCheck 能把它与 webview 渲染出来的文字做跨侧等值比对。 */
   displayPathText: layoutDisplayPathText,
   DEFAULT_PATH_OPTIONS: layoutDefaultPathOptions,
+  /**
+   * 把设置里的锚点条目换算成「路径那行用」的模式（剥括号、去掉方括号项）。
+   * renderCheck 的跨侧比对必须**照着宿主下发给面板的那一份**来喂面板，否则测的不是真链路。
+   */
+  pathOnlyAnchorPatterns: layoutPathOnlyAnchorPatterns,
+  /** 会话级「一条锚点在整个标签里都没命中」的诊断（纯函数，便于断言）。 */
+  unmatchedAnchorPatterns: layoutUnmatchedAnchorPatterns,
+  /**
+   * 路径锚点的段匹配（含括号预处理）。断言「未命中不算语法错误」用它 ——
+   * 这条只能在这里验：冒烟夹具的路径是单段的，`displayPathText` 会提前返回，走不到那一步。
+   */
+  resolveAnchorIndexes: layoutResolveAnchorIndexes,
+  /** 括号扫描（一组括号一个标签）——`{src}` 这类写法不再被当成分组，有断言钉住。 */
+  parseTagPatterns: layoutParseTagPatterns,
 };
 
 /**

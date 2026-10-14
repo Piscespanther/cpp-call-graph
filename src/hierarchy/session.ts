@@ -10,7 +10,7 @@
  *     预先算好一层，再经 `seedRoot()` 按同样的形状写进图（下面各层照旧走调用层级）
  */
 import * as vscode from 'vscode';
-import { itemKey } from './callHierarchy';
+import { isInvalidItemError, itemKey, reacquireItem } from './callHierarchy';
 import { logInfo, logWarn } from '../util/log';
 import {
   Answer,
@@ -53,7 +53,7 @@ async function withExpandTimeout<T>(work: Promise<T>, nodeName: string): Promise
       work,
       new Promise<never>((_resolve, reject) => {
         timer = setTimeout(() => {
-          // 亚秒上限只在测试里出现；生产是 20 秒。别写成「超过 0 秒」。
+          // 亚秒上限只在测试里出现；生产为 20 秒。不要写成「超过 0 秒」。
           const waited = limit >= 1000 ? `${Math.round(limit / 1000)} 秒` : `${limit} 毫秒`;
           reject(new ExpandTimeoutError(`展开「${nodeName}」等待语言服务超过 ${waited}`));
         }, limit);
@@ -120,7 +120,8 @@ export function arrangeByProximity(
   return [...rest.slice(0, half), ...center, ...rest.slice(half)];
 }
 
-export interface RootDescriptor {  name: string;
+export interface RootDescriptor {
+  name: string;
   detail?: string;
   kind: vscode.SymbolKind;
   uri: string;
@@ -217,6 +218,18 @@ export function maxChildrenPerNodeLimit(): number {
 export class CallSession {
   /** 正在展开中的节点（并发护栏：同一节点不被同时展开两次）。 */
   private readonly inflight = new Set<string>();
+  /**
+   * 「布局代次」：每次 `resetExpansion()` 自增。
+   *
+   * 为什么需要它：展开是 `await` 语言服务的异步操作，而「收起全部」可以在等待期间发生。
+   * `applyResults()` 拿到的是 await **之前**捕获的节点对象引用 —— 复位把这个节点从图里删掉之后，
+   * 它照样会把结果写回 `this.nodes`：
+   *   - 复位的是根 → 第一层被重新写回、根又被标成 `loaded`，**复位被静默撤销**；
+   *   - 复位的是中间层 → 新节点成了**不可达孤儿**（父节点已不在图里，永远画不出来），
+   *     却仍计入展开预算、会被「展开全部」当成待展开目标，还会被写进持久化快照。
+   * 因此 `expand()` 在 await 之后要比对代次，不一致就丢弃这次结果。
+   */
+  private generation = 0;
   readonly id: string;
   readonly direction: Direction;
   readonly kind: SessionKind;
@@ -259,7 +272,7 @@ export class CallSession {
       kind: symbolKindToNodeKind(rootItem.kind),
     });
     this.items.set(rootId, rootItem);
-    // 边由 graph() 现算（这里算一次的结果下一次必然被覆盖，属于白做）
+    // 边由 graph() 现算（这里算一次的结果下一次必然被覆盖，属于重复计算）
   }
 
   get rootId(): string {
@@ -269,7 +282,7 @@ export class CallSession {
   /**
    * 标签标题：只放元素名。
    *
-   * 曾经拼成「被调用:bsp_boot」这种带方向前缀的形式，但方向已经由标签上的
+   * 曾经拼成「被调用:lib_boot」这种带方向前缀的形式，但方向已经由标签上的
    * 箭头图标表达了（`call-incoming` / `call-outgoing`），前缀纯属重复，
    * 还把真正有用的名字挤到后面。方向文案仍由 DIRECTION_SHORT 提供，
    * 用于视图标题与提示。
@@ -284,6 +297,37 @@ export class CallSession {
 
   node(id: string): GraphNode | undefined {
     return this.nodes.get(id);
+  }
+
+  /**
+   * 复位「展开状态」：丢掉除根节点之外的全部已加载节点，并把根标记回**未加载**。
+   *
+   * 为什么要它：工具栏「收起全部」在用户口径里是「把展开状态彻底清掉」——
+   * 只改「收起标记」是不够的：已经取回来的节点一直留在会话里，之后再点「展开全部」
+   * 只是把旧的形状搬回来（层数也由历史点击决定，和 `maxExpandRounds` 无关）。
+   * 复位后下一次 `expand(根)` 会重新向语言服务取根的那一层，行为与新开标签一致。
+   *
+   * 返回被丢弃的节点数，供调用方写日志（不在这里做任何 UI 或持久化）。
+   */
+  resetExpansion(): number {
+    const dropped = Math.max(0, this.nodes.size - 1);
+    for (const id of [...this.nodes.keys()]) {
+      if (id !== this.rootId) {
+        this.nodes.delete(id);
+        this.items.delete(id);
+      }
+    }
+    this.edges = [];
+    const root = this.nodes.get(this.rootId);
+    if (root) {
+      root.children = [];
+      root.loaded = false;
+    }
+    // 让**在途**的展开作废（见 `generation` 的说明），同时把并发护栏一并清掉：
+    // 否则复位之后用户立刻点「+」会被旧请求的 inflight 占位挡住（点了没反应）。
+    this.generation += 1;
+    this.inflight.clear();
+    return dropped;
   }
 
   item(id: string): vscode.CallHierarchyItem | undefined {
@@ -340,12 +384,18 @@ export class CallSession {
       return 0;
     }
     this.inflight.add(nodeId);
+    // 记下这次展开属于哪一代：await 期间若发生「收起全部」（`resetExpansion`），
+    // 结果必须丢弃 —— 否则会把已经复位掉的图重新写回（见 `generation` 的说明）。
+    const generation = this.generation;
     try {
       const ancestors = this.ancestorKeys(node);
-      const results = await withExpandTimeout(
-        expandRelation(this.query, this.direction, item),
-        node.name
-      );
+      const results = await withExpandTimeout(this.fetchLevel(node, item), node.name);
+      if (generation !== this.generation) {
+        logInfo(
+          `展开「${node.name}」的结果在等待期间已被「收起全部」复位，本次结果丢弃。`
+        );
+        return 0;
+      }
       return this.applyResults(node, results, ancestors, maxNew);
     } catch (error) {
       if (error instanceof ExpandTimeoutError) {
@@ -444,6 +494,35 @@ export class CallSession {
       (id) => this.nodes.get(id)?.file ?? ''
     );
     return added;
+  }
+
+  /**
+   * 取一层的下一级；语言服务不认这个 item 时，重新认领一次再试。
+   *
+   * 为什么需要：引用兜底（`references.ts`）会**自己合成** item，窗口重载后从快照恢复的 item
+   * 也是普通对象 —— 两者都不在语言服务的内部映射里，直接拿去调 `provideIncomingCalls` 会被拒
+   * （真机日志里的 `invalid item`）。重新认领成功后把新 item 换回图里，之后各层都正常；
+   * 仍认领不到就返回空结果，让该节点按叶子收尾（不再留一个点了必然失败的「+」）。
+   */
+  private async fetchLevel(node: GraphNode, item: vscode.CallHierarchyItem): Promise<Answer[]> {
+    try {
+      return await expandRelation(this.query, this.direction, item);
+    } catch (error) {
+      if (!isInvalidItemError(error)) {
+        throw error;
+      }
+      const reacquired = await reacquireItem(item);
+      if (!reacquired) {
+        logWarn(
+          `展开「${node.name}」：语言服务不再认识该节点的内部项（引用兜底生成，或窗口重载后恢复），` +
+            `已按叶子处理；如需继续展开，请重新查询该函数。`
+        );
+        return [];
+      }
+      this.items.set(node.id, reacquired);
+      logInfo(`展开「${node.name}」：已重新获取该节点的语言服务项，继续取下一层。`);
+      return await expandRelation(this.query, this.direction, reacquired);
+    }
   }
 
   private ancestorKeys(node: GraphNode): string[] {

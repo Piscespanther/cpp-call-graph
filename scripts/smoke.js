@@ -31,6 +31,11 @@ const captured = {
   outputLines: [],
   /** 剪贴板写入内容（复制命令的断言用）。 */
   clipboard: [],
+  /** 导出写盘调用（`workspace.fs.writeFile`）与保存对话框入参，供导出的落盘断言用。 */
+  writes: [],
+  saveDialogs: [],
+  /** 保存对话框的返回值：默认 undefined = 用户取消（需要时由用例改写）。 */
+  saveDialogResult: undefined,
   /** 引用查询次数（宏兜底路径的断言用）。 */
   referenceCalls: 0,
   /** 文本搜索兜底发起过的模式串。 */
@@ -249,6 +254,10 @@ const vscodeStub = {
       }
       if (id === 'vscode.prepareCallHierarchy') {
         captured.prepareCalls += 1;
+        // 重新认领失败（真机上表现为「该节点的语言服务项已失效」）
+        if (noReacquire) {
+          return [];
+        }
         // 宏场景：宏定义处（以及任何不是引用点的位置）没有调用层级；
         // 引用点位置给出**所在函数** —— 这正是引用兜底路径要的那一层。
         if (referenceScenario !== 'call') {
@@ -259,16 +268,31 @@ const vscodeStub = {
       }
       if (id === 'vscode.provideIncomingCalls') {
         captured.incomingCalls += 1;
+        // 「语言服务不认这个 item」场景（真机日志：invalid item）
+        if (invalidItemAlways) {
+          throw new Error('invalid item');
+        }
+        if (invalidItemOnce) {
+          invalidItemOnce = false;
+          throw new Error('invalid item');
+        }
         // 挂住场景：永不 resolve，模拟语言服务卡在解析上（超时用例专用）
         if (hangExpand) {
           return new Promise(() => {});
         }
+        // 延迟放行场景（竞态用例）：把「怎么应答」放进队列，由用例决定什么时候放行
+        if (deferExpand) {
+          const name = args[0]?.name;
+          return new Promise((resolve) => {
+            deferredAnswers.push(() => {
+              const calls = callersOf[name] ?? [];
+              resolve(answerOf(calls));
+            });
+          });
+        }
         const name = args[0]?.name;
         const calls = callersOf[name] ?? [];
-        return calls.map((call) => ({
-          from: items[call.from],
-          fromRanges: [ranges.make(call.line, 2, call.line, 12)],
-        }));
+        return answerOf(calls);
       }
       if (id === 'vscode.executeReferenceProvider') {
         captured.referenceCalls += 1;
@@ -353,6 +377,16 @@ const vscodeStub = {
     showInformationMessage: () => Promise.resolve(undefined),
     showWarningMessage: () => Promise.resolve(undefined),
     showErrorMessage: () => Promise.resolve(undefined),
+    /**
+     * 导出用的保存对话框桩。
+     *
+     * 默认返回 undefined，等价于「用户点了取消」—— 那正是必须断言「不写文件、不报错」的路径。
+     * 需要断言保存成功时，用例先把 `captured.saveDialogResult` 设成一个 Uri 桩。
+     */
+    showSaveDialog: (options) => {
+      captured.saveDialogs.push(options);
+      return Promise.resolve(captured.saveDialogResult);
+    },
     /**
      * 编辑器桩：记录跳转与高亮，供测试断言。
      * 扩展在 openLocation 里会调用 revealRange / selection / setDecorations，
@@ -457,7 +491,11 @@ const vscodeStub = {
     fs: {
       createDirectory: () => Promise.resolve(),
       readFile: () => Promise.resolve(new Uint8Array()),
-      writeFile: () => Promise.resolve(),
+      // 记录落盘调用：导出断言要确认「写了几次、写的是什么、写到哪个路径」。
+      writeFile: (uri, bytes) => {
+        captured.writes.push({ uri, bytes });
+        return Promise.resolve();
+      },
     },
   },
   env: { clipboard: { writeText: (text) => { captured.clipboard.push(text); return Promise.resolve(); } } },
@@ -507,6 +545,28 @@ const macroOwnerByLine = { 5: 'compute', 10: 'main' };
 let referenceScenario = 'call';
 /** 置为 true 时 `provideIncomingCalls` 永不返回（验证展开超时，见"语言服务挂住"用例）。 */
 let hangExpand = false;
+/**
+ * 置为 true 时 `provideIncomingCalls` 把应答排进 `deferredAnswers`，由用例手动放行。
+ *
+ * 用来构造「展开还在路上时按下收起全部」这类竞态（检视发现的幽灵节点缺陷）。
+ */
+let deferExpand = false;
+/** 延迟应答的放行函数（调用即让对应的那次请求 resolve）。 */
+const deferredAnswers = [];
+/** 「语言服务不认这个 item」场景：下一次 `provideIncomingCalls` 抛 `invalid item`。 */
+let invalidItemOnce = false;
+/** 同上但每次抛（用于「重新认领也失败」的用例）。 */
+let invalidItemAlways = false;
+/** `prepareCallHierarchy` 返回空（模拟重新认领失败）。 */
+let noReacquire = false;
+
+/** 把「被谁调用」的夹具转成语言服务返回的形状（三处共用，避免各写一份）。 */
+function answerOf(calls) {
+  return calls.map((call) => ({
+    from: items[call.from],
+    fromRanges: [ranges.make(call.line, 2, call.line, 12)],
+  }));
+}
 
 function makeMacroEditor(line, character) {
   return {
@@ -662,8 +722,21 @@ function assert(condition, message) {
 }
 
 async function main() {
-  extension.activate(fakeContext);
+  const api = extension.activate(fakeContext);
   await new Promise((resolve) => setTimeout(resolve, 300));
+
+  // 0) activate 的返回值：导出的纯函数接口（供本文件的纯函数内容断言使用）
+  for (const name of [
+    'buildMarkdownTree',
+    'buildMarkdownTable',
+    'buildJsonText',
+    'buildExportFileName',
+  ]) {
+    assert(
+      typeof api?.[name] === 'function',
+      `activate 的返回值里缺少纯函数 ${name}（导出功能无法在无 VS Code 环境里断言）`
+    );
+  }
 
   // 1) 命令与视图注册
   const expectedCommands = [
@@ -749,15 +822,15 @@ async function main() {
       const message = [...captured.posted].reverse().find((item) => item.type === 'init');
       return message?.settings?.pathAnchors;
     };
-    const fromString = await anchorsAfterReady('chip,chip+1');
+    const fromString = await anchorsAfterReady('mods,mods+1');
     assert(
-      Array.isArray(fromString) && fromString.join('|') === 'chip|chip+1',
-      `"chip,chip+1" 应当被拆成两个模式，实际 ${JSON.stringify(fromString)}`
+      Array.isArray(fromString) && fromString.join('|') === 'mods|mods+1',
+      `"mods,mods+1" 应当被拆成两个模式，实际 ${JSON.stringify(fromString)}`
     );
-    const fromArray = await anchorsAfterReady(['chip,chip+1']);
+    const fromArray = await anchorsAfterReady(['mods,mods+1']);
     assert(
-      Array.isArray(fromArray) && fromArray.join('|') === 'chip|chip+1',
-      `["chip,chip+1"] 这种写法也应当被拆成两个模式，实际 ${JSON.stringify(fromArray)}`
+      Array.isArray(fromArray) && fromArray.join('|') === 'mods|mods+1',
+      `["mods,mods+1"] 这种写法也应当被拆成两个模式，实际 ${JSON.stringify(fromArray)}`
     );
     delete configStore['cppCallGraph.pathAnchors'];
   }
@@ -963,7 +1036,23 @@ async function main() {
     captured.clipboard[0].includes('leafAdd'),
     '「复制整个标签」的内容应当包含根符号名'
   );
-  console.log(`诊断: 复制整个标签 → ${captured.clipboard[0].split('\n').length} 行`);
+  // ⚠️ 正文逻辑已收敛到纯函数 buildMarkdownTree（copyTree.buildSessionText 现在只是外层进度
+  //    提示）。这里对**同一份会话**逐字比对两条路径：复制命令的剪贴板内容 === 纯函数输出。
+  //    两者一旦分叉（例如有人又往 copyTree 里加了一段格式化），这条断言立刻失败。
+  {
+    const sessionForTree = captured.webviewViewProvider.provider.activeSession;
+    assert(sessionForTree !== undefined, '复制整个标签之后应当仍有活动会话');
+    const treeFromPureFunction = api.buildMarkdownTree(sessionForTree);
+    assert(
+      captured.clipboard[0] === treeFromPureFunction,
+      '「复制整个标签」的正文必须与 buildMarkdownTree 逐字一致（两处不能各写一套格式）'
+    );
+    assert(
+      treeFromPureFunction.startsWith('# 被调用关系：'),
+      `结构树应当以方向标签开头，实际 ${JSON.stringify(treeFromPureFunction.slice(0, 24))}`
+    );
+  }
+  console.log(`诊断: 复制整个标签 → ${captured.clipboard[0].split('\n').length} 行（与 buildMarkdownTree 逐字相同）`);
 
   console.log('--- 跳转与高亮 ---');
   // 双击方框会发 openLocation；宿主应打开文件、定位并加一个临时高亮
@@ -1093,6 +1182,47 @@ async function main() {
     );
   }
 
+  // 「收起全部」的**完全复位**语义（用户 2026-10-14 口径：按下折叠按钮要清掉展开状态的记忆）。
+  // 只把「收起标记」清掉是不够的：已取回的节点一直留在会话里，之后再点「展开全部」只是把
+  // 旧形状搬回来，层数由历史点击决定、与设置里的 maxExpandRounds 无关。复位必须真的丢掉数据，
+  // 这样下一次展开才是「重新读取」。
+  {
+    currentRootName = 'leafAdd';
+    await registered.get('cppCallGraph.showCallers')();
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    const fresh = lastSessionPayload();
+    fake.send({ type: 'expandAll', sessionId: fresh.id });
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const expanded = lastSessionPayload();
+    const beforeCount = Object.keys(expanded.nodes).length;
+    assert(beforeCount > 1, `前提：复位前应当已展开出多个节点，实际 ${beforeCount} 个`);
+
+    fake.send({ type: 'resetExpansion', sessionId: expanded.id });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const afterReset = lastSessionPayload();
+    const remaining = Object.keys(afterReset.nodes);
+    assert(
+      remaining.length === 1,
+      `复位后只应剩根节点，实际 ${remaining.length} 个（${remaining.join(', ')}）`
+    );
+    assert(
+      afterReset.boxes[remaining[0]] !== undefined,
+      '复位后剩下的那一个节点必须仍拿到坐标（否则画面会空白）'
+    );
+
+    // 复位之后「展开全部」必须是**重新读取**：数据已丢，能重新长出节点就证明根被重新查询过
+    fake.send({ type: 'expandAll', sessionId: afterReset.id });
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const afterAgain = lastSessionPayload();
+    assert(
+      Object.keys(afterAgain.nodes).length > 1,
+      '复位后「展开全部」应当能重新读取并展开（根节点必须已标回未加载）'
+    );
+    console.log(
+      `诊断: 收起全部即完全复位 —— ${beforeCount} 个节点 → 复位后 1 个 → 重新展开 ${Object.keys(afterAgain.nodes).length} 个`
+    );
+  }
+
   // 关键回归：宿主不传 progress 对象时，「展开全部」也必须能跑完。
   // 曾经因为直接调 progress.report(...) 而在第一轮就抛错，
   // 表现为「点了没反应」——这是用户实际报过的问题。
@@ -1195,7 +1325,7 @@ async function main() {
       oneRoundNodes < fiveRoundNodes,
       `层数上限设为 1 时应当比默认档展开得少：1 层 ${oneRoundNodes} 个、默认 ${fiveRoundNodes} 个`
     );
-    // 收尾：把这条会话也展开完全，别让后面的用例继承一棵半开的树
+    // 收尾：把这条会话也展开完全，避免后续用例继承未完全展开的树
     fake.send({ type: 'expandFull', sessionId: lastSessionPayload().id });
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
@@ -1227,11 +1357,489 @@ async function main() {
     delete configStore['cppCallGraph.maxLayoutNodes'];
   }
 
+  // 目录过滤（设置 `cppCallGraph.excludeFolders`，用户 2026-10-15）：断言真实链路 ——
+  // 设置 → 宿主裁剪 payload（节点与坐标都少掉）+ 输出通道说明条数；删掉设置后节点全部回来。
+  {
+    const before = lastSessionPayload();
+    const beforeCount = Object.keys(before.nodes).length;
+    configStore['cppCallGraph.excludeFolders'] = ['demo.cpp'];
+    fake.send({ type: 'expandFull', sessionId: before.id });
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const filtered = lastSessionPayload();
+    const afterCount = Object.keys(filtered.nodes).length;
+    assert(
+      afterCount < beforeCount,
+      `过滤 demo.cpp 后节点数应当变少（之前 ${beforeCount}，之后 ${afterCount}）`
+    );
+    assert(
+      Object.keys(filtered.boxes).every((id) => filtered.nodes[id] !== undefined),
+      '被过滤掉的节点不得留下坐标（否则 webview 会画出一个没有数据的空框）'
+    );
+    assert(
+      captured.outputLines.some((line) => /目录过滤：隐藏 \d+ 个节点/.test(line)),
+      `输出通道应当说明过滤掉多少节点，实际最后几行 ${JSON.stringify(captured.outputLines.slice(-3))}`
+    );
+    delete configStore['cppCallGraph.excludeFolders'];
+    fake.send({ type: 'expandFull', sessionId: filtered.id });
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    assert(
+      Object.keys(lastSessionPayload().nodes).length === beforeCount,
+      '删掉过滤条目后节点应当全部回来（过滤只影响显示，不丢数据、也不需要重新请求语言服务）'
+    );
+    console.log(
+      `诊断: 目录过滤 —— ${beforeCount} 个节点 → 过滤 demo.cpp 后 ${afterCount} 个 → 取消后回到 ${beforeCount} 个`
+    );
+  }
+
+  // 临时路径过滤（面板搜索栏右侧的输入框，用户 2026-10-15）：端到端断言「所有标签通用」、
+  // 「命中节点连同子树消失」、「清空即恢复」，以及它是**临时**的（不写设置、不进快照）。
+  // 匹配语义（子串 + 通配）本身由 layoutCheck 的 14 条用例覆盖，这里只验真实链路。
+  {
+    // 需要两个**都有内容**的标签：同根不同方向 = 两个会话（compute 的调用者是 main、
+    // 它调用的有 leafAdd 与 isEven，两边都非空）。用同一个根也让「查询对所有标签生效」更直观。
+    await registered.get('cppCallGraph.closeAllTabs')();
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    currentRootName = 'compute';
+    await registered.get('cppCallGraph.showCallers')();
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    currentRootName = 'compute';
+    await registered.get('cppCallGraph.showCallees')();
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    const provider = captured.webviewViewProvider.provider;
+    /** 从已下发的消息里收集「每个标签最近一次的 payload」。 */
+    const payloadsById = () => {
+      const map = new Map();
+      for (const message of captured.posted) {
+        if (message.type === 'sessionUpdate' && message.session) {
+          map.set(message.session.id, message.session);
+        } else if (message.type === 'init') {
+          for (const session of message.sessions ?? []) {
+            map.set(session.id, session);
+          }
+        }
+      }
+      return map;
+    };
+    const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    // 基线：先用一个不可能命中的查询逼宿主把**当前全部标签**重新下发一次。
+    // 不能直接拿 `captured.posted` 里已有的消息当基线 —— 里面还留着更早用例（含已关闭会话）的
+    // payload，会认出一批幽灵标签来。
+    captured.posted.length = 0;
+    fake.send({ type: 'pathFilter', query: 'zzz-no-such-path' });
+    await wait(120);
+    const baseline = payloadsById();
+    assert(
+      baseline.size >= 2,
+      `本用例需要至少两个标签（临时过滤要「所有标签通用」），实际 ${baseline.size} 个`
+    );
+    const beforeCounts = new Map(
+      [...baseline].map(([id, session]) => [id, Object.keys(session.nodes).length])
+    );
+    for (const [id, count] of beforeCounts) {
+      assert(count >= 2, `标签 ${id} 应当至少有两个节点，否则过滤看不出效果（实际 ${count} 个）`);
+      assert(
+        baseline.get(id).filteredCount === undefined,
+        `没命中的查询不该隐藏任何节点（标签 ${id} 却报了 ${baseline.get(id).filteredCount} 个）`
+      );
+    }
+
+    const configKeysBefore = Object.keys(configStore).join(',');
+    // 夹具里所有节点的文件都是 demo.cpp：查询 demo 应当把除根以外的节点全部隐藏
+    captured.posted.length = 0;
+    captured.outputLines.length = 0;
+    fake.send({ type: 'pathFilter', query: 'demo' });
+    await wait(120);
+
+    const after = payloadsById();
+    for (const [id, count] of beforeCounts) {
+      const session = after.get(id);
+      assert(
+        session !== undefined,
+        `过滤是窗口级的：非活动标签 ${id} 也必须重发一次 payload`
+      );
+      const kept = Object.keys(session.nodes).length;
+      assert(
+        kept === 1 && session.nodes[session.rootId] !== undefined,
+        `查询 demo 应当只剩根节点（根永不参与过滤），标签 ${id} 实际留下 ${kept} 个`
+      );
+      assert(
+        session.filteredCount === count - 1,
+        `payload 应当带上被隐藏的数量（含子树）：标签 ${id} 期望 ${count - 1}，实际 ${session.filteredCount}`
+      );
+      assert(
+        Object.keys(session.boxes).every((boxId) => session.nodes[boxId] !== undefined),
+        '被临时过滤掉的节点不得留下坐标（否则面板会画出一个没有数据的空框）'
+      );
+    }
+    assert(
+      captured.outputLines.some((line) => /临时路径过滤：隐藏 \d+ 个节点/.test(line)),
+      `输出通道应当说明临时过滤隐藏了多少，实际最后几行 ${JSON.stringify(captured.outputLines.slice(-3))}`
+    );
+    assert(
+      provider.__debugSnapshot().pathFilterQuery === 'demo',
+      '宿主应当保留当前查询（面板重建时要靠它还原输入框）'
+    );
+    // init 必须把这份查询一起下发：面板被隐藏后重新显示时 webview 会重建（输入框是空的），
+    // 而宿主这份查询还活着 —— 不下发就会出现「界面看着没过滤、图却是过滤后的」，
+    // 而且用户没有任何办法清掉它（除非先随便打一个字再删掉）。
+    captured.posted.length = 0;
+    fake.send({ type: 'ready' });
+    await wait(60);
+    const initMessage = captured.posted.find((message) => message.type === 'init');
+    assert(
+      initMessage !== undefined,
+      `发 ready 之后应当收到 init，实际收到 ${captured.posted.map((m) => m.type).join(',') || '（无）'}`
+    );
+    assert(
+      initMessage.pathFilterQuery === 'demo',
+      `init 必须带上当前的临时过滤查询（面板重建靠它还原输入框），实际 ${JSON.stringify(
+        initMessage.pathFilterQuery
+      )}`
+    );
+    assert(
+      Object.keys(configStore).join(',') === configKeysBefore,
+      '临时过滤不得写入任何设置（它是临时的，清空即恢复、重载即消失）'
+    );
+    const snapshot = JSON.stringify(storage.get('cppCallGraph.sessions') ?? null);
+    assert(
+      snapshot.length > 10,
+      '本用例需要一份真的写过的会话快照，否则「不进快照」这条断言是空的'
+    );
+    assert(
+      !/pathFilter|filteredCount|filterQuery/.test(snapshot),
+      '临时过滤不得写进持久化快照（重载窗口后必须回到「没有过滤」）'
+    );
+
+    // 清空查询：所有标签的节点全部回来（这一步必须在任何展开之前 —— 展开会改变节点数，
+    // 之后就再也回不到这份基线了）
+    captured.posted.length = 0;
+    fake.send({ type: 'pathFilter', query: '' });
+    await wait(120);
+    const restored = payloadsById();
+    for (const [id, count] of beforeCounts) {
+      const session = restored.get(id);
+      assert(session !== undefined, `清空查询后标签 ${id} 应当重发 payload`);
+      assert(
+        Object.keys(session.nodes).length === count,
+        `清空查询后标签 ${id} 的节点应当全部回来：期望 ${count}，实际 ${
+          Object.keys(session.nodes).length
+        }`
+      );
+      assert(
+        session.filteredCount === undefined,
+        '没有隐藏时不应带 filteredCount（面板按「没有隐藏」处理）'
+      );
+    }
+
+    // 收起全部（完全复位）之后过滤仍然有效：查询还在输入框里，重新取回的数据照样要被过滤。
+    // 这里重新施加一次查询，然后复位 + 完全展开 —— 若过滤随复位一起被清掉，节点会全回来。
+    fake.send({ type: 'pathFilter', query: 'demo' });
+    await wait(120);
+    const resetTarget = provider.__debugSnapshot().sessionIds[0];
+    fake.send({ type: 'resetExpansion', sessionId: resetTarget });
+    await wait(80);
+    captured.posted.length = 0;
+    fake.send({ type: 'expandFull', sessionId: resetTarget });
+    await wait(280);
+    const afterReset = payloadsById().get(resetTarget);
+    assert(
+      afterReset !== undefined && Object.keys(afterReset.nodes).length === 1,
+      `复位并重新展开后，命中查询的节点仍应被隐藏（实际留下 ${
+        afterReset === undefined ? '(没有 payload)' : Object.keys(afterReset.nodes).length
+      } 个）—— 过滤不该被「收起全部」清掉`
+    );
+    assert(
+      afterReset !== undefined && afterReset.filteredCount > 0,
+      '复位后重新取回的数据也应当重新统计隐藏数量'
+    );
+
+    // 收尾：清空查询。**必须清**，否则后面那些用例的节点都是 demo.cpp、会被这个查询整片隐藏。
+    captured.posted.length = 0;
+    fake.send({ type: 'pathFilter', query: '' });
+    await wait(120);
+    assert(
+      provider.__debugSnapshot().pathFilterQuery === '',
+      '清空后宿主手里的查询也应当清空'
+    );
+    for (const [id, session] of payloadsById()) {
+      assert(
+        session.filteredCount === undefined,
+        `收尾清空后标签 ${id} 不该还报隐藏数量（实际 ${session.filteredCount}）`
+      );
+    }
+    console.log(
+      `诊断: 临时路径过滤 —— ${baseline.size} 个标签各 ${[...beforeCounts.values()].join('/')} 个节点` +
+        ` → 查询 demo 后各只剩根（filteredCount 已下发） → 清空后全部回来` +
+        ` → 重新查询后做「收起全部 + 完全展开」仍只剩根；查询既不进设置也不进快照`
+    );
+  }
+
+  // ---- 2026-10-16 检视修掉的四类缺陷：各自的端到端回归 ----
+  {
+    const provider = captured.webviewViewProvider.provider;
+    const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const open = async (command) => {
+      await registered.get('cppCallGraph.closeAllTabs')();
+      await wait(40);
+      currentRootName = 'leafAdd';
+      await registered.get(command)();
+      await wait(80);
+    };
+
+    // ① 展开在途 + 「收起全部」：在途结果必须丢弃（曾经会把复位后的图重新写回）
+    await open('cppCallGraph.showCallers');
+    {
+      const session = lastSessionPayload();
+      const sessionId = session.id;
+      // 开标签时根的那一层已经自动取回，所以挑一个**仍未加载的子节点**来展开
+      const target = Object.values(session.nodes).find(
+        (node) => node.id !== session.rootId && node.canExpand
+      );
+      assert(
+        target !== undefined,
+        '竞态用例的前提：根的第一层里应当有一个尚未展开的节点'
+      );
+      captured.posted.length = 0;
+      captured.outputLines.length = 0;
+      deferExpand = true;
+      fake.send({ type: 'expand', sessionId, nodeId: target.id });
+      await wait(60);
+      assert(deferredAnswers.length === 1, '竞态用例的前提：语言服务请求应当已经发出且被挂住');
+      fake.send({ type: 'resetExpansion', sessionId });
+      await wait(60);
+      for (const release of deferredAnswers.splice(0)) {
+        release();
+      }
+      await wait(140);
+      deferExpand = false;
+      const after = lastSessionPayload();
+      const kept = Object.keys(after.nodes).length;
+      assert(
+        kept === 1,
+        `「收起全部」之后语言服务才返回：不得把节点重新写回（期望只剩根 1 个，实际 ${kept} 个）—— ` +
+          '这就是检视发现的幽灵节点：非根的在途结果会成为不可达孤儿，还会进快照、吃展开预算'
+      );
+      assert(
+        after.nodes[after.rootId]?.canExpand === true,
+        '在途结果被丢弃后，根必须仍是「未加载」（否则复位被静默撤销、第一层又冒出来）'
+      );
+      assert(
+        captured.outputLines.some((line) => line.includes('本次结果丢弃')),
+        `应当记一条「结果丢弃」的说明，实际最后几行 ${JSON.stringify(captured.outputLines.slice(-2))}`
+      );
+      console.log(`诊断: 展开在途 + 收起全部 —— 复位保持不变（只剩 ${kept} 个节点，在途结果被丢弃）`);
+    }
+
+    // ② 导出与「图里看到的」一致：被过滤隐藏的节点不得出现在落盘内容里。
+    //    ⚠️ 必须走**真实导出链路**（settings/过滤 → exportGraph 消息 → 保存对话框 → 落盘），
+    //    只调 `exportView()` 是测不到「导出到底用了哪份数据」的（反向检查抓到过这一点）。
+    {
+      await open('cppCallGraph.showCallers');
+      const session = provider.activeSession;
+      const payload = lastSessionPayload();
+      const hiddenName = Object.values(payload.nodes).find(
+        (node) => node.id !== payload.rootId
+      )?.name;
+      assert(hiddenName !== undefined, '导出用例需要一个非根节点');
+      const exportText = async (format) => {
+        captured.writes.length = 0;
+        captured.saveDialogs.length = 0;
+        captured.saveDialogResult = {
+          scheme: 'file',
+          fsPath: path.join(ROOT, `导出过滤测试.${format === 'json' ? 'json' : 'md'}`),
+          toString: () => '',
+        };
+        fake.send({ type: 'exportGraph', sessionId: session.id, format });
+        await wait(90);
+        return captured.writes.map((write) => Buffer.from(write.bytes).toString('utf8')).join('');
+      };
+      const fullText = await exportText('md-tree');
+      assert(
+        fullText.includes(hiddenName),
+        '没有过滤时导出应当包含全部已展开节点（否则下面那条断言没有区分度）'
+      );
+      // 目录过滤：夹具里所有节点的文件都是 demo.cpp → 非根节点全被隐藏
+      configStore['cppCallGraph.excludeFolders'] = ['demo.cpp'];
+      const filteredText = await exportText('md-tree');
+      assert(
+        filteredText.length > 0 && !filteredText.includes(hiddenName),
+        '目录过滤隐藏掉的节点不该出现在导出的 Markdown 里（PNG/SVG 从画布抓、天然只有可见节点）'
+      );
+      delete configStore['cppCallGraph.excludeFolders'];
+      // 临时路径过滤同理（换成 JSON 格式，顺带覆盖另一条宿主生成路径）
+      fake.send({ type: 'pathFilter', query: 'demo' });
+      await wait(120);
+      const queryText = await exportText('json');
+      assert(
+        queryText.length > 0 && !queryText.includes(hiddenName),
+        '临时路径过滤隐藏掉的节点不该出现在导出的 JSON 里'
+      );
+      fake.send({ type: 'pathFilter', query: '' });
+      await wait(120);
+      const restoredText = await exportText('md-tree');
+      assert(
+        restoredText.includes(hiddenName),
+        '清空过滤后导出应当恢复为全量（说明上一条不是被别的原因弄没的）'
+      );
+      console.log('诊断: 导出所见即所得 —— 目录过滤与临时过滤隐藏的节点都不出现在落盘的 MD/JSON 里');
+    }
+
+    // ③ 「展开全部」的预算与目标按**可见节点**算：隐藏分支不该被请求
+    {
+      await open('cppCallGraph.showCallers');
+      fake.send({ type: 'pathFilter', query: 'demo' });
+      await wait(120);
+      const session = lastSessionPayload();
+      const before = captured.incomingCalls;
+      fake.send({ type: 'expandFull', sessionId: session.id });
+      await wait(320);
+      const calls = captured.incomingCalls - before;
+      const after = lastSessionPayload();
+      assert(
+        Object.keys(after.nodes).length === 1,
+        `过滤生效时「完全展开」不该让节点回到图上（实际 ${Object.keys(after.nodes).length} 个）`
+      );
+      assert(
+        calls <= 1,
+        `被过滤隐藏的分支不该被展开：期望最多请求 1 次（可见的根那一层），实际 ${calls} 次`
+      );
+      fake.send({ type: 'pathFilter', query: '' });
+      await wait(120);
+      console.log(`诊断: 展开预算按可见节点算 —— 过滤下「完全展开」只请求了 ${calls} 次`);
+    }
+
+    // ④ init 必须带回宿主的收起状态（面板重建/可见性变化后两边不再分叉）
+    {
+      await open('cppCallGraph.showCallers');
+      const session = lastSessionPayload();
+      const target = Object.values(session.nodes).find((node) => node.id !== session.rootId);
+      assert(target !== undefined, '收起状态用例需要一个非根节点');
+      fake.send({ type: 'collapse', sessionId: session.id, collapsed: [target.id] });
+      await wait(80);
+      captured.posted.length = 0;
+      fake.send({ type: 'ready' });
+      await wait(60);
+      const initMessage = captured.posted.find((message) => message.type === 'init');
+      const entry = (initMessage?.collapsed ?? []).find(
+        (item) => item.sessionId === session.id
+      );
+      assert(
+        entry !== undefined && entry.ids.includes(target.id),
+        `init 必须下发宿主的收起状态（面板会清空本地收起表，不清就出现「父框画着 −、子框不画」），实际 ${JSON.stringify(
+          initMessage?.collapsed
+        )}`
+      );
+      console.log(`诊断: init 下发收起状态 —— 标签 ${session.id.slice(0, 6)}… 带了 1 个已收起节点`);
+    }
+
+    // ⑤ 锚点诊断：只在**整个标签里一处都没命中**时提示，且不再把「本路径没命中」说成语法错误
+    {
+      await open('cppCallGraph.showCallers');
+      captured.outputLines.length = 0;
+      configStore['cppCallGraph.pathAnchors'] = ['zzz_nosuch_dir'];
+      fake.send({ type: 'ready' });
+      await wait(80);
+      const lines = captured.outputLines;
+      assert(
+        lines.some((line) => line.includes('均未命中')),
+        `一条都没命中的锚点应当提示一次，实际最后几行 ${JSON.stringify(lines.slice(-3))}`
+      );
+      assert(
+        !lines.some((line) => line.includes('写法无法解析')),
+        '「某条路径上没有这个段」不该被当成语法错误（多文件图上必然出现，那是误报）'
+      );
+      // 下发那一份必须是**剥过括号**的（面板不懂括号语义；漏了这一步就是 F0：
+      // 圆括号锚点在面板上的路径那行不生效、两侧文字分叉）
+      captured.posted.length = 0;
+      configStore['cppCallGraph.pathAnchors'] = ['(src)', '[sub]', 'bare'];
+      fake.send({ type: 'ready' });
+      await wait(80);
+      const initWithAnchors = captured.posted.find((message) => message.type === 'init');
+      assert(
+        (initWithAnchors?.settings?.pathAnchors ?? []).join('|') === 'src|bare',
+        `设置里下发面板的锚点必须是剥过括号的那一份（期望 src|bare），实际 ${JSON.stringify(
+          initWithAnchors?.settings?.pathAnchors
+        )}`
+      );
+      delete configStore['cppCallGraph.pathAnchors'];
+      // JSON 导出的截断信息必须显式写出来
+      const json = JSON.parse(api.buildJsonText(provider.exportView(provider.activeSession)));
+      assert(
+        json.truncated && typeof json.truncated.nodes === 'boolean' && typeof json.truncated.depth === 'boolean',
+        `JSON 导出必须写明是否被截断过，实际 ${JSON.stringify(json.truncated)}`
+      );
+      console.log('诊断: 锚点诊断与 JSON 截断标记 —— 只报「一处都没命中」，JSON 带 truncated');
+    }
+
+    // ⑦ 语言服务不认 item（真机日志：`invalid item`）：重新认领后照常展开；认领不到按叶子收尾。
+    //    成因：引用兜底会自己合成 item，窗口重载后恢复的 item 也是普通对象 —— 语言服务不认它们。
+    {
+      await open('cppCallGraph.showCallers');
+      const session = lastSessionPayload();
+      const target = Object.values(session.nodes).find(
+        (node) => node.id !== session.rootId && node.canExpand
+      );
+      assert(target !== undefined, 'invalid item 用例需要一个可展开的子节点');
+      const beforeCount = Object.keys(session.nodes).length;
+      captured.outputLines.length = 0;
+      invalidItemOnce = true;
+      fake.send({ type: 'expand', sessionId: session.id, nodeId: target.id });
+      await wait(140);
+      const healed = lastSessionPayload();
+      assert(
+        Object.keys(healed.nodes).length > beforeCount,
+        `重新认领成功后应当照常展开出下一层（之前 ${beforeCount} 个，现在 ${Object.keys(healed.nodes).length} 个）`
+      );
+      assert(
+        captured.outputLines.some((line) => line.includes('已重新获取该节点的语言服务项')),
+        `应当记一条「已重新获取」的说明，实际最后几行 ${JSON.stringify(captured.outputLines.slice(-2))}`
+      );
+      // 认领也失败：按叶子收尾，不再留一个点了必然失败的「+」，并且给一句人话
+      const target2 = Object.values(healed.nodes).find(
+        (node) => node.id !== healed.rootId && node.canExpand
+      );
+      assert(target2 !== undefined, 'invalid item 第二个用例需要一个仍未展开的节点');
+      captured.outputLines.length = 0;
+      invalidItemAlways = true;
+      noReacquire = true;
+      fake.send({ type: 'expand', sessionId: session.id, nodeId: target2.id });
+      await wait(140);
+      invalidItemAlways = false;
+      noReacquire = false;
+      const finalPayload = lastSessionPayload();
+      assert(
+        finalPayload.nodes[target2.id]?.canExpand === false,
+        '认领不到时必须按叶子收尾（界面不再画一个点了必然失败的加号）'
+      );
+      assert(
+        captured.outputLines.some((line) => line.includes('已按叶子处理')),
+        `应当记一条「已按叶子处理」的说明，实际最后几行 ${JSON.stringify(captured.outputLines.slice(-3))}`
+      );
+      // 取消类错误不该被写成警告（窗口重载时每个在途请求都会以 Canceled 结束）
+      assert(
+        api.isCancellation(new Error('Canceled')) === true,
+        'Canceled 应当判为「已取消」'
+      );
+      assert(
+        api.isCancellation(new Error('boom')) === false,
+        '普通错误不该被判成「已取消」'
+      );
+      assert(api.isShuttingDown() === false, '此时扩展并未停止');
+      console.log(
+        `诊断: invalid item 自愈 —— 重新认领后照常展开（${beforeCount} → ${
+          Object.keys(healed.nodes).length
+        } 个），认领不到按叶子收尾，取消类错误不写警告`
+      );
+    }
+  }
+
   // 语言服务挂住：必须放弃本次展开，且**不能**把「没响应」写成「没有下一层调用关系」；
   // 之后服务恢复时还要能重试成功（证明 inflight 已释放、节点没被标记为已加载）。
   {
     const originalTimeout = extension.__session.expandTimeout.ms;
-    extension.__session.expandTimeout.ms = 30; // 调小，别让测试等 20 秒
+    extension.__session.expandTimeout.ms = 30; // 调小，避免测试等待 20 秒
     // ⚠️ 必须先关掉全部标签再开新会话：宿主会复用同一个（方向 + 根）的会话，
     // 而前一个用例刚刚把它 expandFull 过 —— 直接开新会话会继承一棵"已全部加载"的树，
     // 找不到可展开的节点（第一版就是这么失败的）。
@@ -1589,6 +2197,148 @@ async function main() {
     console.log(
       `OK: 晚到的 collapse / selectNode / reportWidths 不会给已关闭会话 ${victim} 留下缓存条目`
     );
+
+    // D) 导出消息的宿主侧：正文由宿主生成、保存对话框取消时不写文件也不报错。
+    //    这是**端到端**的宿主路径（webview → 消息 → 保存对话框 → 写盘），
+    //    桩里唯一替不掉的是真实 VS Code 的对话框与文件系统。
+    {
+      const exportSession = provider.activeSession;
+      assert(exportSession !== undefined, '导出用例需要至少一个存活标签');
+      const exportSessionId = exportSession.id;
+      // 工作区根（桩里 workspaceFolders[0].uri.fsPath = ROOT），用来核对默认保存路径
+      const workspaceRoot = ROOT;
+
+      const savedTo = { scheme: 'file', fsPath: path.join(ROOT, '导出测试.md'), toString: () => '' };
+      const errorLines = () =>
+        captured.outputLines.filter((line) => line.startsWith('error:')).length;
+      const sendExport = async (format, data) => {
+        captured.writes.length = 0;
+        captured.saveDialogs.length = 0;
+        const before = errorLines();
+        fake.send({ type: 'exportGraph', sessionId: exportSessionId, format, data });
+        await tick();
+        return before;
+      };
+
+      // ① 用户取消（showSaveDialog 返回 undefined）：不写文件、不报错
+      captured.saveDialogResult = undefined;
+      const errorsBeforeCancel = await sendExport('md-tree');
+      assert(
+        captured.saveDialogs.length === 1,
+        `导出应当先问一次保存位置，实际 ${captured.saveDialogs.length} 次`
+      );
+      assert(
+        captured.writes.length === 0,
+        `用户取消时不应写文件，实际写了 ${captured.writes.length} 次`
+      );
+      assert(
+        errorLines() === errorsBeforeCancel,
+        '用户取消导出不是错误，不该往输出通道写 error 级日志'
+      );
+      const dialog = captured.saveDialogs[0];
+      assert(
+        Array.isArray(dialog.filters?.Markdown) && dialog.filters.Markdown[0] === '.md',
+        `Markdown 的保存过滤器应当是 .md，实际 ${JSON.stringify(dialog.filters)}`
+      );
+      const defaultPath = String(dialog.defaultUri?.fsPath ?? '');
+      assert(
+        defaultPath.startsWith(workspaceRoot) && /-(被调用关系|调用关系)-\d{8}-\d{6}\.md$/.test(defaultPath),
+        `默认路径应当是「工作区第一个目录 + <根节点名>-<方向标签>-<时间戳>.md」，实际 ${JSON.stringify(defaultPath)}`
+      );
+      console.log(`诊断: 导出取消 → 问了一次保存位置（${path.basename(defaultPath)}），未写文件、未报错`);
+
+      // ② 保存成功：写出的字节必须**逐字**等于纯函数生成的正文
+      captured.saveDialogResult = savedTo;
+      await sendExport('md-tree');
+      assert(captured.writes.length === 1, `保存成功时应当写一次文件，实际 ${captured.writes.length} 次`);
+      assert(
+        Buffer.from(captured.writes[0].bytes).toString('utf8') === api.buildMarkdownTree(exportSession),
+        'md-tree 写盘的正文必须与 buildMarkdownTree 逐字一致'
+      );
+
+      captured.saveDialogResult = { ...savedTo, fsPath: path.join(ROOT, '导出测试.md') };
+      await sendExport('md-table');
+      const tableText = Buffer.from(captured.writes[0].bytes).toString('utf8');
+      assert(
+        tableText === api.buildMarkdownTable(exportSession),
+        'md-table 写盘的正文必须与 buildMarkdownTable 逐字一致'
+      );
+      assert(tableText.startsWith('| 层 | 节点 | 位置 | 被调用处 |'), 'md-table 应当以表头开头');
+
+      captured.saveDialogResult = { ...savedTo, fsPath: path.join(ROOT, '导出测试.json') };
+      await sendExport('json');
+      const jsonText = Buffer.from(captured.writes[0].bytes).toString('utf8');
+      assert(jsonText === api.buildJsonText(exportSession), 'json 写盘的正文必须与 buildJsonText 逐字一致');
+      assert(
+        JSON.parse(jsonText).root === exportSession.rootId,
+        'JSON 的 root 应当是当前标签的根节点 id'
+      );
+
+      // ③ svg：webview 给的序列化文本原样落盘（文本按 UTF-8 写）
+      captured.saveDialogResult = { ...savedTo, fsPath: path.join(ROOT, '导出测试.svg') };
+      await sendExport('svg', '<svg xmlns="http://www.w3.org/2000/svg"><text>叶子</text></svg>');
+      assert(
+        Buffer.from(captured.writes[0].bytes).toString('utf8') ===
+          '<svg xmlns="http://www.w3.org/2000/svg"><text>叶子</text></svg>',
+        'svg 应当把 webview 给的文本原样按 UTF-8 落盘（中文不能乱码）'
+      );
+
+      // ④ png：webview 给的 base64 必须先解码成二进制再写
+      const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+      captured.saveDialogResult = { ...savedTo, fsPath: path.join(ROOT, '导出测试.png') };
+      await sendExport('png', pngBytes.toString('base64'));
+      assert(
+        Buffer.from(captured.writes[0].bytes).equals(pngBytes),
+        'png 的 base64 必须先解码成二进制再落盘（直接写 base64 文本会得到损坏的图片）'
+      );
+
+      // ⑤ webview 没给 data（例如它那边栅格化失败）：只记警告，不写文件
+      await sendExport('png', undefined);
+      assert(
+        captured.saveDialogs.length === 0 && captured.writes.length === 0,
+        '缺 data 的 png 导出不该弹保存对话框、更不该写文件'
+      );
+      assert(
+        captured.outputLines.some(
+          (line) => line.startsWith('warn:') && line.includes('没有提供')
+        ),
+        '缺 data 时必须留下可诊断的警告（不许静默什么都不做）'
+      );
+      captured.saveDialogResult = undefined;
+      console.log(
+        'OK: 导出宿主侧 —— 取消不写文件不报错；md-tree/md-table/json 与纯函数逐字一致；' +
+          'svg 按 UTF-8、png 按 base64 解码落盘；缺 data 时只警告'
+      );
+
+      // ⑥ webview 报错转日志：前缀「视图内报错：」只能出现一次。
+      //    历史缺陷：graphView.ts 拼了一次前缀，extension.ts 注册的回调又拼一次，
+      //    输出通道里出现「视图内报错：视图内报错：…」（真机日志实录）。
+      {
+        const probe = '导出 png 失败：前缀重复检查';
+        const before = captured.outputLines.length;
+        fake.send({ type: 'error', message: probe });
+        await tick();
+        const fresh = captured.outputLines.slice(before);
+        const viewErrors = fresh.filter((line) => line.includes('视图内报错'));
+        assert(
+          viewErrors.length === 1,
+          `webview 报错应当只在输出通道写一条「视图内报错」日志，实际 ${JSON.stringify(fresh)}`
+        );
+        assert(
+          viewErrors[0] === `warn: 视图内报错：${probe}`,
+          `「视图内报错」日志的文案应当是「视图内报错：<原始消息>」（前缀恰好一次），实际「${viewErrors[0]}」`
+        );
+        assert(
+          !fresh.some((line) => line.includes('视图内报错：视图内报错')),
+          `「视图内报错：」前缀被重复拼接了：${JSON.stringify(fresh)}`
+        );
+        assert(
+          fresh.some((line) => line === `error: webview 报错：${probe}`),
+          `webview 报错还应当在输出通道留一条 error 级日志（「webview 报错：<原始消息>」），实际 ${JSON.stringify(fresh)}`
+        );
+        console.log(`OK: webview 报错转日志 —— 前缀只出现一次（${viewErrors[0]}）`);
+      }
+    }
   }
 
   // ---- 节点 id 的 key 反解：含 `>` 的符号名（operator>）不能再被切错 ----
@@ -1616,6 +2366,165 @@ async function main() {
     console.log(
       'OK: 节点 id 分隔符改用 NUL —— operator> 这类含 `>` 的名字不再被切错，旧快照仍可解析'
     );
+  }
+
+  // ---- 导出的纯函数：结构树 / 表格 / JSON 的内容断言 ----
+  //
+  // 用自造的最小会话夹具（按既有夹具风格写对象字面量，不改生产代码）覆盖四件事：
+  // 缩进、关系点、环标记与 detail 截断；表格的转义与行数；JSON 的 depth / parentId。
+  {
+    const exportNodes = {
+      root: {
+        name: 'main',
+        file: 'src/main.cpp',
+        line: 30,
+        children: ['a', 'b'],
+      },
+      a: {
+        name: 'compute|alt',
+        file: 'src/compute.cpp',
+        line: 18,
+        // 关系点：父级中引用它的位置（第 31 行）
+        callSite: { file: 'src/main.cpp', line: 31, text: 'int result = compute(41);' },
+        children: ['c'],
+      },
+      // detail 超过 60 字符：用来钉住「截断到 60 字符」这条老规矩没在搬迁中丢掉
+      b: {
+        name: 'report',
+        file: 'src/report.cpp',
+        line: 26,
+        detail: 'DETAIL-' + 'x'.repeat(70) + '-END',
+        children: [],
+      },
+      c: {
+        name: 'leafAdd',
+        file: 'src/leaf.cpp',
+        line: 5,
+        isCycle: true,
+        children: [],
+      },
+    };
+    const exportSession = {
+      rootId: 'root',
+      direction: 'callers',
+      node: (id) => exportNodes[id],
+    };
+    const visitedOrder = ['root', 'a', 'c', 'b'];
+    const tree = api.buildMarkdownTree(exportSession);
+    assert(tree.startsWith('# 被调用关系：main（src/main.cpp:30）'), `结构树首行应当是方向 + 根节点，实际 ${JSON.stringify(tree.split('\n')[0])}`);
+    assert(tree.includes('- main   src/main.cpp:30'), '结构树应当含根节点那一行');
+    assert(
+      tree.includes('\n  - compute|alt   src/compute.cpp:18'),
+      `深度 1 的子节点应当缩进两格，实际 ${JSON.stringify(tree.split('\n')[1])}`
+    );
+    assert(
+      tree.includes('  ← 关系点 src/main.cpp:31'),
+      '有 callSite 的节点应当带「← 关系点 文件:行」'
+    );
+    assert(tree.includes('\n    - leafAdd ↻'), '环标记 ↻ 应保留在结构树里');
+    assert(
+      tree.includes(`[${'DETAIL-' + 'x'.repeat(53)}]`),
+      'detail 应当被截断到 60 字符'
+    );
+    assert(!tree.includes('-END'), 'detail 截断后不应出现第 60 字符之后的内容');
+    assert(
+      tree.split('\n').length === visitedOrder.length + 1,
+      `结构树行数应当是「1 行标题 + ${visitedOrder.length} 个节点」，实际 ${tree.split('\n').length}`
+    );
+
+    const table = api.buildMarkdownTable(exportSession);
+    const tableLines = table.split('\n');
+    assert(
+      tableLines[0] === '| 层 | 节点 | 位置 | 被调用处 |',
+      `表格首行应当是表头，实际 ${JSON.stringify(tableLines[0])}`
+    );
+    assert(
+      /^\| --- \| --- \| --- \| --- \|$/.test(tableLines[1]),
+      `表格第二行应当是分隔行，实际 ${JSON.stringify(tableLines[1])}`
+    );
+    const rows = tableLines.filter((line) => line.startsWith('|')).slice(2);
+    assert(
+      rows.length === visitedOrder.length,
+      `表格行数应当等于遍历到的节点数 ${visitedOrder.length}，实际 ${rows.length}`
+    );
+    assert(
+      table.includes('| compute\\|alt |'),
+      `节点名里的 | 必须转义成 \\|，实际 ${JSON.stringify(rows[0])}`
+    );
+    assert(!/[^\\]\| compute\|/.test(table), '未转义的 | 会切断表格列，不该出现');
+    assert(
+      rows[0].includes('| 0 | main | src/main.cpp:30 |  |'),
+      `根节点那一行应当 depth=0 且「被调用处」留空，实际 ${JSON.stringify(rows[0])}`
+    );
+    assert(
+      rows[1].includes('src/main.cpp:31'),
+      `「被调用处」应当是 callSite 的 文件:行，实际 ${JSON.stringify(rows[1])}`
+    );
+    assert(
+      rows[0].startsWith('| 0 |') && rows[1].startsWith('| 1 |') && rows[2].startsWith('| 2 |'),
+      `表格应当按 DFS 先序给出层数，实际 ${JSON.stringify(rows.slice(0, 3))}`
+    );
+
+    const parsed = JSON.parse(api.buildJsonText(exportSession));
+    assert(parsed.version === 1, `JSON 的 version 应当是 1，实际 ${parsed.version}`);
+    assert(parsed.direction === 'callers', `JSON 的 direction 应当是 callers，实际 ${parsed.direction}`);
+    assert(parsed.directionLabel === '被调用关系', 'JSON 应当带方向的中文标签');
+    assert(parsed.root === 'root', `JSON 的 root 应当是 rootId，实际 ${parsed.root}`);
+    assert(
+      parsed.nodes.length === visitedOrder.length,
+      `JSON 的 nodes 数量应当是 ${visitedOrder.length}，实际 ${parsed.nodes.length}`
+    );
+    assert(
+      parsed.nodes.map((node) => node.id).join(',') === visitedOrder.join(','),
+      `JSON 的节点应当按 DFS 先序，实际 ${parsed.nodes.map((node) => node.id).join(',')}`
+    );
+    const expectedParents = { root: null, a: 'root', c: 'a', b: 'root' };
+    const expectedDepths = { root: 0, a: 1, c: 2, b: 1 };
+    for (const node of parsed.nodes) {
+      assert(
+        node.parentId === expectedParents[node.id],
+        `${node.id} 的 parentId 应当是 ${JSON.stringify(expectedParents[node.id])}，实际 ${JSON.stringify(node.parentId)}`
+      );
+      assert(
+        node.depth === expectedDepths[node.id],
+        `${node.id} 的 depth 应当是 ${expectedDepths[node.id]}，实际 ${node.depth}`
+      );
+    }
+    assert(
+      parsed.nodes[0].parentId === null && parsed.nodes[0].depth === 0,
+      '根节点的 parentId 必须是 null、depth 必须是 0'
+    );
+    assert(
+      parsed.nodes.find((node) => node.id === 'a').callSite.file === 'src/main.cpp',
+      'JSON 应当带上 callSite 的文件'
+    );
+    assert(
+      parsed.nodes.find((node) => node.id === 'c').isCycle === true,
+      'JSON 应当带上 isCycle 标记'
+    );
+    // 时间戳一律不写：同一份会话任何时候导出都必须逐字节相同
+    assert(
+      !/\d{8}-\d{6}/.test(api.buildJsonText(exportSession)),
+      'JSON 里不应写入时间戳（那会让同一份会话每次导出都不同，无法比对）'
+    );
+
+    // 默认文件名：Windows 非法字符被过滤、长度受限、时间戳格式固定
+    const stamp = new Date(2026, 0, 2, 3, 4, 5);
+    const fileName = api.buildExportFileName('std::vector<int>|a?b', 'callers', stamp, '.md');
+    assert(
+      fileName === 'std__vector_int__a_b-被调用关系-20260102-030405.md',
+      `默认文件名应当过滤 Windows 非法字符并保留中文方向标签，实际 ${JSON.stringify(fileName)}`
+    );
+    const longName = api.buildExportFileName('n'.repeat(200), 'callees', stamp, '.json');
+    assert(
+      longName.length <= 80 && longName.endsWith('.json'),
+      `超长名字应当被截断且保留扩展名，实际长度 ${longName.length}：${JSON.stringify(longName)}`
+    );
+    console.log(
+      `诊断: 导出纯函数 —— 结构树 ${tree.split('\n').length} 行、表格 ${rows.length} 行、` +
+        `JSON ${parsed.nodes.length} 个节点；默认文件名 ${fileName}`
+    );
+    console.log('OK: 导出纯函数 —— 缩进/关系点/环标记/detail 截断、表格转义与行数、JSON 的 depth 与 parentId 均正确');
   }
 
   // ---- 0.21 引擎配置档：自定义引擎可接入、认领规则生效、未知 id 退回并给出警告 ----

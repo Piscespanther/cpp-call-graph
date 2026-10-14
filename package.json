@@ -48,6 +48,16 @@
         "icon": "$(arrow-right)"
       },
       {
+        "command": "cppCallGraph.filterFolder",
+        "title": "添加到过滤目录（不再显示其中的调用关系）",
+        "category": "调用关系图"
+      },
+      {
+        "command": "cppCallGraph.unfilterFolder",
+        "title": "从过滤目录中移除",
+        "category": "调用关系图"
+      },
+      {
         "command": "cppCallGraph.focusGraph",
         "title": "聚焦调用关系图（在面板中打开）",
         "category": "调用关系图",
@@ -103,6 +113,18 @@
           "group": "0_navigation@-1"
         }
       ],
+      "explorer/context": [
+        {
+          "command": "cppCallGraph.filterFolder",
+          "when": "explorerResourceIsFolder",
+          "group": "cppCallGraph@1"
+        },
+        {
+          "command": "cppCallGraph.unfilterFolder",
+          "when": "explorerResourceIsFolder",
+          "group": "cppCallGraph@2"
+        }
+      ],
       "view/title": []
     },
     "viewsContainers": {
@@ -130,6 +152,8 @@
       "title": "调用关系图",
       "properties": {
         "cppCallGraph.languageService": {
+          "scope": "window",
+          "order": 10,
           "type": "string",
           "enum": [
             "auto",
@@ -146,24 +170,30 @@
             "自定义（用 customEngineId）"
           ],
           "default": "auto",
-          "markdownDescription": "调用层级由哪个语言服务提供。\n\n- **自动**：由 VS Code 决定。\n- **clangd**：需同时具备 clangd 扩展与 `clangd` 可执行文件（仅安装 clang 编译器不满足要求），且工程提供 `compile_commands.json` 或 `compile_flags.txt`。\n- **cpptools**：C/C++ 扩展。\n- **不指定引擎**：按符号名范围与光标的距离挑选，多引擎共存时最安全。\n- **自定义**：使用 `cppCallGraph.customEngineId`。\n\n多个语言服务注册在同一个语言 ID 上，扩展无法强制指定；本设置只影响结果的认领与展示标注（另见 `cppCallGraph.enginePickPolicy`）。如需避免互相干扰，可只启用其中一个。"
+          "markdownDescription": "选择提供调用层级的语言服务。`auto`：自动探测（默认）；`clangd`：仅使用 clangd；`cpptools`：仅使用 C/C++ 扩展；`any`：不指定引擎，接受任一来源的结果；`custom`：使用 `cppCallGraph.customEngineId` 指定的引擎。指定单一引擎时，该引擎不可用则本次查询无法进行，原因写入输出通道。"
         },
         "cppCallGraph.maxLayoutNodes": {
+          "scope": "window",
+          "order": 24,
           "type": "number",
           "default": 800,
           "minimum": 100,
           "maximum": 5000,
-          "markdownDescription": "整张图的**节点总数上限**。超出部分不上图（没有方框），并在输出通道中说明数量。\n\n它同时约束工具栏「展开全部」与「完全展开」的节点预算 —— 超过它的节点画不出来，预算算进去只会白占。数值越大越占内存与渲染时间（实测一次整帧重绘：约 400 个方框 8 毫秒、1200 个约 30 毫秒），建议按需适当调大。"
+          "markdownDescription": "整张图的节点总数上限（100–5000，默认 800）。超出部分不上图，并在输出通道说明未显示的节点数；「展开全部」与「完全展开」的节点预算同样受该上限约束。"
         },
         "cppCallGraph.customEngineId": {
+          "scope": "window",
+          "order": 12,
           "type": "string",
           "default": "",
-          "markdownDescription": "`cppCallGraph.languageService` 选择「自定义」时使用的引擎 id：可填 `cppCallGraph.customEngines` 中定义的 id，也可填内置 id。填不存在的 id 会记一条警告并退回「不指定引擎」。"
+          "markdownDescription": "`languageService` 取 `custom` 时使用的引擎 id，须与 `cppCallGraph.customEngines` 中某一项的 `id` 一致。id 不存在时记录一条警告并退回「不指定引擎」。"
         },
         "cppCallGraph.customEngines": {
+          "scope": "machine-overridable",
+          "order": 13,
           "type": "array",
           "default": [],
-          "markdownDescription": "自定义语言服务列表，用于接入其它实现 Call Hierarchy 的语言服务。字段：`id`（必填）、`label`、`extensionId`、`badge`、`matchName`、`matchDetail`、`advice`。与内置项同 id 时覆盖内置项。",
+          "markdownDescription": "自定义语言服务列表。每项字段：`id`（必填，唯一标识）、`label`（展示名）、`extensionId`（判断扩展是否已安装；省略表示不依赖扩展）、`badge`（标签角标文字）、`matchName` / `matchDetail`（候选结果的名字或详情包含该子串时，视为该引擎给出）、`advice`（该引擎不可用时给出的提示）。与内置项同 id 时覆盖内置项。示例：`[{\"id\":\"my-engine\",\"label\":\"示例引擎\",\"extensionId\":\"publisher.my-engine\",\"badge\":\"my-eng\",\"matchName\":\"myEngine\"}]`",
           "items": {
             "type": "object",
             "required": [
@@ -172,7 +202,7 @@
             "properties": {
               "id": {
                 "type": "string",
-                "description": "唯一标识（设置里填的就是它）"
+                "description": "唯一标识（即设置中填写的内容）"
               },
               "label": {
                 "type": "string",
@@ -202,6 +232,8 @@
           }
         },
         "cppCallGraph.enginePickPolicy": {
+          "scope": "window",
+          "order": 11,
           "type": "string",
           "enum": [
             "nearest",
@@ -214,42 +246,56 @@
             "只认选中引擎（可能查不出结果）"
           ],
           "default": "nearest",
-          "markdownDescription": "存在多个语言服务时，如何从聚合回来的候选中挑选。\n\n- **按光标就近**：按符号名范围与光标的距离取最近的（默认）。\n- **优先选中引擎**：先在选中引擎认领的结果中挑选，认不到时退回就近并在日志中说明。\n- **只认选中引擎**：只认选中引擎的结果，认不到时报该引擎在此位置无结果。这是唯一可能查不出结果的档位，且只对配置了 `matchName` / `matchDetail` 的自定义引擎有效。"
+          "markdownDescription": "多个语言服务同时返回候选时如何挑选。`nearest`：按符号名范围与光标的距离取最近者（默认）；`preferSelected`：优先采用选中引擎认领的结果，认不到时退回最近者；`onlySelected`：只采用选中引擎认领的结果，认不到时报告该引擎在此位置无结果。后两档仅对配置了 `matchName` 或 `matchDetail` 的引擎有效。"
         },
         "cppCallGraph.maxChildrenPerNode": {
+          "scope": "window",
+          "order": 22,
           "type": "number",
           "default": 200,
           "minimum": 1,
-          "markdownDescription": "每个方框最多显示的直接调用者 / 被调用者数量。超出部分不显示，悬停提示给出被省略的条数。"
+          "markdownDescription": "每个方框最多保留的直接调用者 / 被调用者数量（默认 200）。超出部分不显示，方框上以省略标记与悬停提示给出被省略的条数。"
         },
         "cppCallGraph.maxExpandRounds": {
+          "scope": "window",
+          "order": 23,
           "type": "number",
           "default": 5,
           "minimum": 1,
           "maximum": 50,
-          "markdownDescription": "工具栏「展开全部」逐层展开的层数上限（默认 5）。「完全展开」不受该项约束，会展开到没有可展开的节点；两者均受节点总数上限约束，超出部分不上图并在日志中说明。"
+          "markdownDescription": "工具栏「展开全部」逐层展开的层数上限（默认 5）。「完全展开」不受该上限约束，会展开到没有可展开的节点；两者均受节点总数上限约束。"
         },
         "cppCallGraph.autoReveal": {
+          "scope": "window",
+          "order": 20,
           "type": "boolean",
           "default": true,
-          "markdownDescription": "双击方框时打开对应文件并定位到声明处（单击只选中）。"
+          "markdownDescription": "双击方框时打开对应文件并定位到声明处；单击仅选中。关闭后双击不再跳转。"
         },
         "cppCallGraph.showEngineWarning": {
+          "scope": "window",
+          "order": 14,
           "type": "boolean",
           "default": true,
-          "markdownDescription": "检测到两个及以上语言服务可能同时提供调用层级时给出提示，避免结果被多个引擎混用。"
+          "markdownDescription": "检测到两个及以上语言服务可能同时提供调用层级时，在输出通道给出提示，避免结果被多个引擎混用。默认开启。"
         },
         "cppCallGraph.stickyParent": {
+          "scope": "window",
+          "order": 21,
           "type": "boolean",
           "default": true,
-          "markdownDescription": "纵向滚动时，把所有已展开下一层的方框固定在窗口垂直中央；每个方框只在自己的子树范围内滑动。关闭后按普通画布滚动。"
+          "markdownDescription": "纵向滚动时，把已展开下一层的方框固定在窗口垂直中央，每个方框只在自己的子树范围内滑动。关闭后按普通画布滚动。"
         },
         "cppCallGraph.showLocation": {
+          "scope": "window",
+          "order": 30,
           "type": "boolean",
           "default": true,
-          "markdownDescription": "在方框中显示「文件路径:行号」一行。关闭后仅显示元素名，方框宽度与高度均收窄为单行。"
+          "markdownDescription": "是否在方框中显示「文件路径:行号」一行（默认显示）。关闭后仅显示元素名，方框的宽度与高度收窄为单行。"
         },
         "cppCallGraph.pathDisplay": {
+          "scope": "window",
+          "order": 31,
           "type": "string",
           "enum": [
             "tail",
@@ -260,24 +306,71 @@
             "宽度允许时显示整条路径"
           ],
           "default": "tail",
-          "markdownDescription": "方框内路径的显示方式。\n\n- **省略**：保留末尾若干层，另保留 `cppCallGraph.pathAnchors` 指定的目录段。\n- **完整**：显示整条路径。\n\n两种方式都**不会截断文字**：要显示的内容有多少，方框就加多宽（画布可横向滚动）。完整路径始终也可在悬停提示中查看，右键「复制地址」复制的同样是完整路径。"
+          "markdownDescription": "方框中路径的显示方式。`tail`：只保留末尾若干层与锚点段（默认）；`full`：显示整条路径。两种方式都不截断文字，方框按实际文字宽度加宽。"
         },
         "cppCallGraph.pathTailLevels": {
+          "scope": "window",
+          "order": 32,
           "type": "number",
           "default": 0,
           "minimum": 0,
           "maximum": 8,
-          "markdownDescription": "「省略」模式下末尾保留的层数（含文件名）。`0` 表示按方框宽度自动。"
+          "markdownDescription": "`tail` 模式下末尾保留的层数（含文件名，默认 0）。`0` 表示按方框宽度自动决定；给定 1 及以上的值时，除锚点段外只保留末尾这些层。"
         },
         "cppCallGraph.pathShowFileName": {
+          "scope": "window",
+          "order": 33,
           "type": "boolean",
           "default": true,
-          "markdownDescription": "方框里那行路径是否包含最后的**文件名**。关闭后只显示目录部分，`:行号` 仍在；省略、层数与锚点规则照旧作用于目录段。完整路径始终可在悬停提示与右键「复制地址」中查看。"
+          "markdownDescription": "方框中那行路径是否包含文件名（默认包含）。关闭后只显示目录部分，`:行号` 保留；若去掉文件名后没有剩余目录段，则退回显示文件名。层数与锚点规则仅作用于目录段。"
+        },
+        "cppCallGraph.excludeFolders": {
+          "scope": "window",
+          "order": 50,
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "按目录过滤：命中目录的节点连同其子树不在图中显示。三种写法可混用（不区分大小写，`\\` 与 `/` 等价，结尾斜杠与 `./` 忽略）：相对工作区根的路径 `third_party`；绝对路径 `c:/work/project/vendor`（工作区之外的路径匹配不到任何节点，原因写入输出通道）；通配 `**/generated`（过滤所有同名目录；`*` 段内任意长、`?` 单字符、`**` 任意层）。写目录即命中其本身及其下全部内容；整个工作区不会被过滤。资源管理器中右键文件夹可添加或移除，移除时落在该目录内部的子条目一并移除。"
+        },
+        "cppCallGraph.nameFolderTag": {
+          "scope": "window",
+          "order": 40,
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "是否在元素名同一行显示路径标签（默认关闭）。标签来源为 `cppCallGraph.pathAnchors` 中带括号的条目：圆括号条目两处都要，方括号条目只出标签；未命中时不显示标签，方框按标签文字宽度加宽。摆法见 `cppCallGraph.nameFolderTagStyle`，取值见 `cppCallGraph.nameFolderTagPick`。"
+        },
+        "cppCallGraph.nameFolderTagStyle": {
+          "scope": "window",
+          "order": 42,
+          "type": "string",
+          "enum": [
+            "arrow",
+            "parenAfter",
+            "bracketAfter",
+            "dotAfter"
+          ],
+          "default": "arrow",
+          "markdownDescription": "标签的摆法。`arrow`：标签在前，形如 `[include] → 元素名`（默认）；`parenAfter`：形如 `元素名 (include)`；`bracketAfter`：形如 `元素名 [include]`；`dotAfter`：形如 `元素名 · include`。多条标签依次并列。"
+        },
+        "cppCallGraph.nameFolderTagPick": {
+          "scope": "window",
+          "order": 43,
+          "type": "string",
+          "enum": [
+            "first",
+            "deepest"
+          ],
+          "default": "first",
+          "markdownDescription": "一条标签模式命中多个目录段时取哪一段。`first`：最靠工作区根（默认）；`deepest`：最靠文件。仅当该模式能命中**不同文字**（通配、正则、多选）且未写 `all:` 时有区别；字面量模式命中多处时各处文字相同，取值不影响结果。需要逐条指定时在条目末尾写 `@deepest` / `@first`，其优先于本项。"
         },
         "cppCallGraph.pathAnchors": {
+          "scope": "window",
+          "order": 34,
           "type": "string",
           "default": "",
-          "markdownDescription": "「省略」模式下必须显示的目录段，逗号分隔，可写多条。\n\n- `目录名`：该目录名对应的那一段（大小写不敏感，取最左命中）。\n- `目录名+N` / `目录名-N`：以该目录名为基准偏移 N 层，**只显示偏移后的那一段**。\n- `+N`：从工作区根数第 N 段（1 = 最左一段）。\n- `-N`：从文件名往上数第 N 段（1 = 文件所在目录）。\n\n并列目录的名字各不相同时用偏移定位。要连基准目录一起显示，把它另写一条。越界或未命中的条目忽略，并在日志中说明。"
+          "markdownDescription": "`tail` 模式下必须显示的目录段，多条以逗号分隔。以下各层可任意组合；不区分大小写，`\\` 与 `/` 等价。\n\n- **段**：`src` 字面量；`lib*`、`a?c` 通配（`*` 任意长、`?` 单字符）；`a|b` 多选；`re:^tests?$` 正则（匹配 `test` 与 `tests`）；`**` 任意层；`\"a*b\"` 加引号表示按字面量（目录名含 `*`、`|`、`(`、`,`、`@` 时使用）。\n- **路径**：`src/lib` 表示这两段必须连续出现，锚点取末段 `lib`；以 `/` 开头表示从工作区根开始，如 `/src/lib`。\n- **位置**：`+2` 从工作区根数第 2 段；`-1` 从文件名往上数第 1 段；`src+1` 先定位 `src` 再向下偏移一层（`-N` 同理）。与路径写法组合时，先要求上下文连续出现，再对末段偏移，如 `src/lib+1`。\n- **前缀**：`all:` 保留该模式的所有命中；`!` 排除（该条路径命中后不再产生任何锚点与标签）；`keep:` 把命中区间整体作为一个标签（仅对标签生效；路径那行请列举相邻段）。\n- **后缀**：`@deepest` / `@first` 指定该条命中多处时取哪一处（仅对标签生效，优先于 `cppCallGraph.nameFolderTagPick`）。\n- **括号**（名称行标签的来源，总开关为 `cppCallGraph.nameFolderTag`）：`(src+1)` 圆括号 = 路径那行与名称行都要；`[src+1]` 方括号 = 只要标签、不进路径那行；不带括号 = 只进路径那行。一组括号产生一个标签，可写多组，如 `(src)(lib)`。\n- **整段名字优先**：先按整段名字匹配，不命中才按「名字 + 偏移」解释，因此名为 `lib-2` 的目录不会被误当作偏移。\n\n示例：`src` · `lib*` · `a|b` · `re:^tests?$` · `**/include` · `+2` · `-1` · `src+1` · `src/lib` · `/src/lib` · `all:include` · `!test` · `(src+1)` · `[lib]` · `(src)(lib)` · `(keep:src/lib)` · `(lib*@deepest)` · `(\"a|b\")`\n\n写法错误（例如正则不合法）的条目会被忽略并在输出通道说明；在部分路径上没有命中属正常；只有在整个标签的所有路径上都没有命中时才提示一次。"
         }
       }
     }

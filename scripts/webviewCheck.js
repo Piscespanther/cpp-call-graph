@@ -100,7 +100,7 @@ function makeElement(key, clientWidth = 0, clientHeight = 0) {
         return { x: 0, y: 0, width: 0, height: 0 };
       }
       // ⚠️ 未挂进文档（无 parentNode）时必须返回 0 —— 真实浏览器如此。
-      // 桩若照样返回宽度，「探测节点忘了 append」这类历史 bug 在本脚本里永远测不出来。
+      // 桩若照样返回宽度，「探测节点遗漏 append」这类历史缺陷 在本脚本里永远测不出来。
       if (!this.parentNode) {
         return { x: 0, y: 0, width: 0, height: 0 };
       }
@@ -116,7 +116,7 @@ function makeElement(key, clientWidth = 0, clientHeight = 0) {
         height: size * 0.66,
       };
     },
-    /** 生产代码首选 `getComputedTextLength()`，桩也提供，别让最准的那条路在测试里从不执行。 */
+    /** 生产代码首选 `getComputedTextLength()`，桩也提供，避免最准确的路径在测试中从不执行。 */
     getComputedTextLength() {
       const size = Number.parseFloat(String(this.getAttribute('font-size') ?? '')) || 12;
       const bold = String(this.getAttribute('font-weight') ?? '') === '600';
@@ -124,7 +124,7 @@ function makeElement(key, clientWidth = 0, clientHeight = 0) {
     },
     setAttribute(name, value) {
       // ⚠️ 属性**按元素**存。以前只按「标签名:属性名」存进一张全局表，
-      // 同一种标签的多个元素会互相覆盖 —— getAttribute 读到的其实是**最后写**的那一个，
+      // 同一种标签的多个元素会互相覆盖 —— getAttribute 读到的是**最后写入**的那一个，
       // 于是「这个元素上没有该属性」这类否定式断言会假通过。
       this.__attributes.set(name, String(value));
       // 兼容旧的按标签归档的全局表（本文件与 renderCheck 里还有 attributes.get('svg:viewBox') 之类读法）

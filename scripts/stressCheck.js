@@ -55,7 +55,7 @@ const vscodeStub = {
     showErrorMessage: async () => undefined,
     withProgress: async (_options, task) => task({ report() {} }),
     // 日志接口要齐全（info/warn/error）：生产代码用 logWarn 报「图太大、有节点没排布」，
-    // 桩里缺 warn 会让那句日志抛 TypeError，整个压测直接崩掉（本轮踩过）。
+    // 桩里缺 warn 会让那句日志抛 TypeError，整个压测直接失败（本轮曾出现）。
     createOutputChannel: () => ({
       appendLine() {},
       append() {},

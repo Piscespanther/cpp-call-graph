@@ -28,9 +28,9 @@
 
 具体的派生数据位于（合计 31 条轮廓路径）：
 
-  - src/webview/symbolIcons.ts     21 条 —— 21 个符号图标（由生成脚本产出）
-  - src/webview/callIcons.ts        2 条 —— 2 个方向图标（call-incoming / call-outgoing）
-  - src/webview/graph.html          8 条 —— 工具栏 6 个按钮 + 方框右键菜单 2 项
+  - src/webview/symbolIcons.ts
+  - src/webview/callIcons.ts
+  - src/webview/graph.html
 
 免责声明（CC BY 4.0 §5）
 

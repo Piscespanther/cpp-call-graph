@@ -1,13 +1,16 @@
 /**
  * 把当前会话导成纯文本（两空格缩进），方便粘贴到 issue / 文档。
  * 只导出已经展开的节点，不主动触发新的语言服务请求。
+ *
+ * ⚠️ 正文逻辑在 `commands/exportGraph.ts` 的 `buildMarkdownTree()`（不引用 vscode API，
+ * 便于断言）；本文件只保留进度提示、剪贴板命令与既有函数签名。
+ * ⚠️ 入参是 `ExportSession`（**所见视图**，见 `graphView.exportView()`）：调用方若直接把
+ * `CallSession` 传进来也能用（字段相容），但那样会把过滤掉的节点一起复制出去。
  */
 import * as vscode from 'vscode';
 import { CallSession } from '../hierarchy/session';
 import { DIRECTION_LABEL } from '../hierarchy/graphTypes';
-
-const MAX_DEPTH = 8;
-const MAX_NODES = 500;
+import { ExportSession, buildMarkdownTree } from './exportGraph';
 
 /** 复制结果：交给调用方展示，避免在这里弹任何 UI。 */
 export interface CopyResult {
@@ -27,7 +30,7 @@ export async function copyNodeName(session: CallSession, nodeId?: string): Promi
   return { ok: true, text: node.name };
 }
 
-/** 复制「地址」：文件路径加行号，例如 `components/BSP/boot/bsp_boot.h:23`。 */
+/** 复制「地址」：文件路径加行号，例如 `components/LIB/boot/lib_boot.h:23`。 */
 export async function copyNodeLocation(
   session: CallSession,
   nodeId?: string
@@ -42,7 +45,7 @@ export async function copyNodeLocation(
   return { ok: true, text };
 }
 
-export async function buildSessionText(session: CallSession): Promise<string> {
+export async function buildSessionText(session: ExportSession): Promise<string> {
   const root = session.node(session.rootId);
   if (!root) {
     return '';
@@ -53,54 +56,7 @@ export async function buildSessionText(session: CallSession): Promise<string> {
       title: `正在导出${DIRECTION_LABEL[session.direction]}…`,
       cancellable: false,
     },
-    async () => {
-      const lines: string[] = [
-        `# ${DIRECTION_LABEL[session.direction]}：${root.name}（${root.file}:${root.line}）`,
-      ];
-      const visited = new Set<string>();
-      let budget = MAX_NODES;
-      // 两个上限要分别记录：恰好用满 500 个节点时并没有截断，
-      // 而层数超限（>8 层）此前完全不提示 —— 两种情况的说明不一样。
-      let hitNodeLimit = false;
-      let hitDepthLimit = false;
-      const walk = (nodeId: string, depth: number): void => {
-        const node = session.node(nodeId);
-        // ⚠️ 「不存在 / 已访问」必须**先**判：否则恰好用满上限时，最后一个节点的
-        // 重复入栈会在 budget<=0 处把 hitNodeLimit 置位 —— 明明没截断却提示「结果被截断」。
-        if (!node || visited.has(nodeId)) {
-          return;
-        }
-        if (budget <= 0) {
-          hitNodeLimit = true;
-          return;
-        }
-        if (depth > MAX_DEPTH) {
-          hitDepthLimit = true;
-          return;
-        }
-        visited.add(nodeId);
-        budget -= 1;
-        const indent = '  '.repeat(depth);
-        const cycle = node.isCycle ? ' ↻' : '';
-        const callSite = node.callSite
-          ? `  ← 关系点 ${node.callSite.file}:${node.callSite.line}`
-          : '';
-        const detail = node.detail ? `  [${node.detail.slice(0, 60)}]` : '';
-        lines.push(
-          `${indent}- ${node.name}${cycle}   ${node.file}:${node.line}${callSite}${detail}`
-        );
-        for (const child of node.children) {
-          walk(child, depth + 1);
-        }
-      };
-      walk(session.rootId, 0);
-      if (hitNodeLimit) {
-        lines.push(`  …（已达导出上限 ${MAX_NODES} 个节点，结果被截断）`);
-      }
-      if (hitDepthLimit) {
-        lines.push(`  …（已达导出层数上限 ${MAX_DEPTH} 层，更深的节点未导出）`);
-      }
-      return lines.join('\n');
-    }
+    // 正文交给纯函数：输出与改动前逐字一致，这里只剩进度提示与既有签名。
+    async () => buildMarkdownTree(session)
   );
 }

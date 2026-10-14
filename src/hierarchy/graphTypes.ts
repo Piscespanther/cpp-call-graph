@@ -90,6 +90,15 @@ export interface GraphNode {
    * 把两种原因分开写清 —— 只说「另有 N 条未显示」用户无法判断该调哪个设置。
    */
   omittedByNodeCap?: number;
+  /**
+   * 名称行标签的两段文字（设置 `cppCallGraph.nameFolderTag`）。
+   *
+   * `arrow` 摆法只用 `nameTagPrefix`（形如 `[core] → `）；三种后置摆法只用 `nameTagSuffix`
+   * （` (core)` / ` [core]` / ` · core`）。两者都由宿主用 `nameTagPartsFor()` 算好，
+   * webview 只负责渲染 —— 格式只有一处定义，估宽与实际渲染因此不可能分叉。
+   */
+  nameTagPrefix?: string;
+  nameTagSuffix?: string;
   file: string;
   line: number;
   /** 关系发生点：谁在第几行引用了/调用了谁。 */

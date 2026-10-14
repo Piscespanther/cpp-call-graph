@@ -1,12 +1,12 @@
 /**
- * 真实渲染检查：用「真实布局引擎 + 真实消息流」跑一遍 dist/webview.js，
+ * 真实渲染检查：用「真实布局引擎 + 真实消息流」运行一次 dist/webview.js，
  * 断言最终 DOM 里确实有方框、连线、文字、符号角标，且坐标落在可视范围内。
  *
  * 为什么需要这个文件：字符串级断言骗过我们好几轮——
  * 「HTML 里有 script 标签」通过了但脚本被 CSP 拒；「URI 生成了」通过了但被
  * localResourceRoots 拦掉。只有真正构造 DOM 并检查渲染结果，才暴露了那些问题。
  *
- * 时序说明（曾经踩坑，务必保留）：webview 收到 sessionUpdate 会**同步**重绘，
+ * 时序说明（曾经出错，务必保留）：webview 收到 sessionUpdate 会**同步**重绘，
  * 并替换掉节点容器的子元素。所以针对某个会话的断言，必须在注入下一个会话之前完成。
  * 本文件据此分两段：
  *   ① 初始会话（s-callers）→ 静态结构 + 符号角标 + 加减号几何
@@ -27,11 +27,119 @@ function assert(condition, message) {
 
 const log = (message) => console.log(message);
 
+/**
+ * 取出源码里某个函数声明的**完整函数体**（含最外层花括号）。
+ *
+ * 为什么不用 `function X([\s\S]*?)\n\}` 这种一把梭的正则：函数签名可能是多行的，
+ * 参数里的对象类型（`options: { stripTitles: boolean }`）本身就带一个顶格的 `}`，
+ * 非贪婪匹配会在那里提前收尾，后面的结构断言全都在半截函数体上做 —— 看起来过了，
+ * 实际上没有任何断言覆盖。
+ *
+ * 做法：① 先按三类括号配对跨过参数列表（里面的对象类型不会被误判）；
+ *       ② 再从参数列表的 `)` 之后找**第一个顶格的 `\n}`** —— 那才是函数体的收尾
+ *          （返回类型里的 `}` 与 `|`、`{` 同行，不在行首，因此不会被误认）。
+ */
+function functionBodyOf(source, name) {
+  const head = `function ${name}`;
+  const start = source.indexOf(head);
+  assert(start >= 0, `源码里找不到 ${head}(（下面的结构断言无从谈起）`);
+  let index = start + head.length;
+  let depth = 0;
+  for (; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === '(' || char === '{' || char === '[') {
+      depth += 1;
+    } else if (char === ')' || char === '}' || char === ']') {
+      depth -= 1;
+      if (depth === 0 && char === ')') {
+        index += 1;
+        break;
+      }
+    }
+  }
+  const tail = source.slice(index);
+  const closing = tail.indexOf('\n}');
+  assert(closing >= 0, `${head} 的函数体找不到收尾的顶格 '}'`);
+  return source.slice(start, index + closing + 2);
+}
+
+/**
+ * 生产代码会内联到导出 SVG 上的属性名（与 `EXPORT_STYLE_PROPERTIES` 一致）。
+ *
+ * 放在文件靠前处：源码级断言（比对生产那张表）与后面的行为断言（驱动桩计算样式）都要用；
+ * 声明在 `const` 的暂时性死区之后被提前引用会直接抛 ReferenceError。
+ */
+const EXPORT_STYLE_PROPERTY_NAMES = [
+  'fill',
+  'fill-opacity',
+  'stroke',
+  'stroke-width',
+  'stroke-dasharray',
+  'opacity',
+  'font-family',
+  'font-size',
+  'font-weight',
+  'font-style',
+  'text-anchor',
+  'dominant-baseline',
+];
+
 // ------------------------------------------------------------ 桩 DOM
+
+/**
+ * 属性表的桩：对应真实 DOM 的 `NamedNodeMap`。
+ *
+ * ⚠️ 这里过去是一个 `Map`：`Array.from(el.attributes)` 于是得到 `[名字, 取值]` 数组，
+ * 而真实 DOM 得到的是 `Attr` 对象（读 `.name` / `.value`）。生产代码的导出净化正是按 `Attr`
+ * 读的 —— 用 `Map` 时它读到的 `attribute.value` 全是 `undefined`，一个字符都不会改，
+ * 断言却照旧通过。这类「桩替生产代码做假设」的假通过必须堵掉（见工作区约定第 5 节）。
+ */
+function createAttributeList() {
+  const items = [];
+  return {
+    get length() {
+      return items.length;
+    },
+    item(index) {
+      return items[index] ?? null;
+    },
+    getNamedItem(name) {
+      return items.find((attribute) => attribute.name === name) ?? null;
+    },
+    /** 真实语义：同名属性就地改值（它在文档序里的位置保持不变）。 */
+    setNamedItem(attribute) {
+      const existing = items.find((item) => item.name === attribute.name);
+      if (existing === undefined) {
+        items.push(attribute);
+        return null;
+      }
+      const replaced = { ...existing };
+      existing.value = attribute.value;
+      return replaced;
+    },
+    /** 真实语义：属性不存在时抛 `NotFoundError`。 */
+    removeNamedItem(name) {
+      const index = items.findIndex((attribute) => attribute.name === name);
+      if (index < 0) {
+        throw new Error(`NotFoundError：属性 ${name} 不存在`);
+      }
+      return items.splice(index, 1)[0];
+    },
+    [Symbol.iterator]() {
+      return items[Symbol.iterator]();
+    },
+  };
+}
 
 function createElement(tagName) {
   return {
     tagName,
+    /**
+     * 元素节点的 `nodeType`。真实 DOM 里 Element 恒为 1；桩过去没有这个字段，
+     * 于是生产代码里「按 `nodeType` 分辨元素与文本、再递归下去」的写法在桩里
+     * **一次都递归不到**（后代元素全被当成"两者都不是"跳过）—— 又一个假通过。
+     */
+    nodeType: 1,
     /**
      * 真实 DOM 里每个元素都能回指所属 document；量宽缓存要用
      * `ownerDocument.defaultView.getComputedStyle()` 取实际字体族，所以桩也得有。
@@ -40,7 +148,7 @@ function createElement(tagName) {
     get ownerDocument() {
       return global.document;
     },
-    attributes: new Map(),
+    attributes: createAttributeList(),
     children: [],
     listeners: new Map(),
     style: {},
@@ -52,7 +160,7 @@ function createElement(tagName) {
      * classList 与 className 在真实 DOM 里是**同一份数据**，桩必须照做。
      *
      * 曾经桩里两者各自记账：否定式断言读 className、肯定式断言读 classList，
-     * 于是「高亮忘了加 class」这类问题会被一半断言放行。
+     * 于是「高亮遗漏 class」这类问题会被一半断言放行。
      */
     get classList() {
       const element = this;
@@ -106,14 +214,43 @@ function createElement(tagName) {
     set className(value) {
       this.setAttribute('class', String(value));
     },
+    /**
+     * 子节点列表（真实 DOM：元素子节点与文本子节点混在同一个列表里，用 `nodeType` 区分）。
+     *
+     * 桩把文字存在 `_textContent` 上，它对应真实 DOM 里的**一个文本子节点**；因此这里如实给出
+     * `nodeType` 1（元素）与 3（文本），且文本节点的 `nodeValue` 与 `_textContent` 是同一份数据
+     * （写 `nodeValue` 等于改文字）—— 生产代码的导出净化要按 `nodeType` 分辨这两类，
+     * 只看 `children` 是测不到的。
+     */
+    get childNodes() {
+      const element = this;
+      const nodes = [...this.children];
+      if (this._textContent !== '') {
+        nodes.push({
+          nodeType: 3,
+          parentNode: this,
+          get nodeValue() {
+            return element._textContent;
+          },
+          set nodeValue(value) {
+            element._textContent = String(value);
+          },
+        });
+      }
+      return nodes;
+    },
     setAttribute(name, value) {
-      this.attributes.set(name, String(value));
+      this.attributes.setNamedItem({ nodeType: 2, name, value: String(value) });
     },
     getAttribute(name) {
-      return this.attributes.has(name) ? this.attributes.get(name) : null;
+      const attribute = this.attributes.getNamedItem(name);
+      return attribute === null ? null : attribute.value;
     },
     removeAttribute(name) {
-      this.attributes.delete(name);
+      // 真实 removeAttribute 对不存在的属性是静默无操作（removeNamedItem 才会抛）。
+      if (this.attributes.getNamedItem(name) !== null) {
+        this.attributes.removeNamedItem(name);
+      }
     },
     appendChild(child) {
       child.parentNode = this;
@@ -132,6 +269,24 @@ function createElement(tagName) {
       }
       this.parentNode = undefined;
     },
+    /**
+     * 深拷贝。导出 SVG 时生产代码会把克隆体交给 XMLSerializer，
+     * 真实 DOM 的 cloneNode 会连属性与子树一起复制，桩必须照做 ——
+     * 否则「导出丢了样式 / 丢了节点」在测试里永远看不见。
+     */
+    cloneNode(deep) {
+      const copy = createElement(this.tagName);
+      for (const attribute of this.attributes) {
+        copy.setAttribute(attribute.name, attribute.value);
+      }
+      copy._textContent = this._textContent;
+      if (deep) {
+        for (const child of this.children) {
+          copy.appendChild(child.cloneNode(true));
+        }
+      }
+      return copy;
+    },
     addEventListener(type, handler) {
       if (!this.listeners.has(type)) {
         this.listeners.set(type, []);
@@ -147,7 +302,7 @@ function createElement(tagName) {
      *
      * 两条必须与真实浏览器一致的行为：
      *   ① **未挂进文档**的 SVG 文字 `getBBox()` 返回全 0 —— 生产代码量宽时会把探测节点
-     *      append 到 <svg> 上再摘掉，历史上有一次忘了 append，于是量宽永远失败、
+     *      append 到 <svg> 上再摘掉，历史上曾遗漏 append，于是量宽永远失败、
      *      方框宽度不随内容变。桩若对游离节点也返回宽度，那条 bug 就再也测不出来。
      *   ② 宽度随文字内容变化，且**系数刻意与生产兜底（0.66 / 0.6）不同**：
      *      否则「量到了」与「退到估算」数值相同，断言分不清两条路径。
@@ -178,14 +333,33 @@ function createElement(tagName) {
     getCTM() {
       return { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 };
     },
+    /**
+     * 只实现生产代码真正用到的三个选择器：
+     *   - `'*'`：导出时按**文档序**取全部后代（内联计算样式要靠它与原节点逐一下标对应）；
+     *   - `'title'`：PNG 导出要从**克隆体**里剔除 `<title>`（栅格图没有悬停提示）；
+     *   - `'.expander .sign'`：加减号几何（既有用例）。
+     * 其余选择器一律返回空数组：桩里没有 CSS 引擎，假装支持只会掩盖问题。
+     */
     querySelectorAll(selector) {
-      if (selector !== '.expander .sign') {
+      const out = [];
+      if (selector === '.expander .sign') {
+        const walk = (node) => {
+          for (const child of node.children) {
+            if (child.tagName === 'text' && child.className.includes('sign')) {
+              out.push(child);
+            }
+            walk(child);
+          }
+        };
+        walk(this);
+        return out;
+      }
+      if (selector !== '*' && !/^[a-zA-Z][a-zA-Z0-9-]*$/.test(selector)) {
         return [];
       }
-      const out = [];
       const walk = (node) => {
         for (const child of node.children) {
-          if (child.tagName === 'text' && child.className.includes('sign')) {
+          if (selector === '*' || child.tagName === selector) {
             out.push(child);
           }
           walk(child);
@@ -295,6 +469,32 @@ boxMenuEl.contains = (target) => {
   return false;
 };
 
+// 导出菜单：五个菜单项，与真实模板的 data-format 取值一致。
+// 桩里必须先建出来 —— 生产代码在加载时就用 getElementById 取它注册点击事件。
+const exportMenuEl = createElement('div');
+exportMenuEl.setAttribute('id', 'export-menu');
+exportMenuEl.setAttribute('class', 'box-menu');
+exportMenuEl.hidden = true;
+for (const format of ['png', 'svg', 'md-tree', 'md-table', 'json']) {
+  const item = createElement('button');
+  item.setAttribute('data-format', format);
+  const text = createElement('span');
+  text.textContent = format;
+  item.appendChild(text);
+  exportMenuEl.appendChild(item);
+}
+byId.set('export-menu', exportMenuEl);
+exportMenuEl.contains = (target) => {
+  let node = target;
+  while (node) {
+    if (node === exportMenuEl) {
+      return true;
+    }
+    node = node.parentNode;
+  }
+  return false;
+};
+
 // ------------------------------------------------------------ 工具栏（真实 HTML）
 
 // 工具栏按钮来自真实模板：直接解析 graph.html，确保按钮与内联 SVG 都真的存在。
@@ -310,6 +510,7 @@ const expectedButtons = [
   'btn-expand-full',
   'btn-collapse-all',
   'btn-copy-tab',
+  'btn-export',
   'btn-settings',
 ];
 for (const id of expectedButtons) {
@@ -318,8 +519,60 @@ for (const id of expectedButtons) {
     `工具栏缺少按钮 ${id}（实际有：${toolbarButtons.join(', ')}）`
   );
 }
-const toolbarSvgCount = (toolbarHtml[0].match(/<svg/g) ?? []).length;
-assert(
+// 标签栏自有右键菜单（用户 2026-10-14 要求）：VS Code 给 webview 的默认菜单无法扩展，故自建。
+// 这里先在**模板层**断言六项齐备（行为层「点击后发出的 id 集合」的断言待补，见笔记二·六）。
+{
+  const tabMenuHtml = /<div id="tab-menu"[\s\S]*?<\/div>/.exec(htmlSource);
+  assert(tabMenuHtml !== null, 'graph.html 里没有 #tab-menu（标签栏右键菜单）');
+  const actions = [...tabMenuHtml[0].matchAll(/data-action="([^"]+)"/g)].map((m) => m[1]);
+  for (const action of [
+    'copyTabName',
+    'closeSelf',
+    'closeOthers',
+    'closeLeft',
+    'closeRight',
+    'closeAll',
+  ]) {
+    assert(
+      actions.includes(action),
+      `标签菜单缺少 ${action}（实际：${actions.join(', ')}）`
+    );
+  }
+  assert(actions.length === 6, `标签菜单应当恰好六项，实际 ${actions.length} 项`);
+}
+// 导出菜单（工具栏「导出」按钮的下拉）：五个格式，data-format 的集合必须**恰好**等于
+// 宿主与 webview 两侧都认的那五个取值 —— 少一项就是「点了没反应」，多一项就是死菜单项。
+const EXPORT_FORMATS = ['png', 'svg', 'md-tree', 'md-table', 'json'];
+{
+  const exportMenuHtml = /<div id="export-menu"[\s\S]*?<\/div>/.exec(htmlSource);
+  assert(exportMenuHtml !== null, 'graph.html 里没有 #export-menu（导出按钮的下拉菜单）');
+  assert(
+    /id="export-menu"[^>]*hidden/.test(exportMenuHtml[0]),
+    '#export-menu 默认必须是 hidden（未点导出按钮时不该显示）'
+  );
+  assert(
+    /id="export-menu"[^>]*class="box-menu"/.test(exportMenuHtml[0]),
+    '#export-menu 应当复用 box-menu 样式类（需求：不新增 CSS）'
+  );
+  // ⚠️ 逐项 includes 只能证明「没少」，所以要再加两条：条数恰好 5、且互不重复。
+  // 少了这两条，「多出一项写错格式名的菜单」照样全绿（那个菜单项点了不会有任何反应）。
+  const formats = [...exportMenuHtml[0].matchAll(/data-format="([^"]+)"/g)].map((m) => m[1]);
+  for (const format of EXPORT_FORMATS) {
+    assert(
+      formats.includes(format),
+      `导出菜单缺少 ${format}（实际：${formats.join(', ')}）`
+    );
+  }
+  assert(
+    formats.length === EXPORT_FORMATS.length,
+    `导出菜单应当恰好 ${EXPORT_FORMATS.length} 项，实际 ${formats.length} 项：${formats.join(', ')}`
+  );
+  assert(
+    new Set(formats).size === formats.length,
+    `导出菜单的 data-format 有重复：${formats.join(', ')}`
+  );
+}
+const toolbarSvgCount = (toolbarHtml[0].match(/<svg/g) ?? []).length;assert(
   toolbarSvgCount === expectedButtons.length,
   `工具栏应有 ${expectedButtons.length} 个内联 SVG 图标，实际 ${toolbarSvgCount} 个`
 );
@@ -340,6 +593,384 @@ assert(
 console.log(
   `诊断: 工具栏 ${toolbarButtons.length} 个按钮、${toolbarPaths.length} 条内联 SVG 路径`
 );
+
+// ------------------------------------------------------------ 导出功能（源码级断言）
+//
+// 导出把「webview 抓画布」与「宿主写盘」串起来，两端各有一件事在测试桩里跑不到：
+//   ① 栅格化要真实 canvas / Image（桩里没有，只有 CSP 与真实浏览器能给答案）；
+//   ② 保存与落盘要真实 VS Code 的保存对话框与文件系统。
+// 因此这里做**源码级**断言：钉住两侧的关键实现都还在、格式与过滤器映射没有错位。
+// 「真机渲染出来的 PNG 长什么样」「路径含中文时能否真的落盘」属于未验证（不写成已完成）。
+{
+  const exportHostSource = fs.readFileSync(
+    path.join(ROOT, 'src', 'views', 'graphView.ts'),
+    'utf8'
+  );
+  const exportWebviewSource = fs.readFileSync(path.join(ROOT, 'src', 'webview', 'graph.ts'), 'utf8');
+  // webview 侧：序列化必须用 XMLSerializer，样式必须用 getComputedStyle 内联
+  // （外部样式表不会进序列化结果，不内联就是黑图），倍数固定 2，PNG 出自 canvas
+  assert(
+    /XMLSerializer/.test(exportWebviewSource),
+    'webview 应当用 XMLSerializer 序列化当前 SVG'
+  );
+  assert(
+    /getComputedStyle/.test(exportWebviewSource) &&
+      /getPropertyValue/.test(exportWebviewSource),
+    'webview 应当用 getComputedStyle 把计算样式内联到导出克隆上（否则导出丢掉全部样式）'
+  );
+  assert(
+    /const EXPORT_SCALE = 2\b/.test(exportWebviewSource),
+    'PNG 导出倍数必须是 2（需求：2 倍分辨率）'
+  );
+  assert(
+    /toDataURL\('image\/png'\)/.test(exportWebviewSource),
+    "PNG 必须由 canvas 的 toDataURL('image/png') 产出"
+  );
+  assert(
+    /drawImage\(/.test(exportWebviewSource),
+    'PNG 栅格化应当把 SVG 图像 drawImage 到画布上'
+  );
+  // 透明背景：不能有 fillRect / fillStyle 这类画底色的动作（画布不画底色才是透明的）
+  assert(
+    !/fillRect|fillStyle|globalAlpha\s*=/.test(exportWebviewSource),
+    'PNG 导出必须保持透明背景：不应在画布上填充底色'
+  );
+  // 超大面积与空数据都必须**报错**，不能静默产出 0 字节 / 全空的 PNG：
+  // 浏览器内核在超出画布面积上限时不抛错，而是给出空数据。
+  assert(
+    // 打包器可能把常量折叠成字面量 268435456，两种写法都接受。
+    /const MAX_CANVAS_AREA = (16384 \* 16384|268435456)\b/.test(exportWebviewSource),
+    'PNG 导出应当按浏览器画布面积上限（16384 × 16384）设闸'
+  );
+  assert(
+    /canvas\.width \* canvas\.height > MAX_CANVAS_AREA/.test(exportWebviewSource) &&
+      /导出矢量图（SVG）/.test(exportWebviewSource),
+    '超出画布面积上限时必须报错并指向矢量导出，而不是产出空 PNG'
+  );
+  assert(
+    /const PNG_DATA_URL_PREFIX = 'data:image\/png;base64,'/.test(exportWebviewSource) &&
+      /url\.startsWith\(PNG_DATA_URL_PREFIX\)/.test(exportWebviewSource),
+    'PNG 数据必须以 data:image/png;base64, 开头并校验长度，否则空数据会被当成导出成功'
+  );
+  // CSP：`default-src 'none'` 会让 img-src 回退成 none，图像加载被静默拦下。
+  // 两条来源都要放行：`blob:` 是主路径（绕开 Chromium 的 2 MB URL 长度上限），
+  // `data:` 是后备路径（blob 加载失败时再试一次）。
+  assert(
+    /img-src blob: data:/.test(htmlSource),
+    "graph.html 的 CSP 必须同时含 `blob:` 与 `data:`（img-src blob: data:）：blob 是主路径、data 是后备"
+  );
+  assert(
+    /2 MB/.test(htmlSource) && /kMaxURLChars|URL 长度/.test(htmlSource),
+    'graph.html 的注释必须写明「不能用 data URL 走大图」的原因（Chromium 的 2 MB URL 长度上限）'
+  );
+
+  // ---- 大图栅格化：blob URL 主路径 + data URL 后备 ----
+  //
+  // 真机证据：276 个节点的图序列化后 2154007 字节，base64 后约 2.87 MB，超过 Chromium 的
+  // URL 长度硬上限（2 MB），`new Image()` 直接走 onerror；小图则一切正常。因此主路径必须是
+  // blob URL，data URL 只作后备，且两条都失败时的文案要带上序列化字节数。
+  assert(
+    /URL\.createObjectURL\(/.test(exportWebviewSource),
+    'PNG 栅格化应当用 URL.createObjectURL 建 blob URL 加载图像（data URL 有 2 MB URL 长度上限）'
+  );
+  assert(
+    /URL\.revokeObjectURL\(/.test(exportWebviewSource),
+    'PNG 栅格化用完必须 URL.revokeObjectURL 释放 blob URL（否则整份序列化文本一直留在内存里）'
+  );
+  assert(
+    /new Blob\(/.test(exportWebviewSource) &&
+      /image\/svg\+xml;charset=utf-8/.test(exportWebviewSource),
+    'blob 必须由 new Blob([文本], { type: image/svg+xml;charset=utf-8 }) 建出来（不带 charset 时中文可能乱码）'
+  );
+  {
+    // 释放必须发生在这两条出口上：onload 画完、onerror 之后。
+    const body = functionBodyOf(exportWebviewSource, 'rasterizePng');
+    const onloadAt = body.indexOf('image.onload');
+    const onerrorAt = body.indexOf('image.onerror');
+    assert(onloadAt >= 0 && onerrorAt > onloadAt, 'rasterizePng 应当同时实现 image.onload 与 image.onerror');
+    assert(
+      /releaseObjectUrl\(\)|revokeObjectURL\(/.test(body.slice(onloadAt, onerrorAt)),
+      'onload 画完之后必须释放 blob URL'
+    );
+    assert(
+      /releaseObjectUrl\(\)|revokeObjectURL\(/.test(body.slice(onerrorAt)),
+      'onerror 之后也必须释放 blob URL（退到后备路径或最终失败都要释放）'
+    );
+    // 后备路径：data URL 的 base64 编码必须还在（小图仍可成功）。
+    assert(
+      /SVG_DATA_URL_PREFIX|data:image\/svg\+xml;base64,/.test(body) &&
+        /encodeBase64Utf8\(prepared\.text\)/.test(body),
+      'blob 加载失败时必须退回 data URL（encodeBase64Utf8 + data:image/svg+xml;base64,…）再试一次'
+    );
+    // 面积闸门必须**提前**：先建 canvas、先判 MAX_CANVAS_AREA，再去 new Image()。
+    const canvasAt = body.indexOf("createElement('canvas')");
+    const gateAt = body.indexOf('MAX_CANVAS_AREA');
+    const imageAt = body.indexOf('new Image()');
+    assert(
+      canvasAt >= 0 && gateAt > canvasAt && imageAt > gateAt,
+      `面积闸门必须在建 canvas 之后、new Image() 之前（实际下标 canvas=${canvasAt} 闸门=${gateAt} 图像=${imageAt}）`
+    );
+    // 失败文案必须带序列化字节数：「序列化 <字节> 字节」。
+    assert(
+      /序列化 \$\{[A-Za-z_$][\w$]*\} 字节/.test(body),
+      'PNG 失败文案必须带上序列化字节数（例如「序列化 2154007 字节」），那是下次诊断的关键信息'
+    );
+  }
+
+  // ---- 导出前的 XML 自检：函数在位、两条导出路径都调用、PNG 的预检在加载图像之前 ----
+  //
+  // 真机现象（2026-10-15）：「导出 PNG（2×）」失败，同时导出的 .svg 打开报错。本轮不猜根因，
+  // 而是把「序列化结果本身是否合法 XML」变成可证的事实：预检不通过就拒绝写文件 / 拒绝栅格化。
+  assert(
+    /function checkExportXml\(/.test(exportWebviewSource) &&
+      /DOMParser\(\)\.parseFromString\(/.test(exportWebviewSource),
+    'webview 应当有 checkExportXml：用 DOMParser 判定序列化结果是否为合法 XML'
+  );
+  assert(
+    /getElementsByTagName\??\.\('parsererror'\)/.test(exportWebviewSource) &&
+      /querySelector\??\.\('parsererror'\)/.test(exportWebviewSource),
+    'parsererror 必须同时按元素名与选择器取（不同内核下它可能是命名空间里的元素）'
+  );
+  // DOMParser 不存在时不得阻断：测试桩与极简环境都没有它，缺了解析器不等于结果不合法。
+  assert(
+    /typeof DOMParser === 'function'/.test(exportWebviewSource),
+    'DOMParser 不存在时必须跳过解析器判据（否则桩环境里导出全被挡住）'
+  );
+  {
+    const begin = functionBodyOf(exportWebviewSource, 'beginExport');
+    const svgSerializeAt = begin.indexOf('buildExportSvg({ stripTitles: false })');
+    const svgCheckAt = begin.indexOf('checkExportXml(prepared.text)');
+    const svgPostAt = begin.indexOf(
+      "post({ type: 'exportGraph', sessionId, format, data: prepared.text })"
+    );
+    assert(
+      svgSerializeAt >= 0 && svgCheckAt > svgSerializeAt && svgPostAt > svgCheckAt,
+      'SVG 路径必须在序列化之后、交给宿主写盘之前做预检' +
+        `（实际 序列化=${svgSerializeAt} 预检=${svgCheckAt} 写盘=${svgPostAt}）`
+    );
+    const rasterize = functionBodyOf(exportWebviewSource, 'rasterizePng');
+    const pngCheckAt = rasterize.indexOf('checkExportXml(prepared.text)');
+    const imageAt = rasterize.indexOf('new Image()');
+    const blobAt = rasterize.indexOf('createObjectURL');
+    assert(
+      pngCheckAt >= 0 && imageAt > pngCheckAt,
+      `PNG 的预检必须在 new Image() 之前（实际 预检=${pngCheckAt} 加载图像=${imageAt}）`
+    );
+    assert(
+      blobAt > pngCheckAt,
+      '预检不通过时不得先建 blob URL：顺序应当是「预检 → 建画布 → 加载图像」'
+    );
+  }
+
+  // ---- PNG 路径剔除 `<title>`、SVG 文件路径保留 ----
+  //
+  // 栅格图没有悬停提示，`<title>` 在大图里是体积大户；但 SVG 文件要给人用编辑器打开，
+  // 提示必须留着。因此剔除开关**只**用在 PNG 调用点，且只作用于克隆体。
+  {
+    const body = functionBodyOf(exportWebviewSource, 'buildExportSvg');
+    assert(
+      /clone\.querySelectorAll\('title'\)/.test(body) && /\.remove\(\)/.test(body),
+      "PNG 路径应当从**克隆体**里删除 <title>（clone.querySelectorAll('title') + remove）"
+    );
+    assert(
+      !/source\.querySelectorAll\('title'\)/.test(body),
+      '剔除 <title> 绝不能作用于真画布 source（否则用户悬停方框就再没有提示）'
+    );
+    const inlineAt = body.indexOf('inlineExportStyles(source, clone)');
+    const stripAt = body.indexOf("clone.querySelectorAll('title')");
+    assert(
+      inlineAt >= 0 && stripAt > inlineAt,
+      '必须先内联样式再剔除 <title>：内联靠「原节点与克隆体逐一下标对应」，先删元素会让下标错位'
+    );
+    const begin = functionBodyOf(exportWebviewSource, 'beginExport');
+    const keepAt = begin.indexOf('buildExportSvg({ stripTitles: false })');
+    const stripCallAt = begin.indexOf('buildExportSvg({ stripTitles: true })');
+    const rasterizeAt = begin.indexOf('rasterizePng(prepared, sessionId)');
+    assert(
+      keepAt >= 0 && stripCallAt >= 0 && rasterizeAt >= 0,
+      'beginExport 应当分别以 stripTitles: false（SVG）与 stripTitles: true（PNG）调用 buildExportSvg'
+    );
+    const svgBranch = begin.slice(keepAt, stripCallAt);
+    assert(
+      /post\(\{\s*type: 'exportGraph'/.test(svgBranch) && !/rasterizePng\(/.test(svgBranch),
+      'SVG 分支（stripTitles: false）应当把文本交给宿主写盘，而不是走栅格化'
+    );
+    const pngBranch = begin.slice(stripCallAt, rasterizeAt);
+    assert(
+      pngBranch.length > 0 && !/stripTitles: false/.test(pngBranch),
+      'PNG 分支应当用 stripTitles: true 的克隆体去栅格化'
+    );
+  }
+
+  // ---- 导出前的字符净化：必须在序列化**之前**，且判定用的正则不得带 g ----
+  //
+  // 真机根因（8.8）：节点 id 以 NUL 作分隔符，id 随属性值进入画布，序列化后属性值里是裸
+  // U+0000，内核的 XML 解析器报 `invalid character in attribute value`。修法是序列化之前
+  // 把克隆体里 XML 1.0 不允许的控制字符换成可见替身 —— 这一步的**位置**是修法的一部分：
+  // 排在序列化之后等于什么都没做。
+  {
+    const body = functionBodyOf(exportWebviewSource, 'buildExportSvg');
+    const sanitizeAt = body.indexOf('sanitizeExportXmlChars(clone)');
+    const serializeAt = body.indexOf('new XMLSerializer()');
+    assert(sanitizeAt >= 0, 'buildExportSvg 必须在克隆体上调用 sanitizeExportXmlChars(clone)');
+    assert(
+      serializeAt > sanitizeAt,
+      '净化必须排在序列化之前（排在之后等于没做）' +
+        `（实际 净化=${sanitizeAt} 序列化=${serializeAt}）`
+    );
+    // 判定用的正则**不带 g**：带 g 的 test() 会用 lastIndex 在连续调用之间漏判，
+    // 而净化对每个属性、每段文本各调用一次，必然连续调用。
+    const testRegex =
+      /const XML_INVALID_CONTROL_CHAR_TEST = \/((?:[^/\\]|\\.)*)\/([a-z]*);/.exec(
+        exportWebviewSource
+      );
+    assert(testRegex !== null, '找不到 XML_INVALID_CONTROL_CHAR_TEST（判定用的非全局正则）');
+    assert(
+      !testRegex[2].includes('g'),
+      `XML_INVALID_CONTROL_CHAR_TEST 不得带 g 标志（实际 /${testRegex[1]}/${testRegex[2]}）`
+    );
+    const scanRegex = /const XML_INVALID_CONTROL_CHARS = \/((?:[^/\\]|\\.)*)\/([a-z]*);/.exec(
+      exportWebviewSource
+    );
+    assert(
+      scanRegex !== null && scanRegex[1] === testRegex[1],
+      '判定用正则与替换用正则必须是同一字符集（否则「判到却替换不掉」）' +
+        `（判定 [${testRegex[1]}] / 替换 [${scanRegex === null ? '（找不到）' : scanRegex[1]}]）`
+    );
+    assert(scanRegex[2].includes('g'), '替换用的 XML_INVALID_CONTROL_CHARS 必须带 g');
+    const sanitizeFn = functionBodyOf(exportWebviewSource, 'sanitizeXmlChars');
+    assert(
+      /XML_INVALID_CONTROL_CHAR_TEST\.test\(value\)/.test(sanitizeFn) &&
+        /\.replace\(XML_INVALID_CONTROL_CHARS, XML_INVALID_CHAR_PLACEHOLDER\)/.test(sanitizeFn),
+      'sanitizeXmlChars 应当「用非全局正则判定、用全局正则替换」'
+    );
+    // 净化必须同时覆盖属性值与文本节点（nodeType 用数字 1 = 元素、3 = 文本）。
+    const walkFn = functionBodyOf(exportWebviewSource, 'sanitizeExportXmlChars');
+    assert(
+      /node\.attributes/.test(walkFn) && /setAttribute\(attribute\.name, safe\)/.test(walkFn),
+      'sanitizeExportXmlChars 必须逐条改写属性值（只改值、不改名，url(#id) 引用才不受影响）'
+    );
+    assert(
+      /nodeType === 3/.test(walkFn) && /nodeValue/.test(walkFn) && /nodeType === 1/.test(walkFn),
+      'sanitizeExportXmlChars 必须按 nodeType 分辨文本节点（3）与元素（1）并递归下去'
+    );
+  }
+
+  // ---- 内联计算样式：等于初始值的不写、不等于的写 ----
+  {
+    const tableMatch = /const SVG_INITIAL_STYLE_VALUES[^=]*=\s*\{([\s\S]*?)\n\};/.exec(
+      exportWebviewSource
+    );
+    assert(tableMatch !== null, '找不到 SVG_INITIAL_STYLE_VALUES 初始值表');
+    const table = tableMatch[1];
+    // 逐条比对（属性 → 可接受的初始值写法），防止表里写错一个值就整条规则失效。
+    for (const [property, values] of Object.entries({
+      fill: ['rgb(0, 0, 0)', '#000000', 'black'],
+      'fill-opacity': ['1'],
+      stroke: ['none'],
+      'stroke-width': ['1', '1px'],
+      'stroke-dasharray': ['none'],
+      opacity: ['1'],
+      'font-weight': ['400', 'normal'],
+      'font-style': ['normal'],
+      'text-anchor': ['start'],
+      'dominant-baseline': ['auto'],
+    })) {
+      const entry = new RegExp(`['"]?${property}['"]?\\s*:\\s*\\[([^\\]]*)\\]`).exec(table);
+      assert(entry !== null, `初始值表里缺少 ${property}`);
+      for (const value of values) {
+        assert(
+          entry[1].includes(`'${value}'`),
+          `初始值表里 ${property} 缺少写法 '${value}'（实际 [${entry[1].trim()}]）`
+        );
+      }
+    }
+    // font-family / font-size **不得**进入初始值表，且必须在「一律内联」名单里。
+    // 键名可能带引号也可能不带，所以按「键后跟冒号」判定，而不是查字符串。
+    assert(
+      !/(^|[\s{])['"]?font-family['"]?\s*:/m.test(table) &&
+        !/(^|[\s{])['"]?font-size['"]?\s*:/m.test(table),
+      'font-family / font-size 不得进入初始值表：UA 默认值随环境而变，跳过有风险'
+    );
+    const alwaysMatch = /const ALWAYS_INLINE_STYLE_PROPERTIES = \[([^\]]*)\]/.exec(
+      exportWebviewSource
+    );
+    assert(alwaysMatch !== null, '找不到 ALWAYS_INLINE_STYLE_PROPERTIES（一律内联名单）');
+    assert(
+      /'font-family'/.test(alwaysMatch[1]) && /'font-size'/.test(alwaysMatch[1]),
+      'font-family 与 font-size 必须列入「一律内联」名单'
+    );
+    assert(
+      /includes\(property\)\) \{\s*return false;/.test(exportWebviewSource),
+      '「一律内联」必须真的挡住跳过逻辑（先判名单再查初始值表）'
+    );
+  }
+  // 宿主侧：保存对话框 + 写文件 + 四种扩展名的过滤器映射
+  assert(
+    /showSaveDialog\(/.test(exportHostSource),
+    '宿主应当用 vscode.window.showSaveDialog 让用户选保存位置'
+  );
+  assert(
+    /workspace\.fs\.writeFile\(/.test(exportHostSource),
+    '宿主应当用 vscode.workspace.fs.writeFile 落盘'
+  );
+  for (const extension of ['.png', '.svg', '.md', '.json']) {
+    assert(
+      exportHostSource.includes(`'${extension}'`),
+      `宿主的导出格式表里缺少扩展名 ${extension}（保存对话框的 filters 会漏一种格式）`
+    );
+  }
+  // 两侧的格式集合必须一致：模板里写了几项，宿主就要认几项、webview 就要处理几项
+  for (const format of EXPORT_FORMATS) {
+    assert(
+      new RegExp(`'${format}':`).test(exportHostSource),
+      `宿主 EXPORT_FORMATS 里缺少导出格式 ${format}`
+    );
+    assert(
+      exportWebviewSource.includes(`'${format}'`),
+      `webview 侧没有处理导出格式 ${format}`
+    );
+  }
+  // md-tree 必须复用同一份正文逻辑：copyTree 的 buildSessionText 改成调用纯函数后，
+  // 「复制」与「导出 Markdown（结构树）」不可能各走一套格式。
+  const copyTreeSource = fs.readFileSync(path.join(ROOT, 'src', 'commands', 'copyTree.ts'), 'utf8');
+  assert(
+    /buildMarkdownTree\(/.test(copyTreeSource),
+    'copyTree.buildSessionText 应当调用 buildMarkdownTree（否则两处正文会分叉）'
+  );
+  assert(
+    !/MAX_NODES|MAX_DEPTH/.test(copyTreeSource),
+    'walk（含两个上限）应当只在 commands/exportGraph.ts 里有一份，copyTree 里不该再留一份'
+  );
+  // 纯函数文件不得引用 vscode API：它要在没有 VS Code 的冒烟测试里被直接调用
+  const pureSource = fs.readFileSync(path.join(ROOT, 'src', 'commands', 'exportGraph.ts'), 'utf8');
+  assert(
+    !/from 'vscode'/.test(pureSource) && !/\bvscode\./.test(pureSource),
+    'commands/exportGraph.ts 不得引用 vscode API（否则无法在冒烟测试里直接断言）'
+  );
+  for (const name of ['buildMarkdownTree', 'buildMarkdownTable', 'buildJsonText']) {
+    assert(
+      new RegExp(`export function ${name}\\b`).test(pureSource),
+      `commands/exportGraph.ts 应当导出 ${name}`
+    );
+  }
+  // 桩里那张属性名表必须与生产代码一致，否则下面的行为断言会在错误的属性集合上跑。
+  {
+    const listMatch = /const EXPORT_STYLE_PROPERTIES = \[([\s\S]*?)\];/.exec(exportWebviewSource);
+    assert(listMatch !== null, '找不到 EXPORT_STYLE_PROPERTIES（要内联的属性名表）');
+    const names = [...listMatch[1].matchAll(/'([^']+)'/g)].map((match) => match[1]);
+    assert(
+      names.join(',') === EXPORT_STYLE_PROPERTY_NAMES.join(','),
+      `桩里的属性名表必须与生产一致：生产 [${names.join(',')}]、桩 [${EXPORT_STYLE_PROPERTY_NAMES.join(',')}]`
+    );
+  }
+  log(
+    `诊断: 导出 —— 模板 ${EXPORT_FORMATS.length} 个格式，webview 用 XMLSerializer + getComputedStyle + 2 倍 canvas；` +
+      '大图走 blob URL（data URL 仅作后备）、面积闸门在建 canvas 后立刻判定；' +
+      'PNG 剔除 <title> 且跳过等于初始值的内联属性；宿主用 showSaveDialog + workspace.fs.writeFile，' +
+      'filters 覆盖 .png/.svg/.md/.json'
+  );
+}
 
 // ------------------------------------------------ 工具栏按钮的点击行为
 
@@ -402,9 +1033,15 @@ for (const id of [
   'btn-search-case',
   'btn-search-word',
   'btn-search-regex',
+  'btn-search-path',
+  'btn-search-full',
   'search-count',
   'btn-search-prev',
   'btn-search-next',
+  // 临时路径过滤（搜索栏区域，用户 2026-10-15）：输入框与「已隐藏 N 个」
+  'path-filter',
+  'path-filter-input',
+  'path-filter-count',
 ]) {
   assert(searchHtml[0].includes(`id="${id}"`), `搜索栏缺少 #${id}`);
 }
@@ -412,11 +1049,37 @@ assert(
   /id="search-input"[\s\S]*?type="text"/.test(searchHtml[0]),
   '搜索框应当是 type="text" 的输入框'
 );
+assert(
+  /id="path-filter-input"[\s\S]*?type="text"/.test(searchHtml[0]),
+  '临时路径过滤也应当是 type="text" 的输入框'
+);
+// 临时过滤包一层 `<span>` 而不是 `<div>`：上面那条正则按「第一个 </div>」截取 #search，
+// 里面再嵌一个 div 会把搜索栏的其余元素挤到截取范围之外（断言随之假失败/假通过）。
+assert(
+  /<span id="path-filter"/.test(searchHtml[0]),
+  '临时过滤那一段应当用 <span> 包（#search 的截取按第一个 </div> 结束）'
+);
 {
   const searchCss = fs.readFileSync(path.join(ROOT, 'src', 'webview', 'graph.css'), 'utf8');
   assert(
     /\.search\s*\{[^}]*margin-left:\s*auto/.test(searchCss),
     'CSS 里 .search 应当用 margin-left:auto 固定到工具栏最右侧'
+  );
+  // 这一栏现在装着搜索框 + 五个开关 + 计数 + 两个箭头 + 临时过滤，宽度超过窄面板：
+  // 必须能折行，否则它作为不可再缩的 flex 项会把整个工具栏顶出水平滚动条。
+  assert(
+    /\.search\s*\{[^}]*flex-wrap:\s*wrap/.test(searchCss),
+    'CSS 里 .search 应当允许折行（窄面板下这一栏的宽度已经超过可用宽度）'
+  );
+  // 临时路径过滤与搜索挤在同一栏、但是两件事：CSS 里既要有它自己的样式（不能是裸控件），
+  // 也要有把它们分开的视觉分隔（否则用户会以为那个输入框也是搜索框的一部分）。
+  assert(
+    /\.path-filter\s*\{[^}]*border-left:/.test(searchCss),
+    'CSS 里 .path-filter 应当有左侧分隔线（临时过滤与搜索是两件事，视觉上要分开）'
+  );
+  assert(
+    /\.path-filter-input\s*\{[^}]*width:/.test(searchCss),
+    'CSS 里 .path-filter-input 应当有自己的宽度（沿用搜索框的宽度会把这一栏挤爆）'
   );
   // 命中样式：按「白字必须仍然清晰」这个**对比度**问题来断言，而不只是查规则在不在。
   // 做法：把（半透明的）底纹混到深色主题的默认方框背景上，再算它与主题默认前景色的
@@ -490,6 +1153,43 @@ assert(
     `README 的设置表必须与 package.json 的 configuration 完全对应：README=[${readmeKeys.join(',')}]，配置=[${configKeys.join(',')}]`
   );
 
+  // 表格**形状**：每一行的单元格数必须与表头一致。
+  // 立此断言的原因：上一轮新增「建议位置」列时，整理脚本按裸 `|` 切分单元格，
+  // 把说明里含**转义竖线**（`a\|b`）的那几行切错、整整少了一列 —— 键集合的断言完全发现不了
+  // （键还在），而在 GitHub 上那几行的说明会串进「建议位置」列。
+  // ⚠️ 计的是**未转义**的竖线：`\|` 是字面竖线，不是单元格边界。
+  const countPipes = (line) => {
+    let count = 0;
+    for (let index = 0; index < line.length; index += 1) {
+      if (line[index] !== '|') {
+        continue;
+      }
+      let backslashes = 0;
+      for (let back = index - 1; back >= 0 && line[back] === '\\'; back -= 1) {
+        backslashes += 1;
+      }
+      if (backslashes % 2 === 0) {
+        count += 1;
+      }
+    }
+    return count;
+  };
+  const readmeLines = readme.split(/\r?\n/);
+  const headerLine = readmeLines.find((line) => /^\|\s*设置\s*\|/.test(line));
+  assert(headerLine !== undefined, 'README 的设置表没有找到表头（`| 设置 | 默认值 | …`）');
+  const expectedPipes = countPipes(headerLine);
+  for (const line of readmeLines) {
+    if (!/^\|\s*`cppCallGraph\./.test(line)) {
+      continue;
+    }
+    assert(
+      countPipes(line) === expectedPipes,
+      `README 设置表的列数与表头不一致（表头 ${expectedPipes - 1} 列、这一行 ${
+        countPipes(line) - 1
+      } 列）：${line.slice(0, 48)}…`
+    );
+  }
+
   const sticky = pkg.contributes.configuration.properties['cppCallGraph.stickyParent'];
   assert(sticky !== undefined, 'package.json 里应当有 cppCallGraph.stickyParent 设置项');
   assert(
@@ -541,6 +1241,23 @@ assert(
   // 「必须下发给 webview」的清单，只钉两件事：宿主真读它、改设置会触发重排。
   const graphViewSource = fs.readFileSync(path.join(ROOT, 'src', 'views', 'graphView.ts'), 'utf8');
   assert(/maxLayoutNodes/.test(graphViewSource), '宿主没有读 maxLayoutNodes 设置');
+  // 跳转语义（2026-10-14 改动，**尚未真机验收**，因此只能做源码级断言 —— 跳转依赖真实 VS Code
+  // 的文档/编辑器 API，冒烟桩不具备这套能力）：
+  //   ① 双击应打开「父级中引用它的位置」（节点的 callSite），而不是符号自身的定义处；
+  //   ② 引用**可能跨文件**（文本搜索兜底的命中落在任意 .c/.h），必须按 callSite.file 解析；
+  //   ③ 解析不出来时要保留「退回符号定义处」的兜底，避免双击变成无反应。
+  assert(
+    /node\?\.callSite/.test(graphViewSource),
+    'openLocation 应当优先使用节点的 callSite（父级引用处）'
+  );
+  assert(
+    /workspaceFolders[\s\S]{0,240}joinPath\(folder\.uri, callSite\.file\)/.test(graphViewSource),
+    '跨文件引用必须按 callSite.file 对各工作区根解析（不能假定与父节点同文件）'
+  );
+  assert(
+    /openTextDocument\(item\.uri\)/.test(graphViewSource),
+    '找不到 callSite 时必须保留「退回符号定义处」的兜底'
+  );
   assert(
     /affectsConfiguration\('cppCallGraph\.maxLayoutNodes'\)/.test(extensionSource),
     '改了 maxLayoutNodes 却没触发重排 —— extension.ts 的 onDidChangeConfiguration 漏了它'
@@ -723,7 +1440,13 @@ assert(
   // ---- 无障碍：键盘可达与状态可读 ----
   // 「看得见的状态」必须同时暴露给辅助技术，否则屏幕阅读器只能读出"按钮"。
   const htmlSource = fs.readFileSync(path.join(ROOT, 'src', 'webview', 'graph.html'), 'utf8');
-  for (const id of ['btn-search-case', 'btn-search-word', 'btn-search-regex']) {
+  for (const id of [
+    'btn-search-case',
+    'btn-search-word',
+    'btn-search-regex',
+    'btn-search-path',
+    'btn-search-full',
+  ]) {
     const tag = new RegExp(`<button id="${id}"[^>]*>`).exec(htmlSource)?.[0] ?? '';
     assert(
       /aria-pressed="(true|false)"/.test(tag),
@@ -733,6 +1456,10 @@ assert(
   assert(
     /<span id="search-count"[^>]*aria-live=/.test(htmlSource),
     '搜索命中计数应当 aria-live，键盘/读屏用户才能知道命中变化'
+  );
+  assert(
+    /<span id="path-filter-count"[^>]*aria-live=/.test(htmlSource),
+    '临时过滤的「已隐藏 N 个」应当 aria-live（过滤会改变图里有什么，读屏用户要知道）'
   );
   assert(
     /'aria-label'/.test(webviewSource) && /tabindex: '0'/.test(webviewSource),
@@ -754,10 +1481,17 @@ const searchInputStub = createElement('input');
 searchInputStub.value = '';
 byId.set('search-input', searchInputStub);
 byId.set('search-count', createElement('span'));
+// 临时路径过滤：输入框与计数（同搜索栏一样，由桩元素驱动真实的事件处理）
+const pathFilterInputStub = createElement('input');
+pathFilterInputStub.value = '';
+byId.set('path-filter-input', pathFilterInputStub);
+byId.set('path-filter-count', createElement('span'));
 for (const id of [
   'btn-search-case',
   'btn-search-word',
   'btn-search-regex',
+  'btn-search-path',
+  'btn-search-full',
   'btn-search-prev',
   'btn-search-next',
 ]) {
@@ -780,6 +1514,85 @@ viewportEl.appendChild(nodesEl);
 const windowListeners = {};
 const posted = [];
 
+/**
+ * SVG 属性的初始值（与规范一致；生产代码里那张表由源码级断言比对）。
+ * 桩按它回答「这个元素这个属性算出来等于初始值吗」。
+ */
+const STUB_SVG_INITIAL_VALUES = {
+  fill: 'rgb(0, 0, 0)',
+  'fill-opacity': '1',
+  stroke: 'none',
+  'stroke-width': '1px',
+  'stroke-dasharray': 'none',
+  opacity: '1',
+  'font-weight': '400',
+  'font-style': 'normal',
+  'text-anchor': 'start',
+  'dominant-baseline': 'auto',
+};
+
+/**
+ * 桩的「计算样式」：按元素的主类名给一张固定表。
+ *
+ * 真实浏览器里这些值来自 CSS 层叠与继承；桩没有 CSS 引擎，于是按类名硬编码。
+ * 它要验证的是**规则本身**：「内联计算样式时，取值等于 SVG 初始值的属性不写、不等于的写」。
+ * 因此表里刻意同时放了初始值与非初始值：
+ *   - `box.stroke-width = '1px'`（= 初始值）、`edge.fill = 'none'`（= 初始值）、
+ *     `name.text-anchor = 'start'`（= 初始值）→ 都不该出现在导出文件里；
+ *   - `box.fill = 'rgb(30, 30, 30)'`、`name.font-weight = '600'` → 必须写进去。
+ * 表里没有的属性一律按初始值回答；`font-family` / `font-size` 例外：它们会被继承，
+ * 且生产代码规定**一律内联**，所以任何元素都要给出取值（否则那两条规则测不到）。
+ *
+ * ⚠️ 它证明的是「跳过规则按初始值表工作」，**不**证明真实 CSS 下各元素算出的值 ——
+ * 后者要真实浏览器，属于未验证。
+ */
+const STUB_COMPUTED_STYLE_BY_CLASS = {
+  box: { fill: 'rgb(30, 30, 30)', stroke: 'rgb(60, 60, 60)', 'stroke-width': '1px' },
+  edge: {
+    fill: 'none',
+    stroke: 'rgb(128, 128, 128)',
+    'stroke-width': '1.3px',
+    'stroke-dasharray': 'none',
+  },
+  name: {
+    fill: 'rgb(220, 220, 220)',
+    'font-size': '13px',
+    'font-weight': '600',
+    'text-anchor': 'start',
+  },
+  loc: {
+    fill: 'rgb(150, 150, 150)',
+    'font-size': '12px',
+    'font-style': 'normal',
+    'dominant-baseline': 'auto',
+  },
+};
+
+/** 桩里某元素某属性的计算取值（空串表示桩不提供该属性）。 */
+function stubComputedValue(element, property) {
+  const className = String(element?.getAttribute?.('class') ?? '');
+  const primary = className.split(/\s+/).filter(Boolean)[0] ?? '';
+  const table = STUB_COMPUTED_STYLE_BY_CLASS[primary] ?? {};
+  if (Object.prototype.hasOwnProperty.call(table, property)) {
+    return table[property];
+  }
+  if (property === 'font-family') {
+    return stubFontFamily;
+  }
+  if (property === 'font-size') {
+    return '13px';
+  }
+  return STUB_SVG_INITIAL_VALUES[property] ?? '';
+}
+
+/** 生产代码调用的 `getComputedStyle`：既要 `fontFamily`（量宽缓存键），也要 `getPropertyValue`（内联样式）。 */
+function stubComputedStyle(element) {
+  return {
+    fontFamily: stubFontFamily,
+    getPropertyValue: (property) => stubComputedValue(element, property),
+  };
+}
+
 global.document = {
   getElementById: (id) => byId.get(id) ?? null,
   createElement: (tag) => createElement(tag),
@@ -793,8 +1606,8 @@ global.window = {
   // 右键菜单要靠视口尺寸做边界收边，缺了这两个会算出 NaN 坐标
   innerWidth: 1000,
   innerHeight: 700,
-  // 量宽的缓存键要用实际字体族；桩按"当前生效的字体"如实回答
-  getComputedStyle: () => ({ fontFamily: stubFontFamily }),
+  // 量宽缓存键要用实际字体族；内联导出样式要按元素取计算值 —— 桩都按"当前生效的字体"如实回答
+  getComputedStyle: (element) => stubComputedStyle(element),
 };
 global.document.defaultView = global.window;
 global.acquireVsCodeApi = () => ({
@@ -807,6 +1620,114 @@ global.ResizeObserver = class {
   disconnect() {}
 };
 global.SVGElement = createElement('svg');
+
+/**
+ * 桩开关：模拟「克隆体上的字符净化没有生效」。
+ *
+ * 键是属性名，值是该属性在**序列化时**写出的原始取值。真机根因的对照组 ——
+ * 把生产代码里的 `sanitizeExportXmlChars(clone)` 去掉时，序列化结果里就是这些裸控制字符
+ * （内核的 XML 解析器随即报 `invalid character in attribute value`）。
+ * 取值长度刻意与净化后的取值相同，这样「文本其余部分逐字不变」，
+ * 于是预检报出的下标可以被独立核对。
+ */
+let stubSerializerRawAttributeValues;
+
+/**
+ * XMLSerializer 桩：只把元素与属性按文档序拼成一段可读文本。
+ *
+ * 断言只关心「调用确实发生、拿到一段非空字符串、里面带 svg/viewBox/xmlns」；
+ * 真实 XML 语法由浏览器负责，桩自造一套规则反而会掩盖问题。
+ *
+ * 已知与本机内核的差异（刻意保留，不要顺带补齐）：真实 XMLSerializer 会输出文本子节点，
+ * 这个桩只输出元素与属性。因此「文本子节点里的控制字符被净化」这一条没有行为断言
+ * （见开发记录 8.8 的未验证清单）。
+ */
+global.XMLSerializer = class {
+  serializeToString(node) {
+    const parts = [];
+    const walk = (element) => {
+      const attrs = [...element.attributes]
+        .map((attribute) => {
+          const raw = stubSerializerRawAttributeValues?.[attribute.name];
+          const value = raw === undefined ? String(attribute.value) : raw;
+          return ` ${attribute.name}="${value}"`;
+        })
+        .join('');
+      parts.push(`<${element.tagName}${attrs}>`);
+      for (const child of element.children) {
+        walk(child);
+      }
+      parts.push(`</${element.tagName}>`);
+    };
+    walk(node);
+    return parts.join('');
+  }
+};
+
+/**
+ * 桩的「解析结果」：`undefined` 表示解析通过，否则该文本就是解析器报错的内容。
+ *
+ * 真实内核何时给 `image/svg+xml` 插入 `parsererror` 元素，在 Node 里无法复现，
+ * 因此由这个开关直接给出「有 / 没有 parsererror」两种情形，断言生产代码的**反应**。
+ */
+let stubParserErrorText;
+/**
+ * 让桩**只**通过 `querySelector` 暴露 parsererror。
+ *
+ * 用途：部分内核把 parsererror 放在命名空间里（带前缀的元素按标签名取不到），
+ * 生产代码因此写成 `getElementsByTagName(...) ?? querySelector(...)`；打开这个开关即可
+ * 验证「按元素名取不到时，第二条判据仍然生效」。
+ */
+let stubParserErrorOnlyBySelector = false;
+/**
+ * 让桩按 **XML 1.0 规则**自己判：待解析文本里出现不允许直接出现的控制字符就给出 parsererror。
+ *
+ * 这是桩对内核行为的**建模**，依据是真机日志原文
+ * （`error on line 10 at column 3501: invalid character in attribute value`）。
+ * 打开它才能测出「同一个含 NUL 的输入，净化生效时解析通过、净化关掉时解析报错」这条闭环；
+ * 「真实内核在什么条件下给出 parsererror」仍要真机确认（见开发记录 8.8 的未验证清单）。
+ */
+let stubParserRejectInvalidXmlChars = false;
+
+/**
+ * 扫描 XML 1.0 不允许直接出现的控制字符（`\t`、`\n`、`\r` 除外）。
+ *
+ * 刻意**不复用**生产代码那份正则：桩若跟着生产实现一起错，判据就失去意义。
+ * 不带 `g`，避免 `test()` / `exec()` 之间的 `lastIndex` 残留。
+ */
+const XML_INVALID_CHAR_SCAN = /[\u0000-\u0008\u000B\u000C\u000E-\u001F]/;
+
+/**
+ * DOMParser 桩：只回答「解析出来的文档里有没有 parsererror 元素」这一件事。
+ *
+ * ⚠️ 它证明的是「生产代码在拿到 parsererror 时确实拒绝导出」，**不**证明真实内核在什么
+ * 条件下给出 parsererror —— 后者要真实浏览器，属于未验证。
+ */
+global.DOMParser = class {
+  parseFromString(text) {
+    let error = stubParserErrorText === undefined ? null : { textContent: stubParserErrorText };
+    if (error === null && stubParserRejectInvalidXmlChars && typeof text === 'string') {
+      const hit = XML_INVALID_CHAR_SCAN.exec(text);
+      if (hit !== null) {
+        const before = text.slice(0, hit.index);
+        const line = before.split('\n').length;
+        const column = hit.index - (before.lastIndexOf('\n') + 1) + 1;
+        const code = (text.codePointAt(hit.index) ?? 0).toString(16).toUpperCase().padStart(4, '0');
+        error = {
+          textContent:
+            `error on line ${line} at column ${column}: invalid character in attribute value` +
+            `（桩按 XML 1.0 判定：位置 ${hit.index} 处是 U+${code}）`,
+        };
+      }
+    }
+    return {
+      getElementsByTagName: (name) =>
+        name === 'parsererror' && error !== null && !stubParserErrorOnlyBySelector ? [error] : [],
+      querySelector: (selector) =>
+        selector === 'parsererror' && error !== null ? error : null,
+    };
+  }
+};
 
 /** 异步的 requestAnimationFrame：回调排队，等下一个宏任务统一执行。 */
 const frameQueue = [];
@@ -911,8 +1832,8 @@ const layoutBoxes = createLayout(
   {
     root: {
       id: 'root',
-      name: 'bsp_boot',
-      file: 'bsp_boot.h',
+      name: 'lib_boot',
+      file: 'lib_boot.h',
       line: 23,
       direction: 'callers',
       depth: 0,
@@ -957,17 +1878,17 @@ function sendToWebview(message) {
 function makeSession(direction) {
   return {
     id: `s-${direction}`,
-    title: 'bsp_boot',
-    description: 'bsp_boot.h:23',
+    title: 'lib_boot',
+    description: 'lib_boot.h:23',
     direction,
     engineLabel: 'clangd 22.1.6',
     rootId: 'root',
     nodes: {
       root: {
         id: 'root',
-        name: 'bsp_boot',
-        detail: 'void bsp_boot(void)',
-        file: 'components/BSP/boot/bsp_boot.h',
+        name: 'lib_boot',
+        detail: 'void lib_boot(void)',
+        file: 'components/LIB/boot/lib_boot.h',
         line: 23,
         direction,
         depth: 0,
@@ -982,7 +1903,7 @@ function makeSession(direction) {
         name: 'app_main',
         file: 'main/main.c',
         line: 5,
-        callSite: { file: 'main/main.c', line: 8, text: 'bsp_boot();' },
+        callSite: { file: 'main/main.c', line: 8, text: 'lib_boot();' },
         direction,
         depth: 1,
         isCycle: false,
@@ -1055,11 +1976,11 @@ assert(texts.length >= 4, `文字不足：期望至少 4 个，实际 ${texts.le
 
 const textContents = texts.map((element) => element.textContent);
 assert(
-  textContents.some((value) => value.includes('bsp_boot')),
+  textContents.some((value) => value.includes('lib_boot')),
   `方框文字里没有名称：${textContents.join(' | ')}`
 );
 assert(
-  textContents.some((value) => value.includes('bsp_boot.h:23')),
+  textContents.some((value) => value.includes('lib_boot.h:23')),
   `方框文字里没有 文件:行号：${textContents.join(' | ')}`
 );
 
@@ -1313,7 +2234,7 @@ for (const tab of tabsEl.children) {
   const ids = [];
   const cases = [
     ['wshort', 'f', 'a.c', 1],
-    ['wlong', 'a_very_long_function_name_here', 'components/BSP/boot/bsp_boot_impl.c', 120],
+    ['wlong', 'a_very_long_function_name_here', 'components/LIB/boot/lib_boot_impl.c', 120],
   ];
   for (const [id, name, file, line] of cases) {
     ids.push(id);
@@ -1402,7 +2323,7 @@ for (const tab of tabsEl.children) {
     );
   }
 
-  // 列间隙：**按 DOM 里真正画出来的方框**量一遍，而不是只读布局算出来的数。
+  // 列间隙：**按 DOM 里真正画出来的方框**测量一次，而不是只读布局算出来的数。
   // 布局 → 负载 → 渲染这条链上任何一环把宽度或列位置弄错，这里都会露出来
   // （只断言 relaid.boxes 的话，等于用布局自己的常量验证它自己）。
   {
@@ -1825,6 +2746,7 @@ for (const [buttonId, expectedType] of [
   ['btn-expand-full', 'expandFull'], // 递归到底：与 expandAll 是两种消息，宿主那边不再受层数上限约束
   ['btn-settings', 'openSettings'],
   ['btn-copy-tab', 'copyTabText'],
+  ['btn-export', undefined], // 导出按钮只弹菜单，自身不发消息（格式由菜单项决定）
   ['btn-collapse-all', 'collapse'], // 收起全部要把收起状态下发宿主（坐标由宿主算，漏了就只展开到第二级）
   ['btn-close-all', 'closeAllTabs'],
 ]) {
@@ -1850,8 +2772,765 @@ for (const [buttonId, expectedType] of [
 }
 log(
   `诊断: 工具栏 ${expectedButtons.length} 个按钮的点击行为都正确` +
-    '（展开全部发 expandAll、完全展开发 expandFull、设置/复制标签/关闭发消息，收起全部下发收起状态）'
+    '（展开全部发 expandAll、完全展开发 expandFull、设置/复制标签/关闭发消息，' +
+    '收起全部下发收起状态并请求完全复位）'
 );
+
+// 「收起全部」= 完全复位（用户 2026-10-14 口径）：只下发「收起标记」是不够的 ——
+// 已取回的节点一直留在会话里，之后再点「展开全部」只是把旧形状搬回来（层数由历史点击决定，
+// 与设置里的 maxExpandRounds 无关）。因此必须同时请求宿主丢掉已加载的展开状态。
+{
+  const button = byId.get('btn-collapse-all');
+  const before = posted.length;
+  button.dispatch('click', {});
+  const fresh = posted.slice(before).filter((message) => message.type !== 'reportWidths');
+  const types = fresh.map((message) => message.type);
+  assert(
+    types.includes('resetExpansion'),
+    `收起全部点击后应发出 resetExpansion（完全复位），实际 ${types.join(',') || '（无）'}`
+  );
+  const reset = fresh.find((message) => message.type === 'resetExpansion');
+  assert(
+    typeof reset.sessionId === 'string' && reset.sessionId.length > 0,
+    'resetExpansion 必须带当前活动标签的 sessionId'
+  );
+  const collapse = fresh.find((message) => message.type === 'collapse');
+  assert(
+    collapse !== undefined && Array.isArray(collapse.collapsed) && collapse.collapsed.length === 1,
+    '收起全部的收起集合必须**只含根节点**（多一个都会让复位后的画面出现缺口）'
+  );
+  console.log('诊断: 收起全部 —— 收起集合只含根节点，并同时请求完全复位（resetExpansion）');
+}
+
+// ------------------------------------------------ 导出菜单：五个格式真的会发消息
+//
+// 行为层断言（不是查源码子串）：点导出按钮 → 菜单弹出且**不发消息**；
+// 点每一项 → 发出的 exportGraph 消息里 format 正确，且 md-tree / md-table / json **不带 data**
+// （正文必须由宿主生成 —— 带上 data 就等于前端也实现了一份，两处会分叉）。
+{
+  const exportButton = byId.get('btn-export');
+  const exportMenu = byId.get('export-menu');
+  assert(exportButton !== undefined, '找不到工具栏按钮 btn-export');
+  assert(exportMenu !== undefined, '桩里没有 #export-menu（模板里有、桩里没有会让这段断言失去意义）');
+  exportMenu.hidden = true;
+  const relevant = (message) => message.type !== 'reportWidths';
+
+  const beforeOpen = posted.length;
+  exportButton.dispatch('click', {});
+  assert(
+    posted.slice(beforeOpen).filter(relevant).length === 0,
+    '点导出按钮只应弹出菜单，不应直接发消息'
+  );
+  assert(exportMenu.hidden === false, '点导出按钮后菜单应当显示（hidden=false）');
+  assert(
+    typeof exportMenu.style.left === 'string' && exportMenu.style.left.endsWith('px'),
+    `菜单应当贴着按钮定位（left 应当是像素值），实际 ${JSON.stringify(exportMenu.style.left)}`
+  );
+
+  const items = exportMenu.children.filter((child) =>
+    child.getAttribute?.('data-format')
+  );
+  assert(
+    items.length === EXPORT_FORMATS.length,
+    `桩里的导出菜单应当有 ${EXPORT_FORMATS.length} 项，实际 ${items.length} 项`
+  );
+
+  // 点菜单项：直接取菜单上注册的 click 处理函数并调用。
+  // 与方框菜单那一段同一口径：桩的 dispatch 不做事件冒泡，这样测的是「处理逻辑」本身，
+  // 不受桩与浏览器的冒泡差异影响。
+  const menuHandlers = exportMenu.listeners.get('click') ?? [];
+  assert(menuHandlers.length >= 1, '导出菜单上没有注册 click 处理函数');
+
+  // 「真画布上的 <title>」：PNG 路径要剔除克隆体里的标题，但**绝不能动真画布**。
+  const liveTitles = () => svg.flatten().filter((element) => element.tagName === 'title');
+  const titlesBefore = liveTitles().length;
+  assert(
+    titlesBefore > 0,
+    '导出用例需要画布上至少有一个 <title>（否则「剔除只作用于克隆体」这条测不到）'
+  );
+
+  /** 按**旧口径**（凡计算值非空都写）应当写多少条内联属性。 */
+  const oldInlineWrites = () => {
+    let total = 0;
+    for (const element of svg.flatten()) {
+      for (const property of EXPORT_STYLE_PROPERTY_NAMES) {
+        if (stubComputedValue(element, property)) {
+          total += 1;
+        }
+      }
+    }
+    return total;
+  };
+  /** 其中「取值等于 SVG 初始值」的有多少条 —— 新口径应当把它们全部跳过。 */
+  const initialValueWrites = () => {
+    let total = 0;
+    for (const element of svg.flatten()) {
+      for (const property of EXPORT_STYLE_PROPERTY_NAMES) {
+        if (property === 'font-family' || property === 'font-size') {
+          continue;
+        }
+        const value = stubComputedValue(element, property);
+        if (value && value === STUB_SVG_INITIAL_VALUES[property]) {
+          total += 1;
+        }
+      }
+    }
+    return total;
+  };
+  let pngSerializedBytes;
+  let svgSerializedData;
+
+  for (const item of items) {
+    const format = item.getAttribute('data-format');
+    const before = posted.length;
+    for (const handler of menuHandlers) {
+      handler({ type: 'click', target: item, preventDefault() {}, stopPropagation() {} });
+    }
+    const fresh = posted.slice(before).filter(relevant);
+    if (format === 'png') {
+      // PNG：桩里没有真实 canvas / Image 实现，栅格化必然失败 —— 此时**必须出声**，绝不允许静默。
+      // （真机上成功的栅格化属于未验证：它要真实浏览器内核，不写成已完成。）
+      const exported = fresh.find(
+        (message) =>
+          message.type === 'exportGraph' &&
+          message.format === 'png' &&
+          typeof message.data === 'string'
+      );
+      const failure = fresh.find((message) => message.type === 'error');
+      assert(
+        exported !== undefined || failure !== undefined,
+        `PNG 导出在桩环境里必须要么给出 exportGraph、要么给出 error，实际 ${
+          fresh.map((message) => message.type).join(',') || '（无）'
+        }`
+      );
+      if (failure !== undefined) {
+        assert(
+          String(failure.message).includes('导出 png 失败'),
+          `PNG 失败的 error 消息应当说明是「导出 png 失败」，实际「${failure.message}」`
+        );
+        // 报错文案必须带序列化字节数：下次再出问题，可立即判断是「图本来就大」还是其它原因。
+        const byteMatch = /序列化 (\d+) 字节/.exec(String(failure.message));
+        assert(
+          byteMatch !== null,
+          `PNG 失败文案必须带上序列化字节数（例如「序列化 2154007 字节」），实际「${failure.message}」`
+        );
+        pngSerializedBytes = Number(byteMatch[1]);
+        assert(
+          pngSerializedBytes > 0,
+          `序列化字节数应当是正数，实际 ${pngSerializedBytes}`
+        );
+      }
+      // 剔除 <title> 只作用于克隆体：真画布上的标题数一点都不能少。
+      assert(
+        liveTitles().length === titlesBefore,
+        `PNG 导出剔除 <title> 只应作用于克隆体，真画布上的标题数不该变（${titlesBefore} → ${liveTitles().length}）`
+      );
+      assert(exportMenu.hidden === true, '点完「png」菜单应当收起');
+      continue;
+    }
+    const sent = fresh.filter((message) => message.type === 'exportGraph');
+    assert(
+      sent.length === 1,
+      `点「${format}」应当恰好发出 1 条 exportGraph，实际 ${fresh
+        .map((message) => message.type)
+        .join(',') || '（无）'}`
+    );
+    assert(sent[0].format === format, `消息里的 format 应当是 ${format}，实际 ${sent[0].format}`);
+    assert(
+      typeof sent[0].sessionId === 'string' && sent[0].sessionId.length > 0,
+      '导出消息必须带当前活动标签的 sessionId'
+    );
+    if (format === 'md-tree' || format === 'md-table' || format === 'json') {
+      assert(
+        sent[0].data === undefined,
+        `${format} 的正文必须由宿主生成，不该带 data（实际带了 ${typeof sent[0].data}）`
+      );
+    } else if (format === 'svg') {
+      assert(
+        typeof sent[0].data === 'string' && sent[0].data.includes('<svg'),
+        `svg 导出应当把序列化后的 SVG 放进 data，实际 ${String(sent[0].data).slice(0, 60)}`
+      );
+      assert(
+        sent[0].data.includes('viewBox'),
+        'svg 导出应当把内容包围盒写成 viewBox（否则导出图会被裁掉）'
+      );
+      assert(
+        sent[0].data.includes('xmlns'),
+        'svg 导出必须带 xmlns，否则单独打开这个文件浏览器不认（显示为空白）'
+      );
+      assert(
+        sent[0].data.includes('<?xml'),
+        'svg 导出应当带 XML 声明（单独保存成文件后可直接被解析）'
+      );
+      svgSerializedData = sent[0].data;
+      // ---- SVG 文件路径必须**保留** `<title>` ----
+      assert(
+        /<title/.test(sent[0].data),
+        'SVG 文件导出必须保留 <title>（人要在编辑器里看到悬停提示），实际序列化结果里没有 title'
+      );
+      // ---- 内联计算样式：等于初始值的不写、不等于的写（桩的 getComputedStyle 给取值）----
+      const data = sent[0].data;
+      assert(
+        data.includes('fill="rgb(30, 30, 30)"') && data.includes('stroke="rgb(60, 60, 60)"'),
+        '非初始值的计算样式必须内联（否则导出的图丢掉方框配色）：期望 box 的 fill/stroke 被写进去'
+      );
+      assert(
+        data.includes(`font-family="${stubFontFamily}"`),
+        'font-family 必须一律内联（UA 默认值不稳定，跳过会让导出文件换一套字体度量）'
+      );
+      for (const [property, value] of [
+        ['stroke-width', '1px'],
+        ['stroke-dasharray', 'none'],
+        ['fill-opacity', '1'],
+        ['opacity', '1'],
+        ['font-weight', '400'],
+        ['font-style', 'normal'],
+        ['text-anchor', 'start'],
+        ['dominant-baseline', 'auto'],
+      ]) {
+        assert(
+          !data.includes(` ${property}="${value}"`),
+          `取值等于 SVG 初始值的 ${property}（${value}）不该写进导出文件（白涨体积）`
+        );
+      }
+      // 逐元素、逐属性核对「写没写」：
+      //   写了 ⇔ 原节点本来就有这个属性（克隆原样带过来），或
+      //          （桩算出的取值非空 且 该取值不等于 SVG 初始值，且该属性不在「一律内联」名单外的跳过范围）
+      // 序列化文本里的标签顺序与 `svg.flatten()` 一致（两者都是按 children 递归、文档序），
+      // 所以可以按下标一一对应。
+      const elements = svg.flatten();
+      const openTags = [...data.matchAll(/<([a-zA-Z][\w:-]*)((?:\s[^>]*?)?)>/g)].map(
+        (match) => match[2]
+      );
+      assert(
+        openTags.length === elements.length,
+        `序列化出来的标签数（${openTags.length}）应当与原画布元素数（${elements.length}）一致`
+      );
+      let writtenByRule = 0;
+      let presentInClone = 0;
+      let mismatches = [];
+      for (let index = 0; index < elements.length; index += 1) {
+        const element = elements[index];
+        for (const property of EXPORT_STYLE_PROPERTY_NAMES) {
+          const present = openTags[index].includes(` ${property}="`);
+          if (present) {
+            presentInClone += 1;
+          }
+          const fromSource = element.getAttribute?.(property) !== null;
+          const value = stubComputedValue(element, property);
+          const alwaysInline =
+            property === 'font-family' || property === 'font-size';
+          const inlineRule =
+            Boolean(value) &&
+            (alwaysInline || value !== STUB_SVG_INITIAL_VALUES[property]);
+          if (inlineRule) {
+            writtenByRule += 1;
+          }
+          if (present !== (fromSource || inlineRule)) {
+            mismatches.push(
+              `${element.tagName}.${element.getAttribute?.('class') ?? ''}#${index} 的 ${property}` +
+                `（原属性=${fromSource}、计算值=${JSON.stringify(value)}、序列化里写了=${present}）`
+            );
+          }
+        }
+      }
+      assert(
+        mismatches.length === 0,
+        `内联规则与序列化结果对不上（${mismatches.length} 处）：${mismatches.slice(0, 5).join('；')}`
+      );
+      // 夹具必须真的**有**可跳过的东西，否则这条断言什么都证明不了。
+      assert(
+        initialValueWrites() > 0,
+        '这个夹具里没有任何「取值等于初始值」的属性，跳过规则等于没被测到'
+      );
+      console.log(
+        `诊断: 内联样式 —— 旧口径会写 ${oldInlineWrites()} 条；新口径规则应写 ${writtenByRule} 条，` +
+          `实际序列化里带这些属性的共 ${presentInClone} 条（含原节点自带的），` +
+          `跳过等于初始值的 ${initialValueWrites()} 条`
+      );
+    }
+    assert(exportMenu.hidden === true, `点完「${format}」菜单应当收起`);
+  }
+
+  // ---- 剔除 `<title>` 真的减小了 PNG 那一份的体积 ----
+  //
+  // 桩里两条路径都会序列化（PNG 是在栅格化之前失败的），所以可以直接比字节数：
+  // PNG 那一份少了全部 `<title>`，必须严格小于 SVG 那一份。
+  assert(
+    typeof pngSerializedBytes === 'number' && typeof svgSerializedData === 'string',
+    '体积对比需要 PNG 失败文案里的字节数与 SVG 的序列化文本（桩环境应当两条都能拿到）'
+  );
+  {
+    const svgBytes = Buffer.byteLength(svgSerializedData, 'utf8');
+    assert(
+      pngSerializedBytes < svgBytes,
+      `剔除 <title> 后 PNG 那一份的序列化体积应当更小：PNG ${pngSerializedBytes} 字节、` +
+        `SVG ${svgBytes} 字节（若相等说明 PNG 路径根本没剔除 title）`
+    );
+    // 旧口径（凡非空取值都写、title 也不剔）的体积：序列化文本 + 被跳过属性的 ` prop="value"` 字符数。
+    // 这些取值都是 ASCII（颜色 / px / none / start），所以字符数即字节数。
+    let skippedChars = 0;
+    for (const element of svg.flatten()) {
+      for (const property of EXPORT_STYLE_PROPERTY_NAMES) {
+        const value = stubComputedValue(element, property);
+        const alwaysInline = property === 'font-family' || property === 'font-size';
+        if (value && !alwaysInline && value === STUB_SVG_INITIAL_VALUES[property]) {
+          skippedChars += 4 + property.length + value.length;
+        }
+      }
+    }
+    console.log(
+      `诊断: 导出体积 —— 同一张画布 SVG（保留 title）${svgBytes} 字节 / PNG 克隆（剔除 title）` +
+        `${pngSerializedBytes} 字节，剔除省下 ${svgBytes - pngSerializedBytes} 字节、` +
+        `画布上 ${titlesBefore} 个 <title>；` +
+        `另按旧口径（不跳过初始值）复算，PNG 那一份会是约 ${pngSerializedBytes + skippedChars} 字节，` +
+        `即跳过初始值再省约 ${skippedChars} 字节`
+    );
+  }
+  log(
+    `诊断: 导出菜单 ${items.length} 项 —— md-tree/md-table/json 不带 data（正文由宿主生成），` +
+      'svg 交给宿主序列化文本且保留 <title>，png 剔除 <title>、跳过等于初始值的内联属性，' +
+      '在桩里无法栅格化时如实报错（带序列化字节数）'
+  );
+}
+
+// ------------------------------------------------ 导出前的 XML 自检（行为级）
+//
+// 真机现象：展开到第二级后「导出图片（PNG，2×）」失败，同时导出的 .svg 打开报错。
+// 栅格化失败与「文件打开报错」都只是症状，所以本轮把「序列化结果本身是否合法 XML」
+// 变成可证的事实：预检不通过就拒绝写文件、拒绝栅格化，并把诊断一次说清。
+//
+// 桩的能力边界：真实内核何时在解析结果里插入 parsererror 无法在 Node 里复现，
+// 因此由 DOMParser 桩直接给出「有 / 没有 parsererror」两种情形，断言生产代码的**反应**；
+// 「真实内核会对哪类图给出 parsererror」仍属未验证（要真机确认）。
+{
+  const exportMenu = byId.get('export-menu');
+  const menuHandlers = exportMenu.listeners.get('click') ?? [];
+  assert(menuHandlers.length >= 1, '导出菜单上没有注册 click 处理函数');
+  const items = exportMenu.children.filter((child) => child.getAttribute?.('data-format'));
+  const itemOf = (format) => items.find((child) => child.getAttribute('data-format') === format);
+  const relevant = (message) => message.type !== 'reportWidths';
+  /** 点某个导出菜单项，返回它发出的（与导出有关的）消息。 */
+  const clickExport = (format) => {
+    const before = posted.length;
+    for (const handler of menuHandlers) {
+      handler({ type: 'click', target: itemOf(format), preventDefault() {}, stopPropagation() {} });
+    }
+    return posted.slice(before).filter(relevant);
+  };
+  const failureOf = (messages) => messages.find((message) => message.type === 'error');
+  const exportOf = (messages) => messages.find((message) => message.type === 'exportGraph');
+
+  assert(
+    typeof stubParserErrorText === 'undefined',
+    '进入这段断言前桩必须处于「解析通过」状态（否则下面「走原路径」的用例无从判断）'
+  );
+
+  // ---- ① 解析器给出 parsererror：两条导出路径都必须失败，文案里带解析器原文 ----
+  const parserErrorText = 'error on line 7 at column 3: 桩给出的解析器报错\n第二行应当被压掉';
+  stubParserErrorText = parserErrorText;
+  try {
+    let sample = '';
+    for (const format of ['svg', 'png']) {
+      const messages = clickExport(format);
+      const failure = failureOf(messages);
+      assert(
+        failure !== undefined,
+        `${format} 导出在解析器报错时必须失败（不许静默当作成功），实际消息 ${
+          messages.map((message) => message.type).join(',') || '（无）'
+        }`
+      );
+      const text = String(failure.message);
+      sample = sample || text;
+      assert(
+        text.includes('XML 解析器报错'),
+        `${format} 失败文案应当写明是解析器报错，实际「${text}」`
+      );
+      assert(
+        text.includes('桩给出的解析器报错'),
+        `${format} 失败文案必须含解析器给出的原文，实际「${text}」`
+      );
+      assert(
+        !text.includes('\n'),
+        `${format} 失败文案必须压成单行（解析器原文里的换行要压掉），实际「${text}」`
+      );
+      assert(
+        /序列化 \d+ 字节/.test(text),
+        `${format} 失败文案必须带序列化字节数，实际「${text}」`
+      );
+      if (format === 'svg') {
+        // 「拒绝写文件」的可证形式：宿主根本没有收到 exportGraph。
+        assert(
+          exportOf(messages) === undefined,
+          `SVG 预检不通过时必须拒绝写文件（不得发出 exportGraph），实际发出 ${
+            messages.map((message) => message.type).join(',') || '（无）'
+          }`
+        );
+      } else {
+        // PNG 必须在**加载图像之前**就停下：文案里不该出现「加载失败」那套。
+        assert(
+          text.includes('栅格化未开始'),
+          `PNG 预检不通过时应当在加载图像之前终止，实际「${text}」`
+        );
+      }
+    }
+    console.log(`诊断: 解析器报错预检 —— svg 与 png 都失败且拒绝写盘，文案例：「${sample}」`);
+  } finally {
+    stubParserErrorText = undefined;
+  }
+
+  // ---- ② parsererror 只在命名空间元素里（按标签名取不到）时，第二条判据仍要生效 ----
+  stubParserErrorText = '仅由 querySelector 取到的 parsererror';
+  stubParserErrorOnlyBySelector = true;
+  try {
+    const failure = failureOf(clickExport('svg'));
+    assert(
+      failure !== undefined && String(failure.message).includes('仅由 querySelector 取到的 parsererror'),
+      'parsererror 只出现在命名空间元素里（按标签名取不到）时也必须判出来' +
+        `（getElementsByTagName ?? querySelector），实际「${
+          failure === undefined ? '（没有失败消息）' : failure.message
+        }」`
+    );
+  } finally {
+    stubParserErrorOnlyBySelector = false;
+    stubParserErrorText = undefined;
+  }
+
+  // ---- ③ 解析通过：必须继续走原路径（SVG 交给宿主；PNG 照旧尝试栅格化） ----
+  {
+    const svgMessages = clickExport('svg');
+    const sent = exportOf(svgMessages);
+    assert(
+      sent !== undefined && typeof sent.data === 'string' && sent.data.includes('<svg'),
+      '解析器说没问题时，SVG 导出必须照原样把序列化文本交给宿主' +
+        `（实际 ${svgMessages.map((message) => message.type).join(',') || '（无）'}）`
+    );
+    const pngFailure = failureOf(clickExport('png'));
+    assert(
+      pngFailure !== undefined,
+      '桩里没有真实 canvas / Image，PNG 仍应如实报错（不许静默）'
+    );
+    assert(
+      !String(pngFailure.message).includes('合法的 XML'),
+      `解析通过时 PNG 不得报「序列化结果不合法」，实际「${pngFailure.message}」`
+    );
+    assert(
+      /序列化 \d+ 字节/.test(String(pngFailure.message)),
+      `PNG 失败文案仍必须带序列化字节数，实际「${pngFailure.message}」`
+    );
+    console.log(
+      `诊断: 解析通过时走原路径 —— svg 发出 exportGraph，png 照旧尝试栅格化并如实报错：「${pngFailure.message}」`
+    );
+  }
+
+  // ---- ④ 序列化文本里的控制字符：文案含 U+XXXX 与位置、片段，且 svg 不写文件 ----
+  //
+  // ⚠️ 注入方式在 8.8 改过：过去是给**真画布根元素**加一个取值为 `\u0000` 的属性。现在
+  // 生产代码会在序列化之前把克隆体里的控制字符换掉，那条路已经造不出「非法文本」——
+  // 这恰好说明修法生效（含 NUL 的导出改由下面单独的用例做端到端断言）。因此这里改由
+  // **桩开关**模拟「净化没有生效」（等价于去掉 `sanitizeExportXmlChars(clone)`）：
+  // 序列化该属性时写出未净化的原始取值，序列化文本里于是重新出现裸控制字符。
+  //
+  // 报出的下标仍要**独立核对**：先以探针属性取值 'X' 导出一次（开关关闭），从拿到的
+  // 序列化文本里量出该属性取值的位置；再让开关在该属性处写出 `\u0000`（长度相同，
+  // 文本其余部分逐字不变），于是可以要求失败文案报出的下标与它**逐位相等** ——
+  // 而不是「看着像个数字」就算过。
+  svg.setAttribute('data-xml-probe', 'X');
+  try {
+    const baseline = exportOf(clickExport('svg'));
+    assert(
+      baseline !== undefined && typeof baseline.data === 'string',
+      '核对控制字符下标需要一份「探针取值正常」时的序列化文本（这一份应当导出成功）'
+    );
+    const probeAt = baseline.data.indexOf('data-xml-probe="X"');
+    assert(probeAt >= 0, '序列化文本里应当能定位到探针属性（否则下标核对无从谈起）');
+    const expectedIndex = probeAt + 'data-xml-probe="'.length;
+
+    stubSerializerRawAttributeValues = { 'data-xml-probe': '\u0000' };
+    let sample = '';
+    for (const format of ['svg', 'png']) {
+      const messages = clickExport(format);
+      const failure = failureOf(messages);
+      assert(
+        failure !== undefined,
+        `${format} 导出在序列化文本含 U+0000 时必须失败（净化未生效的对照组）`
+      );
+      const text = String(failure.message);
+      sample = sample || text;
+      assert(text.includes('U+0000'), `失败文案必须含 U+0000，实际「${text}」`);
+      assert(
+        text.includes('控制字符 1 处'),
+        `这次夹具里恰好一处控制字符，文案应当如实报 1 处，实际「${text}」`
+      );
+      const position = /U\+0000（位置 (\d+)/.exec(text);
+      assert(
+        position !== null,
+        `失败文案必须给出控制字符的出现位置（下标），实际「${text}」`
+      );
+      assert(
+        Number(position[1]) === expectedIndex,
+        `控制字符的下标必须等于独立核对出的 ${expectedIndex}，实际 ${position[1]}`
+      );
+      assert(
+        text.includes('data-xml-probe="·"'),
+        `片段应当带上命中处前后的上下文、且控制字符替换成可见替身 ·，实际「${text}」`
+      );
+      assert(
+        /序列化 \d+ 字节/.test(text),
+        `失败文案必须带序列化字节数，实际「${text}」`
+      );
+      if (format === 'svg') {
+        assert(
+          exportOf(messages) === undefined,
+          'SVG 预检不通过时不得写出文件（不得发出 exportGraph）'
+        );
+      }
+    }
+    console.log(
+      `诊断: 控制字符预检 —— 报出的下标与独立核对的 ${expectedIndex} 逐位一致；文案例：「${sample}」`
+    );
+  } finally {
+    stubSerializerRawAttributeValues = undefined;
+    svg.removeAttribute('data-xml-probe');
+  }
+
+  // ---- ⑤ DOMParser 不存在（测试桩 / 极简环境）：不得阻断，仍按原逻辑导出 ----
+  const savedDOMParser = global.DOMParser;
+  delete global.DOMParser;
+  try {
+    const svgMessages = clickExport('svg');
+    const sent = exportOf(svgMessages);
+    assert(
+      sent !== undefined && typeof sent.data === 'string' && sent.data.includes('<svg'),
+      'DOMParser 不存在时 SVG 导出必须照原样进行（不得因缺少解析器而阻断），' +
+        `实际 ${svgMessages.map((message) => message.type).join(',') || '（无）'}`
+    );
+    const pngFailure = failureOf(clickExport('png'));
+    assert(
+      pngFailure !== undefined && !String(pngFailure.message).includes('合法的 XML'),
+      'DOMParser 不存在时 PNG 不得报「序列化结果不合法」，仍应按原逻辑走到栅格化那一步，' +
+        `实际「${pngFailure === undefined ? '（没有失败消息）' : pngFailure.message}」`
+    );
+    console.log('诊断: DOMParser 不存在时不阻断 —— svg 照旧交给宿主、png 照旧走栅格化');
+  } finally {
+    global.DOMParser = savedDOMParser;
+  }
+  assert(
+    typeof global.DOMParser === 'function' &&
+      typeof stubParserErrorText === 'undefined' &&
+      stubParserRejectInvalidXmlChars === false &&
+      stubSerializerRawAttributeValues === undefined,
+    '这段断言结束时必须把桩恢复原状（DOMParser 复位、解析结果与两个开关复位）'
+  );
+  log(
+    'OK: 导出前 XML 自检 —— 解析器报错与 U+0000 控制字符都会让 svg / png 拒绝导出' +
+      '（文案带诊断与「序列化 N 字节」，svg 不写文件），解析通过时照旧走原路径，' +
+      'DOMParser 不存在时不阻断'
+  );
+}
+
+// ------------------------------------------------ 导出前的字符净化（行为级，8.8）
+//
+// 真机根因（证据见开发记录 8.8.1）：节点 id 以 NUL 作分隔符（宿主 `session.ts` 的
+// `ID_SEPARATOR`），而 id 会随属性值进入画布，于是序列化结果里是**裸 U+0000**；内核的
+// XML 解析器报 `invalid character in attribute value` —— PNG 走 `<img>` 加载同一份文本，
+// 因此必然 `onerror`。修法是在序列化之前把**克隆体**里 XML 1.0 不允许的控制字符换成可见
+// 替身 `␀`（U+2400），真画布一个字符不动。
+//
+// 本节断言三件事：
+//   ① 导出文本里不再有裸 U+0000，且出现替身 —— 用的是真机命中的属性值形态；
+//   ② 真画布上那个属性仍是原始值（证明净化只动了克隆体）；
+//   ③ 端到端闭环：预检桩按 XML 1.0 规则判定（文本含非法控制字符即报 parsererror）时，
+//      含 NUL 的导出**成功**；把净化关掉（桩开关模拟）后同一个输入**仍然失败**，
+//      证明 8.7 的预检没有被架空。
+{
+  const exportMenu = byId.get('export-menu');
+  const menuHandlers = exportMenu.listeners.get('click') ?? [];
+  const items = exportMenu.children.filter((child) => child.getAttribute?.('data-format'));
+  const itemOf = (format) => items.find((child) => child.getAttribute('data-format') === format);
+  const relevant = (message) => message.type !== 'reportWidths';
+  /** 点某个导出菜单项，返回它发出的（与导出有关的）消息。 */
+  const clickExport = (format) => {
+    const before = posted.length;
+    for (const handler of menuHandlers) {
+      handler({ type: 'click', target: itemOf(format), preventDefault() {}, stopPropagation() {} });
+    }
+    return posted.slice(before).filter(relevant);
+  };
+  const failureOf = (messages) => messages.find((message) => message.type === 'error');
+  const exportOf = (messages) => messages.find((message) => message.type === 'exportGraph');
+
+  assert(
+    typeof stubSerializerRawAttributeValues === 'undefined' && !stubParserRejectInvalidXmlChars,
+    '进入这段断言前两个桩开关都必须处于关闭状态（否则测的就不是净化本身）'
+  );
+
+  /** 真画布上「属性取值含 NUL」的属性条数：用来证明净化只动了克隆体。 */
+  const canvasNulAttributes = () =>
+    svg
+      .flatten()
+      .reduce(
+        (total, element) =>
+          total +
+          [...element.attributes].filter((attribute) => String(attribute.value).includes('\u0000'))
+            .length,
+        0
+      );
+
+  // 真机命中的形态：属性值是「符号名 + NUL + file URI」（节点 id 以 NUL 拼成）。
+  const nulNodeId = 'lib_core_dev_read_byte\u0000file:///c%3A/work/fixture/lib_core_dev.c';
+  const sanitizedNodeId = 'lib_core_dev_read_byte\u2400file:///c%3A/work/fixture/lib_core_dev.c';
+  const box = nodesGroup.children[0];
+  const originalNodeId = box.getAttribute('data-node');
+  assert(
+    typeof originalNodeId === 'string' && originalNodeId.length > 0,
+    '真画布上第一个方框应当带 data-node（那是节点 id 落到 DOM 上的地方）'
+  );
+  assert(canvasNulAttributes() === 0, '进入用例前真画布上不该有含 NUL 的属性');
+
+  // 预检桩改成**按 XML 1.0 规则判定**：序列化文本里出现非法控制字符就报 parsererror。
+  // 这一步是闭环的关键：桩若照旧一律「解析通过」，含 NUL 的导出无论如何都会「成功」，
+  // 那就证明不了修法真的消掉了非法字符。
+  stubParserRejectInvalidXmlChars = true;
+  try {
+    box.setAttribute('data-node', nulNodeId);
+    assert(canvasNulAttributes() === 1, '探针属性应当让真画布上恰好出现 1 个含 NUL 的属性');
+
+    // ---- ① + ② 净化生效，且只作用于克隆体 ----
+    const svgMessages = clickExport('svg');
+    const failure = failureOf(svgMessages);
+    assert(
+      failure === undefined,
+      '含 NUL 的导出在净化生效后必须成功（预检桩已按 XML 1.0 判定，失败即说明净化没生效）' +
+        `，实际「${failure === undefined ? '' : failure.message}」`
+    );
+    const sent = exportOf(svgMessages);
+    assert(
+      sent !== undefined && typeof sent.data === 'string' && sent.data.includes('<svg'),
+      '含 NUL 的 SVG 导出必须发出 exportGraph（宿主据此写文件），实际发出 ' +
+        `${svgMessages.map((message) => message.type).join(',') || '（无）'}`
+    );
+    assert(
+      !sent.data.includes('\u0000'),
+      '导出文本里不得再有裸 U+0000（内核的 XML 解析器正是因为它才报 invalid character）'
+    );
+    assert(
+      sent.data.includes(sanitizedNodeId),
+      '导出文本里必须出现净化后的属性取值（NUL 换成 ␀），实际片段：' +
+        `${sent.data.slice(Math.max(0, sent.data.indexOf('data-node=')), sent.data.indexOf('data-node=') + 120)}`
+    );
+    assert(
+      sent.data.includes('\u2400'),
+      '导出文本里必须出现替身 ␀（U+2400），否则「原本有个 NUL」这件事在文件里看不出来'
+    );
+    assert(
+      box.getAttribute('data-node') === nulNodeId,
+      '真画布上那个属性必须仍是原始值（含 NUL）—— 净化只许动克隆体，' +
+        `实际「${String(box.getAttribute('data-node')).replace(/\u0000/g, '\\u0000')}」`
+    );
+    assert(
+      canvasNulAttributes() === 1,
+      `净化之后真画布上仍应恰好有 1 个含 NUL 的属性，实际 ${canvasNulAttributes()}（只动了克隆体才对）`
+    );
+    // PNG 与 SVG 共用 buildExportSvg，因此这里只断言「不再因 XML 不合法被拦下」。
+    // 桩里没有真实 canvas / Image，栅格化**必然**失败，所以 PNG 无法在桩里端到端成功
+    // （这是未验证项，见开发记录 8.8.3）。
+    const pngMessages = clickExport('png');
+    const pngFailure = failureOf(pngMessages);
+    assert(
+      pngFailure !== undefined,
+      '桩里没有真实 canvas / Image，PNG 仍应如实报错（不许静默）'
+    );
+    const pngText = String(pngFailure.message);
+    assert(
+      !pngText.includes('合法的 XML') && !pngText.includes('控制字符') && !pngText.includes('U+0000'),
+      '含 NUL 的 PNG 导出不得再因「序列化结果含非法字符」被拦下（真机症状正是 PNG 必然失败），' +
+        `实际「${pngText}」`
+    );
+    assert(
+      /序列化 \d+ 字节/.test(pngText),
+      `PNG 失败文案仍必须带序列化字节数，实际「${pngText}」`
+    );
+    console.log(
+      `诊断: 导出字符净化 —— 含 NUL 的属性值（${nulNodeId.replace(/\u0000/g, '\\u0000')}）` +
+        '导出成功、文本里换成 ␀，真画布上的取值一个字符没动；' +
+        `导出文本里该属性为 data-node="${sanitizedNodeId}"，` +
+        '全文不含裸 U+0000；' +
+        `PNG 不再是 XML 预检失败（实际失败于栅格化：「${pngText}」）`
+    );
+
+    // ---- ③ 对照：把净化关掉（桩开关模拟），真正非法的输入必须仍然失败 ----
+    // 这条是「预检没被架空」的证据：净化生效时它放行，净化失效时它必须拦下并给出诊断。
+    //
+    // 探针属性名是**只此一处**的：桩开关按属性名替换序列化取值，若借用 `data-node`
+    // （画布上每个方框都有），命中处数就不是 1，「控制字符 1 处」这条断言会失去意义。
+    // 取值用 `\u0001` 而不是 NUL：换个字符类成员，顺带证明净化与预检覆盖的不只是 NUL。
+    const rawProbeAttribute = 'data-export-raw-probe';
+    const rawProbeValue = '\u0001';
+    box.setAttribute(rawProbeAttribute, rawProbeValue);
+    stubSerializerRawAttributeValues = { [rawProbeAttribute]: rawProbeValue };
+    try {
+      let sample = '';
+      for (const format of ['svg', 'png']) {
+        const messages = clickExport(format);
+        const blocked = failureOf(messages);
+        assert(
+          blocked !== undefined,
+          `净化未生效时，含 U+0001 的序列化结果必须被预检拦下（${format} 路径）`
+        );
+        const text = String(blocked.message);
+        sample = sample || text;
+        assert(
+          text.includes('XML 解析器报错') && text.includes('invalid character in attribute value'),
+          `${format} 失败文案应当带上预检桩给出的解析器报错原文（真机日志同为这句），` +
+            `实际「${text}」`
+        );
+        assert(
+          text.includes('U+0001') && text.includes('控制字符 1 处'),
+          `${format} 失败文案应当同时给出控制字符诊断（U+0001 与命中处数），实际「${text}」`
+        );
+        assert(
+          /序列化 \d+ 字节/.test(text),
+          `${format} 失败文案必须带序列化字节数，实际「${text}」`
+        );
+        if (format === 'svg') {
+          assert(
+            exportOf(messages) === undefined,
+            '净化未生效时 SVG 不得写出文件（不得发出 exportGraph）'
+          );
+        } else {
+          assert(
+            text.includes('栅格化未开始'),
+            `净化未生效时 PNG 必须在加载图像之前终止，实际「${text}」`
+          );
+        }
+      }
+      console.log(`诊断: 净化未生效的对照组 —— 同一个方框仍被拦下，文案例：「${sample}」`);
+    } finally {
+      stubSerializerRawAttributeValues = undefined;
+      box.removeAttribute(rawProbeAttribute);
+    }
+  } finally {
+    stubParserRejectInvalidXmlChars = false;
+    if (originalNodeId === null) {
+      box.removeAttribute('data-node');
+    } else {
+      box.setAttribute('data-node', originalNodeId);
+    }
+  }
+
+  assert(
+    !stubParserRejectInvalidXmlChars &&
+      typeof stubSerializerRawAttributeValues === 'undefined' &&
+      box.getAttribute('data-node') === originalNodeId &&
+      canvasNulAttributes() === 0,
+    '这段断言结束时必须把桩与真画布都恢复原状（两个开关关闭、data-node 复原、真画布无 NUL）'
+  );
+  log(
+    'OK: 导出字符净化 —— 含 NUL 的属性值经净化后导出成功（文本里是 ␀、真画布原样），' +
+      '净化关掉时同一个输入仍被预检拦下'
+  );
+}
 
 // ------------------------------------------------ 单击高亮 + 方框右键菜单
 
@@ -2736,7 +4415,7 @@ setTimeout(() => {
     assert(
       perFrame < 4,
       `一帧重画应当 < 4ms（实测 ${perFrame.toFixed(1)}ms，${visibleCount} 个可见方框）——` +
-        `若超了就要下调 ANIM_GATE_NODES，别让大图掉帧`
+        `若超出则需下调 ANIM_GATE_NODES，避免大图掉帧`
     );
   }
 
@@ -2940,7 +4619,7 @@ setTimeout(() => {
   );
 
   // 收尾：把 DOM 还原成「多节点可见」的形态，并关掉设置、还原视口尺寸。
-  // 两个坑：① 后面延后执行的段落会在**当前 DOM** 上逐个方框数加减号（要求 ≥2 个），
+  // 两个易错点：① 后面延后执行的段落会在**当前 DOM** 上逐个方框数加减号（要求 ≥2 个），
   // 而这里最后一步是「收起全部」（只剩根可见）；② 收起标记是**按会话 id** 记的，
   // 所以必须换一个新会话 id 才会真的重新展开，光重发同一会话的负载没用。
   sendLevel(2, 'anchor-restore');
@@ -3115,7 +4794,7 @@ setTimeout(() => {
   );
   // 绝对锚点（由一次性探针实测，可手工复核）：视口 300、滚动 0、viewBox.y = −10
   //   a2 中心 = viewBox.y + 视口半高 = −10 + 150 = 140 → 顶边 = 140 − 21.5 = 118.5
-  // 写成字面量而不是「照实现的公式再算一遍」：规则若整体写错，公式会跟着一起错，只有写死才会红。
+  // 写成字面量而不是「照实现公式重算一次」：规则若整体写错，公式会跟着一起错，只有写死才会红。
   assert(topOf('a2') === 118.5, `① 居中时 a2 顶边应当钉在 118.5，实际 ${topOf('a2')}`);
   assertNoOverlap('空挡内居中时');
 
@@ -3938,7 +5617,7 @@ setTimeout(() => {
 //
 // 宏、结构体、变量这类符号要走引用查找（一串语言服务请求），明显比普通函数慢。
 // 解析较久时在画布正中显示遮罩：转圈 + 文案 + 取消，背景模糊；
-// 快查询不显示（延迟 240ms），否则会闪一下。
+// 快查询不显示（延迟 240ms），否则会出现瞬时闪烁。
 {
   const css = fs.readFileSync(path.join(ROOT, 'src', 'webview', 'graph.css'), 'utf8');
   assert(
@@ -3971,7 +5650,7 @@ setTimeout(() => {
   );
   assert(busyEl.hidden === true, '默认不应显示遮罩');
 
-  // 快查询：busy 立刻结束，延迟没到就不该显示（这是「不闪一下」的关键）
+  // 快查询：busy 立刻结束，延迟没到就不该显示（这是「不出现瞬时闪烁」的关键）
   sendToWebview({ type: 'busy', busy: true, label: '正在解析被调用关系图…' });
   sendToWebview({ type: 'busy', busy: false });
   setTimeout(() => {
@@ -4103,7 +5782,7 @@ setTimeout(() => {
     }
   } catch (error) {
     // ⚠️ 必须**判失败**，不能只打印：这一块本来就不做断言（只出数字），一旦它自己抛错，
-    // 表现是「压测数字凭空消失、退出码仍是 0」。本轮就踩过：生产代码新起的 logWarn 需要
+    // 表现是「压测数字凭空消失、退出码仍是 0」。本轮曾出现：生产代码新起的 logWarn 需要
     // 桩里没有的 createOutputChannel，异常被这里吞掉，整段压测静默停摆。
     console.error('渲染压测块出错（这是失败，不是跳过）：', error && error.stack);
     process.exit(1);
@@ -4276,8 +5955,8 @@ setTimeout(() => {
 
 // ------------------------------------------------ 路径显示方式（省略几层 / 完整 / 锚点）
 //
-// 需求来自真实场景：一个目录下并列很多 chip / board，每个 chip 下又有同名文件，
-// 只显示末尾几层无法区分是哪个 chip。这里把三种口径都钉住，并做**跨侧等值**检查 ——
+// 需求来自真实场景：一个目录下并列很多 mods / group，每个 mods 下又有同名文件，
+// 只显示末尾几层无法区分是哪个 mods。这里把三种口径都钉住，并做**跨侧等值**检查 ——
 // 宿主（估宽）与 webview（渲染）各有一份同样的逻辑，一旦漂移，列宽就会与文字对不上。
 {
   const layoutApi = extensionBundle.__layout;
@@ -4288,15 +5967,17 @@ setTimeout(() => {
 
   // ⚠️ 歧义只在「区分用的那一段落到了预算窗口之外」时才出现：短路径（33 字符）整体放得下、
   // 本来就能区分，所以这里**必须用足够深的路径**才能复现用户报的场景。
-  const BOARD_A = 'components/BSP/board_a/src/drivers/display/lcd/lcd_init.c';
-  const BOARD_B = 'components/BSP/board_b/src/drivers/display/lcd/lcd_init.c';
-  const BOARD_A_SHORT = 'components/BSP/board_a/src/main.c';
-  const BOARD_B_SHORT = 'components/BSP/board_b/src/main.c';
-  const DEEP = 'src/modules/display/driver/lcd/lcd_init.c';
+  const GROUP_A = 'components/LIB/group_a/src/modules/display/sub/sub_main.c';
+  const GROUP_B = 'components/LIB/group_b/src/modules/display/sub/sub_main.c';
+  const GROUP_A_SHORT = 'components/LIB/group_a/src/main.c';
+  const GROUP_B_SHORT = 'components/LIB/group_b/src/main.c';
+  const DEEP = 'src/modules/display/driver/sub/sub_main.c';
   const SHORT = 'main/main.c';
   // 目录名里带连字符：用来钉住「整串名字优先于偏移解析」这条规则
-  const HYPHEN = 'components/BSP/chip-01/main.c';
-  const paths = [BOARD_A, BOARD_B, DEEP, SHORT, BOARD_A_SHORT, BOARD_B_SHORT, HYPHEN];
+  const HYPHEN = 'components/LIB/lib-2/main.c';
+  // 同一个目录名出现两次、且**两次都不在末尾窗口里**：用来钉住后缀 `*`（全命中）这条规则
+  const REPEATED = 'x/se/mid/se/mid2/z.c';
+  const paths = [GROUP_A, GROUP_B, DEEP, SHORT, GROUP_A_SHORT, GROUP_B_SHORT, HYPHEN, REPEATED];
   const ids = [];
   const nodes = {};
   for (const [index, file] of paths.entries()) {
@@ -4329,9 +6010,19 @@ setTimeout(() => {
     kind: 'function',
   };
 
-  /** 把当前设置下的图发下去，并取回每个节点方框里那行「路径:行号」。 */
+  /**
+   * 把当前设置下的图发下去，并取回每个节点方框里那行「路径:行号」。
+   *
+   * ⚠️ 锚点条目必须**照着宿主真实下发的形态**喂给面板：`settingsPayload()` 会先把
+   * 「方括号项去掉、圆括号剥壳」（见 `__layout.pathOnlyAnchorPatterns`）。测试里直接塞原文
+   * 就不是在测真实链路了 —— 而宿主那一侧的期望值仍然按**原文**算，两边必须一致。
+   */
   const renderWith = (settings) => {
-    sendToWebview({ type: 'settings', settings: { showLocation: true, ...settings } });
+    const payload = { ...settings };
+    if (Array.isArray(payload.pathAnchors)) {
+      payload.pathAnchors = layoutApi.pathOnlyAnchorPatterns(payload.pathAnchors);
+    }
+    sendToWebview({ type: 'settings', settings: { showLocation: true, ...payload } });
     const boxes = createLayout(nodes, 'pdroot').boxes;
     sendToWebview({
       type: 'sessionUpdate',
@@ -4356,7 +6047,7 @@ setTimeout(() => {
     return read;
   };
 
-  /** 同一份设置给宿主函数与 webview 各算一遍，逐条比对（跨侧漂移就会红）。 */
+  /** 同一份设置给宿主函数与 webview 各算一次，逐条比对（跨侧漂移就会红）。 */
   const assertCrossSide = (options, label) => {
     const read = renderWith({
       pathDisplay: options.mode,
@@ -4381,109 +6072,209 @@ setTimeout(() => {
   // 日志会显示成「五种模式一模一样」，看着像功能没生效。
   const sampleDefault = readDefault('pd0');
   assert(
-    readDefault('pd2') === `…/modules/display/driver/lcd/lcd_init.c:3`,
+    readDefault('pd2') === `…/modules/display/driver/sub/sub_main.c:3`,
     `默认口径应当与 0.20 一致（40 字符内尽量多留末尾段），实际「${readDefault('pd2')}」`
   );
   assert(readDefault('pd3') === 'main/main.c:4', `短路径应当原样显示，实际「${readDefault('pd3')}」`);
-  // 用户报的场景：深路径下两个 board 的同名文件**完全无法区分**（只差行号）
+  // 用户报的场景：深路径下两个 group 的同名文件**完全无法区分**（只差行号）
   const pathPart = (text) => text.replace(/:\d+$/, '');
   assert(
     pathPart(readDefault('pd0')) === pathPart(readDefault('pd1')),
-    `默认口径下两条 board 路径应当长得一样（这正是要解决的问题），实际「${readDefault('pd0')}」「${readDefault('pd1')}」`
+    `默认口径下两条 group 路径应当长得一样（这正是要解决的问题），实际「${readDefault('pd0')}」「${readDefault('pd1')}」`
   );
 
-  // ② 只在末尾留 2 层：仍是同名，形状变成 `…/lcd/lcd_init.c`
+  // ② 只在末尾留 2 层：仍是同名，形状变成 `…/sub/sub_main.c`
   const tailTwo = { ...defaultOptions, tailLevels: 2 };
   const readTail = assertCrossSide(tailTwo, '末尾 2 层');
   const sampleTail = readTail('pd0');
   assert(
-    readTail('pd0') === '…/lcd/lcd_init.c:1' && pathPart(readTail('pd0')) === pathPart(readTail('pd1')),
-    `末尾 2 层应当显示成「…/lcd/lcd_init.c:1」且两条仍相同，实际「${readTail('pd0')}」「${readTail('pd1')}」`
+    readTail('pd0') === '…/sub/sub_main.c:1' && pathPart(readTail('pd0')) === pathPart(readTail('pd1')),
+    `末尾 2 层应当显示成「…/sub/sub_main.c:1」且两条仍相同，实际「${readTail('pd0')}」「${readTail('pd1')}」`
   );
 
-  // ③ 纯偏移锚点：`+3` = 从根数第 3 段（board_a / board_b 就在第 3 段）→ 两条终于分得开
+  // ③ 纯偏移锚点：`+3` = 从根数第 3 段（group_a / group_b 就在第 3 段）→ 两条终于分得开
   const byLevel = { ...tailTwo, anchors: ['+3'] };
   const readLevel = assertCrossSide(byLevel, '锚点 +3');
   const sampleLevel = readLevel('pd0');
   assert(
-    readLevel('pd0') === '…/board_a/…/lcd/lcd_init.c:1',
-    `锚点 +3 应当显示成「…/board_a/…/lcd/lcd_init.c:1」，实际「${readLevel('pd0')}」`
+    readLevel('pd0') === '…/group_a/…/sub/sub_main.c:1',
+    `锚点 +3 应当显示成「…/group_a/…/sub/sub_main.c:1」，实际「${readLevel('pd0')}」`
   );
   assert(
-    readLevel('pd1') === '…/board_b/…/lcd/lcd_init.c:2',
-    `另一条应当显示成「…/board_b/…/lcd/lcd_init.c:2」，实际「${readLevel('pd1')}」`
+    readLevel('pd1') === '…/group_b/…/sub/sub_main.c:2',
+    `另一条应当显示成「…/group_b/…/sub/sub_main.c:2」，实际「${readLevel('pd1')}」`
   );
 
-  // ④ 名字锚点：`BSP` 保留该段本身
-  const byName = { ...tailTwo, anchors: ['BSP'] };
-  const readName = assertCrossSide(byName, '名字锚点 BSP');
+  // ④ 名字锚点：`LIB` 保留该段本身
+  const byName = { ...tailTwo, anchors: ['LIB'] };
+  const readName = assertCrossSide(byName, '名字锚点 LIB');
   const sampleName = readName('pd0');
   assert(
-    readName('pd0') === '…/BSP/…/lcd/lcd_init.c:1',
-    `名字锚点应当显示成「…/BSP/…/lcd/lcd_init.c:1」，实际「${readName('pd0')}」`
+    readName('pd0') === '…/LIB/…/sub/sub_main.c:1',
+    `名字锚点应当显示成「…/LIB/…/sub/sub_main.c:1」，实际「${readName('pd0')}」`
   );
 
-  // ⑤ 相对偏移且**基准段不显示**：`BSP+1` 只保留下一级（board_a），正是「只显示偏移出来的目录」
-  const byOffset = { ...tailTwo, anchors: ['BSP+1'] };
-  const readOffset = assertCrossSide(byOffset, '锚点 BSP+1（基准不显示）');
-  const sampleOffset = readOffset('pd0');
+  // ④·一 带括号的锚点（用户 2026-10-15 定的两种括号语义）：**这是 F0 的回归用例** ——
+  // 宿主下发前会把圆括号剥壳、把方括号去掉，面板拿到的是剥过的那份，两侧文字必须逐字一致。
+  // 早期只有宿主单侧做预处理，面板把 `(LIB)` 当字面段名 → 同一路径两侧文字不同
+  // （webview 少了那一段、宿主多了那一段），下面这两条断言当时就会红。
+  {
+    const roundAnchors = { ...tailTwo, anchors: ['(LIB)'] };
+    const readRound = assertCrossSide(roundAnchors, '圆括号锚点 (LIB)');
+    assert(
+      readRound('pd0') === '…/LIB/…/sub/sub_main.c:1',
+      `圆括号条目「两处都要」：路径那行必须保留 LIB，实际「${readRound('pd0')}」`
+    );
+  }
+  {
+    const squareAnchors = { ...tailTwo, anchors: ['[LIB]'] };
+    const readSquare = assertCrossSide(squareAnchors, '方括号锚点 [LIB]');
+    const readNone = assertCrossSide({ ...tailTwo, anchors: [] }, '无锚点（对照组）');
+    assert(
+      pathPart(readSquare('pd0')) === pathPart(readNone('pd0')),
+      `方括号条目只当标签：路径那行必须与无锚点逐字相同，实际「${readSquare('pd0')}」vs「${readNone(
+        'pd0'
+      )}」`
+    );
+  }
+
+  // ④·二 上下文限定锚点（用户 2026-10-14 的消歧场景）：`group_a/src` 只在**紧跟在 group_a
+  // 之后**的 `src` 上命中，两条 group 路径因此不再互相干扰；以 `/` 开头则要求从工作区根开始。
+  // ⚠️ 这一条同时是 webview 那份 `resolveAnchorIndexes` 副本的**跨侧等值**检查 ——
+  // 两份实现必须逐字同规则，否则这里会红。
+  const byContext = { ...tailTwo, anchors: ['group_a/src'] };
+  const readContext = assertCrossSide(byContext, '上下文锚点 group_a/src');
   assert(
-    readOffset('pd0') === '…/board_a/…/lcd/lcd_init.c:1',
-    `BSP+1 应当只显示偏移出来的那一段（…/board_a/…），实际「${readOffset('pd0')}」`
+    readContext('pd0') === '…/src/…/sub/sub_main.c:1',
+    `上下文锚点应当命中 src 那一段（…/src/…/sub/sub_main.c:1），实际「${readContext('pd0')}」`
   );
   assert(
-    readOffset('pd1') === '…/board_b/…/lcd/lcd_init.c:2',
-    `另一条应当是 board_b，实际「${readOffset('pd1')}」`
+    readContext('pd1') === '…/sub/sub_main.c:2',
+    `另一条不含「group_a/src」这个连续片段，不应当被锚点影响，实际「${readContext('pd1')}」`
+  );
+  const byRootContext = { ...tailTwo, anchors: ['/components/LIB/group_a'] };
+  const readRootContext = assertCrossSide(byRootContext, '上下文锚点 /components/LIB/group_a');
+  assert(
+    readRootContext('pd0') === '…/group_a/…/sub/sub_main.c:1',
+    `以 / 开头的上下文应当从工作区根开始匹配（…/group_a/…），实际「${readRootContext('pd0')}」`
+  );
+  assert(
+    readRootContext('pd1') === '…/sub/sub_main.c:2',
+    `group_b 那条不该被 /components/LIB/group_a 命中，实际「${readRootContext('pd1')}」`
+  );
+
+  // ④·三 前缀 `all:` = 该模式的**所有**命中（用户 2026-10-14：「可以匹配上所有的这个名字」）；
+  // 段匹配器支持 `*` / `?` 通配与 `a|b` 多选（第一档语法）。
+  // 夹具里 `x/se/mid/se/mid2/z.c` 有两个 `se`，`all:se` 两条都保留、`se` 只保留一条。
+  // ⚠️ 窗口必须只留 1 层：留 2 层时末尾窗口本身就含第二个 `se`，两种写法看起来一样，
+  // 断言就没有区分度了（第一版就是这么写的，对照组直接红）。
+  // ⚠️ 同样走 assertCrossSide：webview 与宿主各有一份 `resolveAnchorIndexes`，漂移就会红。
+  const byAll = { ...tailTwo, tailLevels: 1, anchors: ['all:se'] };
+  const readAll = assertCrossSide(byAll, '全命中锚点 all:se');
+  const repeatedText = readAll('pd7');
+  assert(
+    (repeatedText.match(/se/g) ?? []).length === 2,
+    `all:se 应当把两个 se 都保留下来，实际「${repeatedText}」`
+  );
+  // 对照组：不写 `all:` 时只保留一个（否则「全命中」这条规则等于没有区分度）
+  const byOne = { ...tailTwo, tailLevels: 1, anchors: ['se'] };
+  const readOne = assertCrossSide(byOne, '单命中锚点 se');
+  assert(
+    (readOne('pd7').match(/se/g) ?? []).length === 1,
+    `不写 all: 时只应保留一个 se，实际「${readOne('pd7')}」`
+  );
+  // 通配：`group_*` 在两条板子路径上各命中自己的那一段（跨侧等值 + 具体段名都钉住）
+  const byGlob = { ...tailTwo, tailLevels: 1, anchors: ['group_*'] };
+  const readGlob = assertCrossSide(byGlob, '通配锚点 group_*');
+  assert(
+    readGlob('pd0').includes('group_a') && readGlob('pd1').includes('group_b'),
+    `group_* 应当分别命中 group_a 与 group_b，实际「${readGlob('pd0')}」「${readGlob('pd1')}」`
+  );
+  // 第三档语法同样跨侧等值：`**`（任意层）、`re:`（正则）、`!`（排除）
+  const byAnyDepth = { ...tailTwo, tailLevels: 1, anchors: ['**/sub'] };
+  const readAnyDepth = assertCrossSide(byAnyDepth, '任意层锚点（两层星号后接 sub）');
+  assert(
+    readAnyDepth('pd0').includes('sub'),
+    `任意层写法应当命中 sub，实际「${readAnyDepth('pd0')}」`
+  );
+  const byRegex = { ...tailTwo, tailLevels: 1, anchors: ['re:^group_[ab]$'] };
+  const readRegex = assertCrossSide(byRegex, '正则锚点 re:^group_[ab]$');
+  assert(
+    readRegex('pd0').includes('group_a') && readRegex('pd1').includes('group_b'),
+    `正则应当分别命中 group_a 与 group_b，实际「${readRegex('pd0')}」「${readRegex('pd1')}」`
+  );
+  const byExclude = { ...tailTwo, tailLevels: 1, anchors: ['!group_b', 'group_*'] };
+  const readExclude = assertCrossSide(byExclude, '排除锚点 !group_b');
+  assert(
+    readExclude('pd0').includes('group_a'),
+    `未被排除的那条应当照常命中，实际「${readExclude('pd0')}」`
+  );
+  assert(
+    !readExclude('pd1').includes('group_b'),
+    `被 ! 排除的那条不得再保留锚点段，实际「${readExclude('pd1')}」`
+  );
+
+  // ⑤ 相对偏移且**基准段不显示**：`LIB+1` 只保留下一级（group_a），正是「只显示偏移出来的目录」
+  const byOffset = { ...tailTwo, anchors: ['LIB+1'] };
+  const readOffset = assertCrossSide(byOffset, '锚点 LIB+1（基准不显示）');
+  const sampleOffset = readOffset('pd0');
+  assert(
+    readOffset('pd0') === '…/group_a/…/sub/sub_main.c:1',
+    `LIB+1 应当只显示偏移出来的那一段（…/group_a/…），实际「${readOffset('pd0')}」`
+  );
+  assert(
+    readOffset('pd1') === '…/group_b/…/sub/sub_main.c:2',
+    `另一条应当是 group_b，实际「${readOffset('pd1')}」`
   );
 
   // ⑥ 多层组合：基准与偏移各单列一条 → 两者都显示，且相邻段连在一起（中间不加省略号）
-  const combined = { ...tailTwo, anchors: ['BSP', 'BSP+1'] };
-  const readCombined = assertCrossSide(combined, '锚点 BSP + BSP+1');
+  const combined = { ...tailTwo, anchors: ['LIB', 'LIB+1'] };
+  const readCombined = assertCrossSide(combined, '锚点 LIB + LIB+1');
   const sampleCombined = readCombined('pd0');
   assert(
-    readCombined('pd0') === '…/BSP/board_a/…/lcd/lcd_init.c:1',
-    `组合锚点应当显示成「…/BSP/board_a/…/lcd/lcd_init.c:1」，实际「${readCombined('pd0')}」`
+    readCombined('pd0') === '…/LIB/group_a/…/sub/sub_main.c:1',
+    `组合锚点应当显示成「…/LIB/group_a/…/sub/sub_main.c:1」，实际「${readCombined('pd0')}」`
   );
 
   // ⑦ 从文件名往上数：`-1` = 文件所在目录
   const byTail = { ...tailTwo, anchors: ['-1'] };
   const readTailAnchor = assertCrossSide(byTail, '锚点 -1');
   assert(
-    readTailAnchor('pd0') === '…/lcd/lcd_init.c:1',
+    readTailAnchor('pd0') === '…/sub/sub_main.c:1',
     `-1 应当取到文件所在目录，实际「${readTailAnchor('pd0')}」`
   );
 
   // ⑧ 目录名本身带 `-` 时不能被当成偏移（解析顺序：整串名字优先）
-  const hyphen = { ...defaultOptions, tailLevels: 1, anchors: ['chip-01'] };
-  const readHyphen = assertCrossSide(hyphen, '锚点 chip-01（含连字符的目录名）');
+  const hyphen = { ...defaultOptions, tailLevels: 1, anchors: ['lib-2'] };
+  const readHyphen = assertCrossSide(hyphen, '锚点 lib-2（含连字符的目录名）');
   const sampleHyphen = readHyphen('pd6');
   assert(
-    readHyphen('pd6') === '…/chip-01/main.c:7',
+    readHyphen('pd6') === '…/lib-2/main.c:7',
     `含连字符的目录名应当被整串匹配，实际「${readHyphen('pd6')}」`
   );
 
-  // ⑨ 完整显示：放得下就给整条路径（两条 board 路径自然也能区分）
+  // ⑨ 完整显示：放得下就给整条路径（两条 group 路径自然也能区分）
   const fullMode = { ...defaultOptions, mode: 'full' };
   const readFull = assertCrossSide(fullMode, '完整显示');
   const sampleFull = readFull('pd4');
   assert(
-    readFull('pd4') === `${BOARD_A_SHORT}:5`,
+    readFull('pd4') === `${GROUP_A_SHORT}:5`,
     `放得下的路径应当整条显示，实际「${readFull('pd4')}」`
   );
   assert(
     readFull('pd4') !== readFull('pd5'),
-    `完整显示下两条短 board 路径必须不同，实际「${readFull('pd4')}」「${readFull('pd5')}」`
+    `完整显示下两条短 group 路径必须不同，实际「${readFull('pd4')}」「${readFull('pd5')}」`
   );
   // 放不下的长路径：保留首尾（含文件名）且不超长 —— 完整路径的承诺由**悬停提示**兜底
   assert(
-    readFull('pd2').length <= 45 && readFull('pd2').includes('lcd_init.c'),
+    readFull('pd2').length <= 45 && readFull('pd2').includes('sub_main.c'),
     `放不下的长路径应当保留首尾（含文件名）且不超长，实际「${readFull('pd2')}」`
   );
   {
     const group = nodesGroup.children.find((child) => child.getAttribute('data-node') === 'pd0');
     const tip = group?.children.find((child) => child.tagName === 'title');
     assert(
-      String(tip?.textContent ?? '').includes(BOARD_A),
+      String(tip?.textContent ?? '').includes(GROUP_A),
       `悬停提示里必须始终有完整路径，实际「${String(tip?.textContent ?? '').replace(/\n/g, ' / ')}」`
     );
   }
@@ -4508,7 +6299,7 @@ setTimeout(() => {
 {
   const LONG_NAME = 'veryLongFunctionNameThatWouldHaveBeenMiddleTruncatedBefore_1234567890';
   const SHORT_NAME = 'f';
-  const FULL_PATH = 'components/BSP/board_a/src/drivers/display/lcd/deep/deeper/lcd_init.c';
+  const FULL_PATH = 'components/LIB/group_a/src/modules/display/sub/deep/deeper/sub_main.c';
   const nodes = {
     ln: {
       id: 'ln',
@@ -4629,7 +6420,7 @@ setTimeout(() => {
   });
   const noNameLoc = textOf('ln', 'loc');
   assert(
-    !noNameLoc.includes('lcd_init.c'),
+    !noNameLoc.includes('sub_main.c'),
     `关掉文件名后不该再出现文件名，实际「${noNameLoc}」`
   );
   assert(noNameLoc.endsWith(':7'), `关掉文件名后行号必须仍在，实际「${noNameLoc}」`);
@@ -4839,7 +6630,7 @@ setTimeout(() => {
   assert(
     canvasEl.scrollTop === beforeTop,
     `折叠不该改动视口滚动位置（折叠前 ${beforeTop}，折叠后 ${canvasEl.scrollTop}）` +
-      `—— 一收就弹一下就是这个改动造成的`
+      `—— 收敛时的瞬时跳动即由该改动引起`
   );
   log(
     `诊断: 相机 —— 右边缘展开左移到 ${expectedRight}、极端宽按最左 ${expectedExtreme}、` +
@@ -5045,7 +6836,7 @@ setTimeout(() => {
   // 回到 switchA，保持后面的断言前提不变
   sendToWebview({ type: 'selectTab', id: 'tab-a' });
 
-  // 反向守卫：relayout（把非活动会话重发一遍）绝不能把活动标签抢走 ——
+  // 反向守卫：relayout（把非活动会话重新下发一次）绝不能把活动标签抢走 ——
   // 这正是「只在**新会话**的 sessionUpdate 里认领活动标签」那条规则的用途。
   sendToWebview({ type: 'sessionUpdate', session: sessionB });
   assert(
@@ -5164,4 +6955,690 @@ setTimeout(() => {
       log('OK: 新查询把根方框摆到视口中央 —— 在「先摘要、后内容」的真实顺序下也成立');
     }, 30);
   }, 900);
+}
+
+// ------------------------------------------------ 没有活动标签时导出必须出声（不许静默）
+//
+// 历史缺陷：导出菜单的处理在 `activeSession()` 为 undefined 时直接 `return` ——
+// 点了菜单项什么都不发生、也不报告，用户会以为扩展坏了。
+// 这里放一个**没有活动标签**的帧，真的点一次菜单项，断言发出的是 error 消息。
+//
+// ⚠️ 必须放在最后：这条用例会把标签全部关掉（`update` 空列表），之后画布就是空状态。
+// 1300ms 覆盖掉前面所有异步小节（最晚的是 900ms 那条）。
+{
+  setTimeout(() => {
+    // 先确认这一刻**确实**没有活动标签：清空标签表后 activeSession() 应当为 undefined。
+    sendToWebview({ type: 'update', sessions: [], activeId: '' });
+    assert(
+      nodesGroup.children.length === 0,
+      `清空标签后画布应当是空状态，实际仍有 ${nodesGroup.children.length} 个方框`
+    );
+
+    const exportMenu = byId.get('export-menu');
+    const menuHandlers = exportMenu.listeners.get('click') ?? [];
+    assert(menuHandlers.length >= 1, '导出菜单上没有注册 click 处理函数');
+    const pngItem = exportMenu.children.find(
+      (child) => child.getAttribute?.('data-format') === 'png'
+    );
+    assert(pngItem !== undefined, '桩里的导出菜单缺少 png 项');
+
+    const before = posted.length;
+    for (const handler of menuHandlers) {
+      handler({ type: 'click', target: pngItem, preventDefault() {}, stopPropagation() {} });
+    }
+    const fresh = posted.slice(before);
+    const failure = fresh.find((message) => message.type === 'error');
+    assert(
+      failure !== undefined,
+      `没有活动标签时点导出菜单项必须发出 error（不许静默什么都不做），实际发了 ${
+        fresh.map((message) => message.type).join(',') || '（无）'
+      }`
+    );
+    assert(
+      String(failure.message).includes('当前没有活动标签，无法导出'),
+      `这条 error 应当说明「当前没有活动标签，无法导出」，实际「${failure.message}」`
+    );
+    assert(
+      String(failure.message).includes('导出 png 失败'),
+      `这条 error 应当与其它导出失败同一套文案（导出 <格式> 失败：…），实际「${failure.message}」`
+    );
+    log(`OK: 没有活动标签时点导出不静默 —— ${failure.message}`);
+  }, 1300);
+}
+
+// ------------------------------------------------ 名称行路径标签（设置 nameFolderTag*）
+//
+// 三件事都要钉住：① 有标签时名称行由 tspan 组成（前/后各一段，文字逐字相等）；
+// ② 没有标签时**不引入 tspan**（保持单个 textContent，DOM 与改动前一致）；
+// ③ 标签在名称前面时搜索底纹必须右移标签那么宽（否则底纹会盖住标签、只压住名字的后半截）。
+//
+// 放在文件末尾：这一块会下发自己的会话（新会话会被认领为活动标签），
+// 放中间会把后面那些有状态依赖的用例全部带偏。
+{
+  const mkNode = (id, name, depth, tag) => ({
+    id,
+    name,
+    file: 'components/LIB/core/lib_core.c',
+    line: 12,
+    direction: 'callers',
+    depth,
+    isCycle: false,
+    canExpand: false,
+    children: [],
+    loaded: true,
+    kind: 'function',
+    ...tag,
+  });
+  const tagNodes = {
+    // ⚠️ 子节点必须挂在根的 `children` 里，否则 webview 认为它们不可见、根本不会渲染
+    tagBefore: mkNode('tagBefore', 'fn_a', 0, {
+      nameTagPrefix: '[LIB] → ',
+      children: ['tagAfter', 'tagNone'],
+    }),
+    tagAfter: mkNode('tagAfter', 'fn_b', 1, { nameTagSuffix: ' (core)' }),
+    tagNone: mkNode('tagNone', 'fn_c', 1, {}),
+  };
+  const tagBoxes = {
+    tagBefore: { x: 0, y: 0, width: 320, height: NODE_HEIGHT },
+    tagAfter: { x: 420, y: 0, width: 320, height: NODE_HEIGHT },
+    tagNone: { x: 420, y: 90, width: 320, height: NODE_HEIGHT },
+  };
+  sendToWebview({ type: 'settings', settings: { stickyParent: false, showLocation: false } });
+  sendToWebview({
+    type: 'sessionUpdate',
+    session: {
+      id: 'name-tag-check',
+      title: '名称行标签检查',
+      description: '',
+      direction: 'callers',
+      engineLabel: 'clangd',
+      rootId: 'tagBefore',
+      nodes: tagNodes,
+      edges: [],
+      boxes: tagBoxes,
+      collapsedCount: 0,
+    },
+  });
+  flushFrames();
+
+  const groupOf = (id) => nodesGroup.children.find((child) => child.getAttribute('data-node') === id);
+  const childOf = (element, className) =>
+    element === undefined
+      ? undefined
+      : element.children.find((child) => child.getAttribute('class') === className);
+  const nameElOf = (id) => childOf(groupOf(id), 'name');
+
+  const before = nameElOf('tagBefore');
+  assert(before !== undefined, '名称行标签用例：找不到 tagBefore 的名称元素');
+  const beforeTag = childOf(before, 'name-tag-before');
+  const beforeName = childOf(before, 'name-text');
+  assert(
+    beforeTag !== undefined && beforeTag.textContent === '[LIB] → ',
+    `前置标签必须逐字等于宿主给的文字，实际「${beforeTag?.textContent}」`
+  );
+  assert(
+    beforeName !== undefined && beforeName.textContent === 'fn_a',
+    `前置摆法下元素名仍要单独成段，实际「${beforeName?.textContent}」`
+  );
+
+  const after = nameElOf('tagAfter');
+  const afterTag = childOf(after, 'name-tag-after');
+  assert(
+    afterTag !== undefined && afterTag.textContent === ' (core)',
+    `后置标签必须逐字等于宿主给的文字，实际「${afterTag?.textContent}」`
+  );
+  assert(
+    childOf(after, 'name-tag-before') === undefined,
+    '后置摆法不得再出现前置标签（两段不可能同时有文字）'
+  );
+
+  const none = nameElOf('tagNone');
+  assert(
+    none !== undefined && none.textContent === 'fn_c',
+    `没有标签时名称行必须保持单个 textContent，实际「${none?.textContent}」`
+  );
+  assert(
+    (none?.children ?? []).length === 0,
+    '没有标签时不得引入 tspan（DOM 结构与改动前保持一致）'
+  );
+
+  // 搜索底纹的横向偏移：查询词 `fn` 让三个方框都命中
+  const searchInput = byId.get('search-input') ?? byId.get('searchInput');
+  if (searchInput === undefined) {
+    log('诊断: 名称行标签 —— 前置/后置/无标签三种情形通过；底纹偏移**未验证**（桩里找不到搜索输入框）');
+  } else {
+    searchInput.value = 'fn';
+    searchInput.dispatch('input', {});
+    flushFrames();
+    const hitBefore = childOf(groupOf('tagBefore'), 'name-hit');
+    const hitNone = childOf(groupOf('tagNone'), 'name-hit');
+    assert(hitBefore !== undefined && hitNone !== undefined, '命中后应当出现 name-hit 底纹');
+    assert(
+      Number(hitBefore.getAttribute('x')) > Number(hitNone.getAttribute('x')),
+      `标签在前时底纹必须右移标签那么宽：带标签 x=${hitBefore.getAttribute('x')} vs 不带 x=${hitNone.getAttribute('x')}`
+    );
+    log(
+      `诊断: 名称行标签 —— 前置「[LIB] → 」/ 后置「 (core)」/ 无标签不引 tspan；` +
+        `底纹 x ${hitNone.getAttribute('x')} → ${hitBefore.getAttribute('x')}`
+    );
+  }
+
+  // 设置 → payload 这一段只有**源码级**依据：冒烟夹具的路径是单段（`demo.cpp`），
+  // 任何锚点模式都不可能命中，所以「打开开关 → payload 真的带上标签」在现有夹具里
+  // 构造不出端到端用例。如实记在这里，不要当成已覆盖（见开发记录 8.10）。
+  const hostSource = require('node:fs').readFileSync(
+    require('node:path').join(__dirname, '..', 'src', 'views', 'graphView.ts'),
+    'utf8'
+  );
+  assert(
+    /nameFolderTag: config\.get<boolean>\('nameFolderTag', false\)/.test(hostSource) &&
+      /nameFolderTagStyle/.test(hostSource) &&
+      /nameFolderTagPick/.test(hostSource),
+    '宿主必须真的读这三项设置（否则设置里点了没反应）'
+  );
+  assert(
+    /nameTagPartsFor\(node\.file, pathOptions\)/.test(hostSource),
+    'payload 里的标签文字必须用与布局同一份 pathOptions 生成（两处各读一次设置会让列宽与文字分叉）'
+  );
+  assert(
+    /nameFolderTagStyle:\s*\n?\s*rawStyle === 'parenAfter'/.test(hostSource) &&
+      /nameFolderTagPick: rawPick === 'deepest'/.test(hostSource),
+    '非法取值必须退回默认（手改 settings.json 写错字不该让整行标签渲染成 undefined）'
+  );
+}
+
+// ------------------------------------------------ 「收起全部 → 点第一级展开」必须一次生效
+//
+// 回归（用户 2026-10-15 实测「折叠按钮点击后，再点第一级展开要点两遍」）：
+// 收起全部会把根标成「已收起」，而复位之后根是**未加载**的。旧的展开处理只在「数据已加载」
+// 那条分支里清收起标记 —— 第一次点击发出请求、数据也回来了，但节点仍被当成收起，
+// 新一级不显示，用户必须再点一次。这里的判据是：**一次点击**之后，宿主把数据送回来就要可见。
+{
+  const makeNode = (id, name, depth, children, loaded) => ({
+    id,
+    name,
+    file: `${name}.c`,
+    line: 1,
+    direction: 'callers',
+    depth,
+    isCycle: false,
+    canExpand: !loaded,
+    children,
+    loaded,
+    kind: 'function',
+  });
+  const foldRoot = 'foldRoot';
+  const foldChild = 'foldChild';
+  const foldSession = (withChild) => ({
+    id: 'fold-check',
+    title: '折叠回归',
+    description: '',
+    direction: 'callers',
+    engineLabel: 'clangd',
+    rootId: foldRoot,
+    nodes: withChild
+      ? {
+          [foldRoot]: makeNode(foldRoot, 'root', 0, [foldChild], true),
+          [foldChild]: makeNode(foldChild, 'child', 1, [], true),
+        }
+      : { [foldRoot]: makeNode(foldRoot, 'root', 0, [], false) },
+    edges: withChild ? [{ id: 'fold-edge', from: foldRoot, to: foldChild }] : [],
+    boxes: withChild
+      ? {
+          [foldRoot]: { x: 0, y: 0, width: 300, height: NODE_HEIGHT },
+          [foldChild]: { x: 420, y: 0, width: 300, height: NODE_HEIGHT },
+        }
+      : { [foldRoot]: { x: 0, y: 0, width: 300, height: NODE_HEIGHT } },
+    collapsedCount: withChild ? 1 : 0,
+  });
+  const groupOfFold = (id) =>
+    nodesGroup.children.find((child) => child.getAttribute('data-node') === id);
+  const expanderOfFold = (id) =>
+    groupOfFold(id)?.children.find((child) =>
+      String(child.getAttribute('class') || '').startsWith('expander')
+    );
+  const clickExpander = (id, mode) => {
+    const expander = expanderOfFold(id);
+    assert(expander !== undefined, `${id} 应当有加减号`);
+    assert(
+      String(expander.getAttribute('class')).includes(mode),
+      `${id} 的加减号应当是 ${mode}，实际 ${expander.getAttribute('class')}`
+    );
+    expander.dispatch('mousedown', { stopPropagation() {}, preventDefault() {} });
+    for (const handler of windowListeners.mouseup ?? []) {
+      handler({});
+    }
+  };
+
+  sendToWebview({ type: 'settings', settings: { stickyParent: false, showLocation: false } });
+  // ① 先给一帧「已展开」的图，让「收起全部」有东西可收
+  sendToWebview({ type: 'sessionUpdate', session: foldSession(true) });
+  flushFrames();
+  // ② 点收起全部（前端会下发 collapse([根]) 与 resetExpansion）
+  byId.get('btn-collapse-all').dispatch('click', {});
+  flushFrames();
+  // ③ 宿主复位后回一帧「只有根、未加载」的会话 —— 这正是复位后的真实状态
+  sendToWebview({ type: 'sessionUpdate', session: foldSession(false) });
+  flushFrames();
+
+  posted.length = 0;
+  clickExpander(foldRoot, 'expand');
+  flushFrames();
+  const afterClick = posted.filter((message) => message.type !== 'reportWidths');
+  assert(
+    afterClick.some((message) => message.type === 'expand' && message.nodeId === foldRoot),
+    `第一次点第一级 + 必须发出 expand，实际 ${afterClick.map((m) => m.type).join(',') || '（无）'}`
+  );
+  const cleared = afterClick.find((message) => message.type === 'collapse');
+  assert(
+    cleared !== undefined && Array.isArray(cleared.collapsed) && cleared.collapsed.length === 0,
+    `点 + 时必须把「已收起」标记清掉并同步宿主，实际 ${JSON.stringify(cleared && cleared.collapsed)}`
+  );
+  // ④ 宿主把第一级数据送回来：必须**立刻可见**（这才是「一次点击」的判据）
+  sendToWebview({ type: 'sessionUpdate', session: foldSession(true) });
+  flushFrames();
+  assert(
+    groupOfFold(foldChild) !== undefined,
+    '数据回来后第一级必须立刻显示（不许要再点一次）—— 标记没清就会出现这个现象'
+  );
+  log('OK: 收起全部 → 点第一级 + 一次生效（收起标记随展开请求一起清除，数据回来立刻可见）');
+}
+
+// ------------------------------------------------ 搜索范围：显示的路径 / 完整路径（用户 2026-10-15）
+//
+// 两个开关分别把「方框里那行路径的**显示文本**」与「**完整路径**」纳入搜索：
+//   - 「显示的路径」跟着 `pathDisplay` / `pathTailLevels` 走 —— 被省略掉的目录名**搜不到**；
+//   - 「完整路径」不看显示设置，路径里任何一段都能搜到；
+//   - 两个都关 = 只搜元素名（0.22 之前的行为，这里也作为回归基准）。
+// 夹具刻意让两条口径分叉：`lib/deepdir/nested/target.c` 在「保留末尾 1 层」下显示成 `…/target.c`。
+{
+  const mkNode = (id, name, file, line, depth, children) => ({
+    id,
+    name,
+    file,
+    line,
+    direction: 'callers',
+    depth,
+    isCycle: false,
+    canExpand: false,
+    children,
+    loaded: true,
+    kind: 'function',
+  });
+  const scopeNodes = {
+    scopeRoot: mkNode('scopeRoot', 'root_fn', 'src/main.c', 1, 0, ['scopeDeep', 'scopeTop']),
+    // 末段之前还有一个目录段在显示里被省略 —— 这正是「显示的路径」与「完整路径」的分界
+    scopeDeep: mkNode('scopeDeep', 'deep_fn', 'lib/deepdir/nested/target.c', 7, 1, []),
+    scopeTop: mkNode('scopeTop', 'shallow_fn', 'lib/top.c', 3, 1, []),
+  };
+  const scopeSession = {
+    id: 'scope-check',
+    title: '搜索范围检查',
+    description: '',
+    direction: 'callers',
+    engineLabel: 'clangd',
+    rootId: 'scopeRoot',
+    nodes: scopeNodes,
+    edges: [],
+    boxes: {
+      scopeRoot: { x: 0, y: 0, width: 260, height: NODE_HEIGHT },
+      scopeDeep: { x: 340, y: 0, width: 260, height: NODE_HEIGHT },
+      scopeTop: { x: 340, y: 70, width: 260, height: NODE_HEIGHT },
+    },
+    collapsedCount: 0,
+  };
+
+  sendToWebview({
+    type: 'settings',
+    settings: {
+      stickyParent: false,
+      showLocation: true,
+      pathDisplay: 'tail',
+      // 只保留末尾 1 层：显示成 `…/target.c`
+      pathTailLevels: 1,
+      pathShowFileName: true,
+      pathAnchors: [],
+    },
+  });
+  sendToWebview({ type: 'sessionUpdate', session: scopeSession });
+  flushFrames();
+
+  const classListOf = (el) => String(el.className).split(/\s+/).filter(Boolean);
+  const matchedIds = () =>
+    nodesGroup.children
+      .filter((child) => classListOf(child).includes('match'))
+      .map((child) => child.getAttribute('data-node'))
+      .sort();
+  const groupOfScope = (id) =>
+    nodesGroup.children.find((child) => child.getAttribute('data-node') === id);
+  const locTextOf = (id) =>
+    groupOfScope(id)?.flatten().find((el) => classListOf(el).includes('loc'))?.textContent;
+
+  // 前提：那一行**确实**没有目录名（否则下面的三条断言全都在验一件不存在的事）
+  const deepLoc = locTextOf('scopeDeep');
+  assert(
+    typeof deepLoc === 'string' && deepLoc === '…/target.c:7',
+    `夹具前提不成立：保留末尾 1 层时 scopeDeep 那行应当是「…/target.c:7」，实际「${deepLoc}」`
+  );
+
+  const scopeSearch = byId.get('search-input');
+  const typeScope = (value) => {
+    scopeSearch.value = value;
+    scopeSearch.dispatch('input', {});
+    flushFrames();
+  };
+
+  // ① 两个开关都关（回归基准）：只搜元素名，路径里的目录名搜不到
+  typeScope('deepdir');
+  assert(
+    matchedIds().length === 0,
+    `两个路径开关都关时不应命中（只搜元素名），实际 ${matchedIds().join(',') || '（无）'}`
+  );
+
+  // ② 只开「显示的路径」：显示的 `…/target.c` 里没有目录名 → 仍然搜不到
+  byId.get('btn-search-path').dispatch('click', {});
+  typeScope('deepdir');
+  assert(
+    matchedIds().length === 0,
+    `「显示的路径」只覆盖那行**显示出来的**文字：被省略掉的 deepdir 不该命中，实际 ${matchedIds().join(',')}`
+  );
+  // 同一开关下，显示出来的文件名要能搜到（证明这个开关真的生效，而不是死的）
+  typeScope('target');
+  assert(
+    matchedIds().join(',') === 'scopeDeep',
+    `「显示的路径」应当能搜到显示出来的 target.c，实际 ${matchedIds().join(',') || '（无）'}`
+  );
+  // 未显示的目录段 `lib`（两个节点的完整路径都有）同样搜不到
+  typeScope('lib');
+  assert(
+    matchedIds().length === 0,
+    `「显示的路径」不该命中被省略的 lib 段，实际 ${matchedIds().join(',')}`
+  );
+
+  // ③ 换开「完整路径」：同一个 deepdir 现在搜得到，且只有那一个节点
+  byId.get('btn-search-path').dispatch('click', {});
+  byId.get('btn-search-full').dispatch('click', {});
+  typeScope('deepdir');
+  assert(
+    matchedIds().join(',') === 'scopeDeep',
+    `「完整路径」应当能搜到完整路径里的目录名，实际 ${matchedIds().join(',') || '（无）'}`
+  );
+  typeScope('lib');
+  assert(
+    matchedIds().join(',') === 'scopeDeep,scopeTop',
+    `「完整路径」下 lib 段应当命中两个节点，实际 ${matchedIds().join(',')}`
+  );
+  // 元素名仍然按老规矩能搜到（开关只**扩大**范围，不缩小）
+  typeScope('root_fn');
+  assert(
+    matchedIds().join(',') === 'scopeRoot',
+    `开了路径开关后元素名仍要能搜到，实际 ${matchedIds().join(',') || '（无）'}`
+  );
+
+  // ④ 恢复两个开关都关：与 ① 逐字一致（回归）
+  byId.get('btn-search-full').dispatch('click', {});
+  typeScope('deepdir');
+  assert(
+    matchedIds().length === 0,
+    `关掉两个路径开关后应当回到只搜元素名，实际 ${matchedIds().join(',')}`
+  );
+  typeScope('');
+  log(
+    'OK: 搜索范围 —— 「显示的路径」只覆盖那行显示出来的文字（被省略的目录名搜不到），' +
+      '「完整路径」覆盖全部路径段；两个都关 = 只搜元素名（与改动前一致）'
+  );
+}
+
+// ------------------------------------------------ 临时路径过滤的界面接线（用户 2026-10-15）
+//
+// 面板这一侧的职责只有三件：① 把输入框的文字发给宿主（空查询立即发、非空查询防抖后发）；
+// ② 用宿主回传的 `filteredCount` 显示「已隐藏 N 个」——**不是**面板自己数的
+// （命中与否要拿完整会话数据判，而面板手上的 payload 已经被裁掉了那些节点）；
+// ③ 面板重建时把宿主那一份查询还原回输入框，否则界面与图分叉。
+//
+// 「过滤真的把这些方框藏起来」那一半在宿主侧，由 smoke 的端到端用例覆盖。
+{
+  const filterInput = byId.get('path-filter-input');
+  const filterCount = byId.get('path-filter-count');
+  assert(
+    filterInput !== undefined && filterCount !== undefined,
+    '桩里缺少临时过滤的输入框或计数（#path-filter-input / #path-filter-count）'
+  );
+
+  const mkNode = (id, name, file, line, depth, children) => ({
+    id,
+    name,
+    file,
+    line,
+    direction: 'callers',
+    depth,
+    isCycle: false,
+    canExpand: false,
+    children,
+    loaded: true,
+    kind: 'function',
+  });
+  const filterSession = (filteredCount) => ({
+    id: 'filter-check',
+    title: '临时过滤检查',
+    description: '',
+    direction: 'callers',
+    engineLabel: 'clangd',
+    rootId: 'fltRoot',
+    nodes: {
+      fltRoot: mkNode('fltRoot', 'root_fn', 'src/main.c', 1, 0, ['fltHidden']),
+      fltHidden: mkNode('fltHidden', 'hidden_fn', 'lib/deepdir/target.c', 7, 1, []),
+    },
+    edges: [],
+    boxes: {
+      fltRoot: { x: 0, y: 0, width: 260, height: NODE_HEIGHT },
+      fltHidden: { x: 340, y: 0, width: 260, height: NODE_HEIGHT },
+    },
+    collapsedCount: 0,
+    ...(filteredCount > 0 ? { filteredCount } : {}),
+  });
+
+  sendToWebview({ type: 'sessionUpdate', session: filterSession(0) });
+  flushFrames();
+
+  // ① 还在打字（宿主没回）时不给一个已经不对的旧数字
+  filterInput.value = 'deepdir';
+  filterInput.dispatch('input', {});
+  assert(
+    filterCount.textContent === '过滤中…',
+    `刚输入、宿主还没回时计数应当写「过滤中…」（不能显示旧数字），实际「${filterCount.textContent}」`
+  );
+
+  // ② 宿主回一帧带 filteredCount 的会话：计数按它显示
+  sendToWebview({ type: 'sessionUpdate', session: filterSession(2) });
+  flushFrames();
+  assert(
+    filterCount.textContent === '已隐藏 2 个',
+    `计数应当用宿主回传的 filteredCount，实际「${filterCount.textContent}」`
+  );
+
+  // ③ 清空：**立刻**发空查询（恢复不该等防抖），计数清空
+  posted.length = 0;
+  filterInput.value = '';
+  filterInput.dispatch('input', {});
+  const clearedMessage = posted.find((message) => message.type === 'pathFilter');
+  assert(
+    clearedMessage !== undefined && clearedMessage.query === '',
+    `清空输入框应当立刻发出空查询（不等防抖），实际 ${JSON.stringify(
+      posted.filter((message) => message.type === 'pathFilter')
+    )}`
+  );
+  assert(filterCount.textContent === '', `清空后不该还留着「已隐藏 N 个」，实际「${filterCount.textContent}」`);
+
+  // ④ Esc 清空并立刻发空查询（与搜索框同一套手感）
+  filterInput.value = 'something';
+  filterInput.dispatch('input', {});
+  posted.length = 0;
+  filterInput.dispatch('keydown', { key: 'Escape', preventDefault() {} });
+  assert(filterInput.value === '', `Esc 应当清空临时过滤输入框，实际「${filterInput.value}」`);
+  assert(
+    posted.some((message) => message.type === 'pathFilter' && message.query === ''),
+    'Esc 清空后应当立刻把空查询发给宿主'
+  );
+
+  // ⑤ 面板重建（init 带回宿主那一份查询）：输入框必须还原，计数按当前标签显示
+  posted.length = 0;
+  sendToWebview({
+    type: 'init',
+    sessions: [filterSession(2)],
+    summaries: [{ id: 'filter-check', title: '临时过滤检查', description: '', direction: 'callers' }],
+    activeId: 'filter-check',
+    pathFilterQuery: 'deepdir',
+  });
+  flushFrames();
+  assert(
+    filterInput.value === 'deepdir',
+    `面板重建时输入框应当还原宿主那一份查询，实际「${filterInput.value}」`
+  );
+  assert(
+    filterCount.textContent === '已隐藏 2 个',
+    `还原后计数应当按当前标签的 filteredCount 显示，实际「${filterCount.textContent}」`
+  );
+  assert(
+    posted.every((message) => message.type !== 'pathFilter'),
+    'init 还原输入框**不得**顺带把查询再发回去（那会在宿主与面板之间形成回环）'
+  );
+  log(
+    'OK: 临时路径过滤的界面接线 —— 输入清空/ Esc 立刻发空查询、计数用宿主回传的 filteredCount、' +
+      'init 还原输入框且不回发查询'
+  );
+}
+
+// 非空查询要**防抖**后才发（打字是高频操作，宿主每个查询都要重算所有标签的布局）。
+// 这一条必须真等一个防抖周期，所以放在文件最后的定时器里；此时其它小节都已跑完。
+{
+  const filterInput = byId.get('path-filter-input');
+  setTimeout(() => {
+    // 定时器醒来时活动会话可能已被别的小节换掉，先把自己的夹具摆回去
+    const session = {
+      id: 'filter-debounce',
+      title: '防抖检查',
+      description: '',
+      direction: 'callers',
+      engineLabel: 'clangd',
+      rootId: 'dbRoot',
+      nodes: {
+        dbRoot: {
+          id: 'dbRoot',
+          name: 'root_fn',
+          file: 'src/main.c',
+          line: 1,
+          direction: 'callers',
+          depth: 0,
+          isCycle: false,
+          canExpand: false,
+          children: [],
+          loaded: true,
+          kind: 'function',
+        },
+      },
+      edges: [],
+      boxes: { dbRoot: { x: 0, y: 0, width: 200, height: NODE_HEIGHT } },
+      collapsedCount: 0,
+    };
+    sendToWebview({ type: 'sessionUpdate', session });
+    flushFrames();
+
+    posted.length = 0;
+    filterInput.value = 'debounce-probe';
+    filterInput.dispatch('input', {});
+    assert(
+      posted.every((message) => message.type !== 'pathFilter'),
+      '非空查询不该**立即**发出（打字期间要防抖，否则宿主会被逐字符重排拖垮）'
+    );
+    setTimeout(() => {
+      const sent = posted.filter((message) => message.type === 'pathFilter');
+      assert(
+        sent.length === 1 && sent[0].query === 'debounce-probe',
+        `防抖结束后应当恰好发出一条 pathFilter，实际 ${JSON.stringify(sent)}`
+      );
+      // 收尾：清空，避免这条查询影响后续任何观察
+      filterInput.value = '';
+      filterInput.dispatch('input', {});
+      log(`OK: 临时路径过滤的防抖 —— 停止输入后恰好发出 1 条 pathFilter（查询「${sent[0].query}」）`);
+    }, 300);
+  }, 1500);
+}
+
+// ------------------------------------------------ init 必须带回宿主的收起状态（用户 2026-10-16 检视发现）
+//
+// 面板收到 init 会清空本地收起表，而宿主仍在按它算坐标（收起的子树没有坐标、不占高度）——
+// 不还原就会出现「父框画着 − 号、子框一个都不画」，用户要点两下才恢复（界面与宿主分叉）。
+// 放在最后：这一块会换掉画布上的会话，而前面那些「冲帧后就地读几何」的用例依赖自己的图。
+{
+  setTimeout(() => {
+    const mkNode = (id, name, depth, children) => ({
+      id,
+      name,
+      file: `${name}.c`,
+      line: 1,
+      direction: 'callers',
+      depth,
+      isCycle: false,
+      canExpand: false,
+      children,
+      loaded: true,
+      kind: 'function',
+    });
+    const session = {
+      id: 'collapsed-check',
+      title: '收起状态还原',
+      description: '',
+      direction: 'callers',
+      engineLabel: 'clangd',
+      rootId: 'colRoot',
+      nodes: {
+        colRoot: mkNode('colRoot', 'root', 0, ['colChild']),
+        colChild: mkNode('colChild', 'child', 1, []),
+      },
+      edges: [{ id: 'colEdge', from: 'colRoot', to: 'colChild', depth: 1 }],
+      boxes: {
+        colRoot: { x: 0, y: 0, width: 240, height: NODE_HEIGHT },
+        colChild: { x: 320, y: 0, width: 240, height: NODE_HEIGHT },
+      },
+      collapsedCount: 1,
+    };
+    const groupOf = (id) =>
+      nodesGroup.children.find((child) => child.getAttribute('data-node') === id);
+
+    // ① 先给一帧「没收起」的：子方框在
+    sendToWebview({ type: 'init', sessions: [session], summaries: [], activeId: session.id });
+    flushFrames();
+    assert(groupOf('colChild') !== undefined, '前提：未收起时子方框应当被画出来');
+
+    // ② 宿主说「根是收起的」：面板必须照它的状态画（子方框不画、根显示 +）
+    sendToWebview({
+      type: 'init',
+      sessions: [session],
+      summaries: [],
+      activeId: session.id,
+      collapsed: [{ sessionId: session.id, ids: ['colRoot'] }],
+    });
+    flushFrames();
+    assert(
+      groupOf('colChild') === undefined,
+      'init 带回来的收起状态必须生效：被收起的根之下不该渲染子方框（否则父框显示 − 却一个子框都没有）'
+    );
+    const expander = groupOf('colRoot')?.children.find((child) =>
+      String(child.getAttribute('class') || '').startsWith('expander')
+    );
+    assert(
+      String(expander?.getAttribute('class') || '').includes('expand'),
+      `被收起的节点应当显示「+」（与宿主一致），实际 ${expander?.getAttribute('class')}`
+    );
+
+    // ③ 反向：不带 collapsed 的 init 要把本地收起表清空（不能被上一帧粘住）
+    sendToWebview({ type: 'init', sessions: [session], summaries: [], activeId: session.id });
+    flushFrames();
+    assert(
+      groupOf('colChild') !== undefined,
+      '不带收起状态的 init 应当把本地收起表清空（不能被上一帧粘住）'
+    );
+    log('OK: init 下发收起状态 —— 面板按宿主的状态画（子方框不画、根显示 +），且不会粘住上一帧');
+  }, 2000);
 }

@@ -16,6 +16,7 @@
 import * as vscode from 'vscode';
 import { existsSync } from 'node:fs';
 
+import { logWarn } from '../util/log';
 import { CallDirection, Direction } from './graphTypes';
 import {
   EngineChoice,
@@ -465,6 +466,68 @@ export async function fetchCalls(
  *   - outgoingCalls 的 fromRanges = 本函数体内调用对方的实际位置
  * 取第一个 range 作为调用点，就能回答「谁在第几行调用了谁」。
  */
+/**
+ * 该错误是否表示「语言服务不认这个 item」。
+ *
+ * 触发场景（都不是语言服务坏了，而是**我们手里的 item 不是它产出的那一个**）：
+ *   - `references.ts` 的引用兜底会自己 `new vscode.CallHierarchyItem(...)`（宏、类型、变量那类符号）；
+ *   - 窗口重载后从快照恢复的 item 是普通对象（`session.ts` 的 `deserializeItem`）。
+ * 真机日志里表现为 `invalid item`（clangd 的措辞）。
+ */
+export function isInvalidItemError(error: unknown): boolean {
+  const text = error instanceof Error ? error.message : String(error ?? '');
+  return /invalid item/i.test(text);
+}
+
+/**
+ * 重新认领一个 item：用它的 uri 与位置再问一次 `prepareCallHierarchy`，
+ * 拿到语言服务**认可**的那个（挑选规则与主路径一致，复用 `pickByChoice`）。
+ *
+ * 拿不到就返回 `undefined`（调用方据此把节点按叶子处理，而不是让「+」反复失败）。
+ */
+export async function reacquireItem(
+  item: vscode.CallHierarchyItem
+): Promise<vscode.CallHierarchyItem | undefined> {  const position = item.selectionRange?.start ?? item.range?.start;
+  if (!position) {
+    return undefined;
+  }
+  try {
+    const prepared = await vscode.commands.executeCommand<vscode.CallHierarchyItem[]>(
+      'vscode.prepareCallHierarchy',
+      item.uri,
+      position
+    );
+    return pickByChoice(prepared ?? [], position);
+  } catch (error) {
+    logWarn(
+      `重新认领节点「${item.name}」失败：${error instanceof Error ? error.message : String(error)}`
+    );
+    return undefined;
+  }
+}
+
+/**
+ * 把展开失败的原因翻成人话（输出通道与面板提示共用）。
+ *
+ * `invalid item` 与 `Canceled` 这类底层措辞对用户毫无信息量。
+ */
+export function describeRelationError(error: unknown): string {
+  const text = error instanceof Error ? error.message : String(error ?? '');
+  if (isInvalidItemError(error)) {
+    return (
+      '该节点的语言服务项已失效（常见于引用兜底生成的节点，或窗口重载后从快照恢复的节点），' +
+      '无法继续展开；请重新查询该函数'
+    );
+  }
+  if (/cancel/i.test(text)) {
+    return '请求已被取消（窗口可能正在重载），可重试';
+  }
+  if (/no handler registered/i.test(text)) {
+    return '当前语言服务不支持调用层级（请确认 clangd 或 C/C++ 扩展已启用）';
+  }
+  return text || '未知原因';
+}
+
 export async function fetchCallsDetailed(
   direction: Direction,
   item: vscode.CallHierarchyItem

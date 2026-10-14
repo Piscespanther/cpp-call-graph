@@ -59,7 +59,7 @@ export const MARGIN_TOP = 10;
  * 列间距：这是**箭头真正可见的那一段**。
  *
  * 曾经固定为 46，那时列宽也固定 230、而方框按内容可更宽，方框越过列边界
- * 把这个间隙吃掉，箭头看起来「太短或被盖住」。现在列宽按内容算、间隙有保证，
+ * 占用该间隙，箭头看起来「太短或被盖住」。现在列宽按内容算、间隙有保证，
  * 取 52 作为适中值（56 看着偏长，46 又偏短）。
  */
 const COLUMN_GAP = 52;
@@ -69,7 +69,7 @@ const ROW_GAP = 12;
  * 排布上限：图特别大时不把整张图都算坐标（一帧要排几千个方框会拖垮交互）。
  *
  * ⚠️ 必须 ≥ 宿主的「展开全部」节点预算（`graphView.MAX_EXPAND_NODES = 800`）：
- * 否则展开全部明明抓回了 800 个节点，布局却只画 500 个 → 用户看到方框凭空消失。
+ * 否则展开全部抓回了 800 个节点，布局却只画 500 个 → 用户看到方框凭空消失。
  * renderCheck 里有「MAX_LAYOUT_NODES ≥ MAX_EXPAND_NODES」的源码级断言钉住这条关系。
  */
 const MAX_LAYOUT_NODES = 800;
@@ -78,7 +78,7 @@ const MAX_LAYOUT_NODES = 800;
  * 方框最大宽度：防病态长名把画布撑爆。
  *
  * 这个值必须**明显大于**「文字上限宽 + 加减号预留」，否则会把方框钳窄，
- * 文字被截断后仍顶到加减号上（曾经取 320 就踩了这个坑，实测压住 0.8px）。
+ * 文字被截断后仍顶到加减号上（曾经取 320 时出现过该问题，实测压住 0.8px）。
  * 当前文字上限约 40 字符 ≈ 300px，加两侧预留约 320，故取 400 留出余量。
  * 与 webview 里的同名常量必须保持一致。
  */
@@ -131,6 +131,28 @@ export interface PathDisplayOptions {
    */
   showFileName?: boolean;
   /**
+   * 是否把「锚点命中的那一段目录名」作为标签显示在**元素名同一行**（设置 `cppCallGraph.nameFolderTag`）。
+   *
+   * 文本形如 `[core] → `，由 `nameTagPrefixFor()` 统一生成（估宽与渲染都用它，避免两侧各写一份格式）；
+   * 关掉、或没有命中任何锚点时为 `undefined`。它只影响估宽与那一行的渲染，不参与路径文字的拼装。
+   */
+  nameFolderTag?: boolean;
+  /**
+   * 标签的**摆法**（设置 `cppCallGraph.nameFolderTagStyle`）：`arrow` = `[段] → 元素名`（默认，
+   * 用户 2026-10-14 确认的格式）；`parenAfter` / `bracketAfter` / `dotAfter` = 元素名在前、
+   * 标签以 ` (段)` / ` [段]` / ` · 段` 跟在后面。
+   */
+  nameFolderTagStyle?: NameFolderTagStyle;
+  /**
+   * 多个锚点规则同时命中时取哪一段（设置 `cppCallGraph.nameFolderTagPick`）：
+   * `first` = `pathAnchors` 里第一个命中的模式（默认）；`deepest` = 最靠文件的那段。
+   *
+   * ⚠️ 它只在「一条模式能命中**不同文字**（通配/正则/多选）、且没写 `all:`」时才改变结果：
+   * 字面量模式命中多处时几处文字一样，取哪个都一样；路径那行更是不看它（永远取最左）。
+   * 需要**逐条**指定时，在条目末尾写 `@deepest` / `@first`（见 `parsePattern`），它优先于本项。
+   */
+  nameFolderTagPick?: NameFolderTagPick;
+  /**
    * 必须显示的目录段，可任意组合多层。每条模式只保留**它自己解析出的那一段**，
    * 因此「基准目录不显示、只显示偏移出来的那一段」是天然支持的；要连基准一起显示，
    * 把它也单列一条即可。写法：
@@ -141,9 +163,16 @@ export interface PathDisplayOptions {
    *   `+N`          从工作区根数第 N 段（1 = 最左那一段）
    *   `-N`          从文件名往上数第 N 段（1 = 文件所在目录）
    *
-   * 越界或名字未命中时该条忽略（宿主会记一条警告；webview 只忽略，保持两侧输出一致）。
+   * **括号决定这个条目还兼作什么**（用户 2026-10-15 口径，也是标签的唯一来源）：
+   *   - 不带括号 `src+1` → 只进路径那行；
+   *   - 圆括号 `(src+1)` → 路径那行**与**名称行标签都要；
+   *   - 方括号 `[src+1]` → **只要标签**，不进路径那行。
+   * 括号里可以写多组（`(a)(b)` = 两个标签），末尾可加 `@deepest` / `@first` 逐条指定取值。
+   *
+   * 越界或名字未命中时该条忽略；**语法**错误会记一条警告，
+   * 「在部分路径上没命中」不算错误（多文件图上很常见），只有整个标签里一处都没命中时才提示一次。
    * 解析顺序：先按整串名字精确匹配，再按「名字 + 偏移」，最后按纯偏移 ——
-   * 这样目录名本身带 `-`（如 `chip-01`）也不会被误当成偏移。
+   * 这样目录名本身带 `-`（如 `lib-2`）也不会被误当成偏移。
    */
   anchors: string[];
 }
@@ -155,62 +184,535 @@ export const DEFAULT_PATH_OPTIONS: PathDisplayOptions = {
   anchors: [],
 };
 
+/** 编译好的段匹配正则缓存（同一批模式逐帧复用，避免每个节点都重新编译）。 */
+const globRegexCache = new Map<string, RegExp>();
+
 /**
- * 把锚点模式解析成段下标。
+ * 把通配形式的段匹配器编成正则：`*` = 任意长、`?` = 单字符，其余一律当字面量。
  *
- * @returns indexes 命中的段下标；invalid 无法解析或越界的模式（宿主据此记警告）
+ * 大小写不敏感（与既有锚点口径一致）。带缓存：同一批模式在 800 个节点上会被调用很多次。
+ */
+function globRegex(glob: string): RegExp {
+  const cached = globRegexCache.get(glob);
+  if (cached) {
+    return cached;
+  }
+  let source = '';
+  for (const character of glob) {
+    if (character === '*') {
+      source += '.*';
+    } else if (character === '?') {
+      source += '.';
+    } else {
+      source += character.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    }
+  }
+  const regex = new RegExp(`^${source}$`, 'i');
+  // 简单上限：手写几百条模式时不至于无界增长（超出就整表清掉，代价只是重新编译）
+  if (globRegexCache.size > 200) {
+    globRegexCache.clear();
+  }
+  globRegexCache.set(glob, regex);
+  return regex;
+}
+
+/**
+ * 段匹配器的解析结果。支持的段写法（`cppCallGraph.pathAnchors` 的条目用这一套，路径那行
+ * 与名称行标签共用）：
+ *
+ *   `src`              字面量（大小写不敏感）
+ *   `group_*` / `a?c`  通配：`*` 任意长、`?` 单字符
+ *   `a|b`              多选（段内，不嵌套）
+ *   `"a*b"`            引号 = **字面量**（不解释任何元字符；名字真的带 `*` `|` `(` 时用它）
+ *   `re:^group_[ab]$`  正则（整段都是正则，不参与 `|` 拆分；`+` `-` `*` 在正则里原样有效）
+ *   `**`               任意层（含 0 层）
+ */
+type SegmentSpec =
+  | { kind: 'anyDepth' }
+  | { kind: 'regex'; regex: RegExp }
+  | { kind: 'literal'; value: string }
+  | { kind: 'glob'; branches: string[] }
+  | { kind: 'invalid' };
+
+/** 解析一个段；正则写错时返回 `invalid`（调用方据此提示，而不是静默失效）。 */
+function parseSegmentSpec(raw: string): SegmentSpec {
+  const trimmed = raw.trim();
+  if (trimmed === '**') {
+    return { kind: 'anyDepth' };
+  }
+  if (trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    return { kind: 'literal', value: trimmed.slice(1, -1).toLowerCase() };
+  }
+  if (/^re:/i.test(trimmed)) {
+    try {
+      return { kind: 'regex', regex: new RegExp(trimmed.replace(/^re:/i, ''), 'i') };
+    } catch {
+      return { kind: 'invalid' };
+    }
+  }
+  const branches = trimmed
+    .split('|')
+    .map((branch) => branch.trim())
+    .filter((branch) => branch.length > 0);
+  return branches.length === 0 ? { kind: 'invalid' } : { kind: 'glob', branches };
+}
+
+/** 该段匹配器是否命中某个段名（`**` 由 `matchSpans` 单独处理，不在这里比较）。 */
+function specMatches(spec: SegmentSpec, segment: string): boolean {
+  switch (spec.kind) {
+    case 'anyDepth':
+      return true;
+    case 'literal':
+      return segment.toLowerCase() === spec.value;
+    case 'regex':
+      return spec.regex.test(segment);
+    case 'glob':
+      return spec.branches.some((branch) => globRegex(branch).test(segment));
+    default:
+      return false;
+  }
+}
+
+/** 一条模式解析后的计划。 */
+interface PatternPlan {
+  /** 原始写法（提示用）。 */
+  raw: string;
+  /** `!` 前缀：排除（任一排除模式命中该路径 → 整条路径不出锚点/标签）。 */
+  exclude: boolean;
+  /** `all:` 前缀：该模式的**所有**命中。 */
+  all: boolean;
+  /** `keep:` 前缀：命中区间整体保留（只作用于标签；路径那行会关掉它）。 */
+  keep: boolean;
+  /**
+   * 条目末尾的 `@deepest` / `@first`（可逐条指定取值，优先于设置里的 `nameFolderTagPick`）。
+   *
+   * 为什么要有它：一个全局开关没法表达「这一条取最靠文件的、那一条取第一个」——
+   * 而 `first` / `deepest` 只在模式能命中**不同文字**（通配/正则/多选）时才有区别。
+   */
+  pick?: NameFolderTagPick;
+  /** 以分隔符开头：必须从工作区根开始。 */
+  fromRoot: boolean;
+  /** 末段 `+N` / `-N`；`all:` 时每个命中各偏移。 */
+  offset: number;
+  /** 单独写的 `+N` / `-N`（没有段）：按段数定位。 */
+  pureOffset?: { sign: '+' | '-'; count: number };
+  /**
+   * 末段既能当**整段名字**、也能当「名字 ± N」时（例如 `lib-2`），这里放偏移那一种解释。
+   *
+   * ⚠️ 必须先按整段试、整段命中不了才用它 —— 这条「整段优先」是 0.22 的既有规则，
+   * 丢掉的后果是真实目录名 `lib-2` 永远匹配不上（统一匹配器时曾出现一次）。
+   */
+  offsetCandidate?: { specs: SegmentSpec[]; offset: number };
+  specs: SegmentSpec[];
+}
+
+/**
+ * 解析一条模式。语法（三层，可任意组合）：
+ *
+ *   前缀：`!`（排除）/ `all:`（所有命中）/ `keep:`（整段保留）—— 顺序任意、可叠加
+ *   段：见 `SegmentSpec`；`父/名字` 要求这些段**连续出现**，以 `/` 开头要求从工作区根开始
+ *   偏移：末尾 `+N` / `-N`；单独写 `+N` / `-N` 表示「从根数第 N 段 / 从文件名往上第 N 段」
+ *   取值：末尾 `@deepest` / `@first`（只影响标签；逐条覆盖 `nameFolderTagPick`）
+ *
+ * ⚠️ 末段是正则（`re:`）或引号段时不解析偏移：`re:a+1`、`"a+1"` 里的 `+1` 是内容而不是偏移。
+ * 同理 `@deepest` 也不解析：目录名真的叫 `x@deepest` 时把它整体加引号即可。
+ */
+function parsePattern(raw: string): PatternPlan | undefined {
+  let text = String(raw ?? '').trim();
+  if (text.length === 0) {
+    return undefined;
+  }
+  let exclude = false;
+  if (text.startsWith('!')) {
+    exclude = true;
+    text = text.slice(1).trim();
+  }
+  let all = false;
+  let keep = false;
+  for (;;) {
+    if (/^all:/i.test(text)) {
+      all = true;
+      text = text.replace(/^all:/i, '').trim();
+      continue;
+    }
+    if (/^keep:/i.test(text)) {
+      keep = true;
+      text = text.replace(/^keep:/i, '').trim();
+      continue;
+    }
+    break;
+  }
+  if (text.length === 0) {
+    return undefined;
+  }
+  // 整体加引号 = 一条**字面量路径**：各段按字面量匹配，并整段一起显示（等价 keep:）
+  if (isWhollyQuoted(text)) {
+    const specs = quoteEachSegment(text).split('/').map(parseSegmentSpec);
+    return { raw, exclude, all, keep: true, fromRoot: false, offset: 0, specs };
+  }
+  // 逐条的取值后缀（`@deepest` / `@first`）：只影响标签，且优先于设置里的 nameFolderTagPick。
+  // ⚠️ 必须排在 isWhollyQuoted **之后** —— 否则 `"x@deepest"` 这种字面量名字会被切掉后缀。
+  let pick: NameFolderTagPick | undefined;
+  const pickSuffix = /@(deepest|first)$/i.exec(text);
+  if (pickSuffix) {
+    pick = pickSuffix[1].toLowerCase() === 'deepest' ? 'deepest' : 'first';
+    text = text.slice(0, text.length - pickSuffix[0].length).trim();
+    if (text.length === 0) {
+      return undefined;
+    }
+  }
+  // 单独写的偏移：没有段，按段数定位
+  const plain = /^([+-])(\d+)$/.exec(text.replace(/^[\\/]+/, ''));
+  if (plain) {
+    return {
+      raw,
+      exclude,
+      all,
+      keep,
+      fromRoot: false,
+      offset: 0,
+      pureOffset: { sign: plain[1] === '-' ? '-' : '+', count: Number.parseInt(plain[2], 10) },
+      // ⚠️ 字面解释**也要留着**：真的存在名为 `+3` 的目录时必须先按整段命中
+      //（与 `lib-2` 同一条「整段优先」规则，见 offsetCandidate）。
+      specs: [parseSegmentSpec(text)],
+      pick,
+    };
+  }
+  const fromRoot = /^[\\/]/.test(text);
+  const body = text.replace(/^[\\/]+/, '');
+  const segments = body.split(/[\\/]/);
+  const lastIndex = segments.length - 1;
+  const last = segments[lastIndex].trim();
+  const canOffset = last !== '**' && !/^re:/i.test(last) && !isWhollyQuoted(last);
+  const named = canOffset ? /^(.+?)([+-])(\d+)$/.exec(last) : null;
+  // 先把**整段**当名字（`lib-2` 是真实目录名，不能一开始就当成「mods 减 1」）；
+  // 整段命中不了时才退回「名字 + 偏移」这一种解释（见 PatternPlan.offsetCandidate）。
+  const specs = segments.map(parseSegmentSpec);
+  if (!named) {
+    return { raw, exclude, all, keep, fromRoot, offset: 0, specs, pick };
+  }
+  const offsetSegments = segments.slice();
+  offsetSegments[lastIndex] = named[1];
+  return {
+    raw,
+    exclude,
+    all,
+    keep,
+    fromRoot,
+    offset: 0,
+    specs,
+    pick,
+    offsetCandidate: {
+      specs: offsetSegments.map(parseSegmentSpec),
+      offset: Number.parseInt(named[3], 10) * (named[2] === '-' ? -1 : 1),
+    },
+  };
+}
+
+/**
+ * 在一条路径的段表上匹配一条模式，返回命中**区间**。
+ *
+ * - 非 `keep:`：区间只有一个元素（锚点段）；
+ * - `keep:`：区间 = 首个命中段…锚点段（含 `**` 跨过的中间段），用于整段保留显示；
+ * - `all:`：收集**全部**命中；否则只取最左一个；
+ * - `**`：匹配任意层（含 0 层）。写法上它自己占一段，例如「`**` 后接 `/se`」表示任意层里的 se，
+ *   「`a` 后接 `/**`」表示 a 以下的任意层，中间夹一层也可以（`a` 后接 `/**` 再接 `/se`）。
+ *   ⚠️ 文档里不能直接写连在一起的星号加斜杠：那会提前结束块注释（本项目曾出现过一次）。
+ */
+function matchSpansOnce(parts: string[], plan: PatternPlan): number[][] {
+  // 纯偏移只在「没有段」时生效：带段的模式要走下面的匹配（`+3` 可能真的是目录名）
+  if (plan.pureOffset && plan.specs.length === 0) {
+    const { sign, count } = plan.pureOffset;
+    // `+N` 从根数（1 = 最左一段）；`-N` 从文件名往上数（1 = 文件所在目录）
+    const index = sign === '+' ? count - 1 : parts.length - 2 - (count - 1);
+    return index >= 0 && index < parts.length ? [[index]] : [];
+  }
+  const specs = plan.specs;
+  if (specs.length === 0 || parts.length === 0) {
+    return [];
+  }
+  const spans: number[][] = [];
+  const seen = new Set<string>();
+  const record = (first: number, last: number): void => {
+    if (last < 0) {
+      return; // 整条模式只由 `**` 组成：没有可锚定的段
+    }
+    const anchor = last + plan.offset;
+    if (anchor < 0 || anchor >= parts.length) {
+      return;
+    }
+    const start = first + plan.offset;
+    if (plan.keep && start < 0) {
+      return;
+    }
+    const span: number[] = [];
+    if (plan.keep) {
+      for (let index = start; index <= anchor; index += 1) {
+        span.push(index);
+      }
+    } else {
+      span.push(anchor);
+    }
+    const key = span.join(',');
+    if (!seen.has(key)) {
+      seen.add(key);
+      spans.push(span);
+    }
+  };
+  const walk = (specIndex: number, pathIndex: number, first: number, last: number): void => {
+    if (!plan.all && spans.length > 0) {
+      return; // 只要最左一个：第一个命中就收工
+    }
+    if (specIndex === specs.length) {
+      record(first, last);
+      return;
+    }
+    const spec = specs[specIndex];
+    if (spec.kind === 'anyDepth') {
+      // `**` 匹配 0..N 段：从当前位置起逐个试（含“一段都不吃”）
+      for (let next = pathIndex; next <= parts.length; next += 1) {
+        walk(specIndex + 1, next, first, last);
+        if (!plan.all && spans.length > 0) {
+          return;
+        }
+      }
+      return;
+    }
+    if (pathIndex >= parts.length || !specMatches(spec, parts[pathIndex])) {
+      return;
+    }
+    walk(specIndex + 1, pathIndex + 1, first < 0 ? pathIndex : first, pathIndex);
+  };
+  const starts = plan.fromRoot ? [0] : parts.map((_part, index) => index);
+  for (const start of starts) {
+    walk(0, start, -1, -1);
+    if (!plan.all && spans.length > 0) {
+      break;
+    }
+  }
+  return spans;
+}
+
+/**
+ * 匹配一条模式：**先按整段名字试**，整段命中不了才退回「名字 ± N」那一种解释。
+ *
+ * 这条顺序是 0.22 的既有规则（`lib-2` 这类真实目录名不能被当成「mods 减 1」），
+ * 统一匹配器时必须显式保留 —— 解析阶段无法判断该用哪种解释，只有匹配结果能。
+ */
+function matchSpans(parts: string[], plan: PatternPlan): number[][] {
+  const primary = matchSpansOnce(parts, plan);
+  if (primary.length > 0) {
+    return primary;
+  }
+  if (plan.offsetCandidate) {
+    const retry = matchSpansOnce(parts, {
+      ...plan,
+      specs: plan.offsetCandidate.specs,
+      offset: plan.offsetCandidate.offset,
+      offsetCandidate: undefined,
+    });
+    if (retry.length > 0) {
+      return retry;
+    }
+  }
+  if (plan.pureOffset) {
+    // 最后才把 `+N` / `-N` 当偏移：真的存在同名目录时上面已经命中了
+    return matchSpansOnce(parts, { ...plan, specs: [], offset: 0, offsetCandidate: undefined });
+  }
+  return primary;
+}
+
+/** 该路径是否被**任一排除模式**（`!...`）命中；命中则整条路径不出任何锚点/标签。 */
+function isPathExcluded(parts: string[], plans: readonly PatternPlan[]): boolean {
+  return plans.some(
+    (plan) => plan.exclude && matchSpans(parts, { ...plan, all: true, keep: false }).length > 0
+  );
+}
+
+/**
+ * 逐条模式给出命中区间（标签链路用：**一条模式可能出多个标签**，所以不能把各模式合并）。
+ *
+ * @param keepEnabled 路径那行传 `false`：`keep:` 在那里不生效（区间被拍平成单段），
+ *   因为路径那行本来就靠列举相邻锚点显示多段（`LIB` + `LIB+1`），否则同一写法在两条链路里
+ *   语义就不同了 —— 这条有断言钉住。
+ */
+function planAnchorPatterns(
+  parts: string[],
+  patterns: readonly string[],
+  keepEnabled = true,
+  collectAll = false
+): {
+  groups: Array<{ raw: string; all: boolean; pick?: NameFolderTagPick; spans: number[][] }>;
+  invalid: string[];
+  unmatched: string[];
+  excluded: boolean;
+} {
+  const invalid: string[] = [];
+  const unmatched: string[] = [];
+  const plans: PatternPlan[] = [];
+  for (const pattern of patterns) {
+    const text = String(pattern ?? '').trim();
+    if (text.length === 0) {
+      continue;
+    }
+    const plan = parsePattern(text);
+    if (!plan || plan.specs.some((spec) => spec.kind === 'invalid')) {
+      invalid.push(text);
+      continue;
+    }
+    plans.push(plan);
+  }
+  // 排除优先：任一排除模式命中，这条路径就整体作废
+  if (isPathExcluded(parts, plans)) {
+    return { groups: [], invalid, unmatched, excluded: true };
+  }
+  const groups: Array<{ raw: string; all: boolean; pick?: NameFolderTagPick; spans: number[][] }> = [];
+  for (const plan of plans) {
+    if (plan.exclude) {
+      continue;
+    }
+    // `collectAll`：标签链路先**收齐所有命中**，再由 `all:` / `@deepest` / `nameFolderTagPick`
+    // 决定取几个。否则匹配阶段已经砍到最左一个，`deepest`（最靠文件）就成了空设置。
+    // 路径那行不传它：那里一直是「只保留最左一个」，行为不变。
+    const spans = matchSpans(parts, {
+      ...plan,
+      // ⚠️ `keepEnabled ? plan.keep : false`：传 `keepEnabled` 表示「尊重计划里的 keep」，
+      // 不是「强制 keep」—— 写成 `keep: keepEnabled` 会让所有上下文模式都整段保留。
+      keep: keepEnabled ? plan.keep : false,
+      all: collectAll ? true : plan.all,
+    });
+    if (spans.length === 0) {
+      // ⚠️ 「这条路径上没有该段」**不是**错误：一张图上只要有一个文件不含它就会走到这里。
+      // 真正的语法错误在上面（`invalid`）就分开了；「整个标签里一处都没命中」由
+      // `unmatchedAnchorPatterns()` 在会话这一层统一报一次（见 graphView.buildPayload）。
+      unmatched.push(plan.raw);
+      continue;
+    }
+    groups.push({ raw: plan.raw, all: plan.all, pick: plan.pick, spans });
+  }
+  return { groups, invalid, unmatched, excluded: false };
+}
+
+/**
+ * 该条目属于哪种括号语义（用户 2026-10-15 口径，**也是标签的唯一来源**）：
+ *
+ *   - **圆括号** `(src+1)` / `（src）` → `'both'`：**路径那行与名称行都要**（既当锚点又当标签）；
+ *   - **方括号** `[src+1]` / `【src】` → `'tagOnly'`：**只要标签**，**不进路径那行**
+ *     （不想让同一个目录在两处各出现一次时用它）；
+ *   - 不带括号 → `undefined`：只进路径那行。
+ *
+ * 与 `parseTagPatterns` 认的四种括号保持一致。
+ */
+export function tagEntryKind(raw: string): 'both' | 'tagOnly' | undefined {
+  const text = String(raw ?? '').trim();
+  if (text.length < 3) {
+    return undefined;
+  }
+  const first = text[0];
+  const last = text[text.length - 1];
+  if ((first === '(' && last === ')') || (first === '（' && last === '）')) {
+    return 'both';
+  }
+  if ((first === '[' && last === ']') || (first === '【' && last === '】')) {
+    return 'tagOnly';
+  }
+  return undefined;
+}
+
+/** 该条目会不会产生标签（圆括号与方括号都会）。 */
+export function isTagEntry(raw: string): boolean {
+  return tagEntryKind(raw) !== undefined;
+}
+
+/** 该条目是否**只**当标签（方括号）：路径那行要把它排除掉。 */
+export function isTagOnlyEntry(raw: string): boolean {
+  return tagEntryKind(raw) === 'tagOnly';
+}
+
+/**
+ * 把锚点模式解析成段下标（**路径那行**用）。
+ *
+ * ⚠️ 入参应当是**已经剥过括号**的条目（`pathOnlyAnchorPatterns()` 的结果）：
+ * 宿主下发给面板的就是那一份，两侧因此拿到同样的模式；把带括号的原文丢进来，
+ * 方括号会被当成字面段名、圆括号条目也匹配不上（这正是 `pathOnlyAnchorPatterns` 要解决的问题）。
+ *
+ * ⚠️ `keep:` 在这里**不生效**（区间被拍平成单段）：路径那行本来就靠列举相邻锚点显示多段
+ * （`LIB` + `LIB+1`），若这里也整段保留，同一写法在两条链路里的语义就不同了。有断言钉住。
+ *
+ * @returns indexes 命中的段下标；invalid **语法**上无法解析的模式
+ *   （「这条路径上没有该段」不算错误，见 `unmatchedAnchorPatterns`）
  */
 export function resolveAnchorIndexes(
   parts: string[],
   patterns: readonly string[]
 ): { indexes: Set<number>; invalid: string[] } {
+  const { groups, invalid } = planAnchorPatterns(parts, pathOnlyAnchorPatterns(patterns), false);
   const indexes = new Set<number>();
-  const invalid: string[] = [];
-  for (const raw of patterns) {
-    const pattern = String(raw ?? '').trim();
-    if (!pattern) {
-      continue;
-    }
-    const lower = parts.map((part) => part.toLowerCase());
-    // ① 整串就是一个真实目录名（优先，避免 `chip-01` 被当成偏移）
-    const exact = lower.indexOf(pattern.toLowerCase());
-    if (exact >= 0) {
-      indexes.add(exact);
-      continue;
-    }
-    // ② 名字 + 偏移
-    const named = /^(.+?)([+-])(\d+)$/.exec(pattern);
-    if (named) {
-      const base = lower.indexOf(named[1].toLowerCase());
-      if (base < 0) {
-        invalid.push(pattern);
-        continue;
-      }
-      const offset = Number.parseInt(named[3], 10) * (named[2] === '-' ? -1 : 1);
-      const index = base + offset;
-      if (index >= 0 && index < parts.length) {
+  for (const group of groups) {
+    for (const span of group.spans) {
+      for (const index of span) {
         indexes.add(index);
-      } else {
-        invalid.push(pattern);
       }
-      continue;
     }
-    // ③ 纯偏移
-    const plain = /^([+-])(\d+)$/.exec(pattern);
-    if (plain) {
-      const count = Number.parseInt(plain[2], 10);
-      // `+N` 从根数（1 = 最左一段）；`-N` 从文件名往上数（1 = 文件所在目录）
-      const index = plain[1] === '+' ? count - 1 : parts.length - 2 - (count - 1);
-      if (index >= 0 && index < parts.length) {
-        indexes.add(index);
-      } else {
-        invalid.push(pattern);
-      }
-      continue;
-    }
-    invalid.push(pattern);
   }
   return { indexes, invalid };
+}
+
+/**
+ * 把设置里的条目换算成**只给路径那行用**的模式列表。
+ *
+ * 两件事：① 丢掉方括号条目（`[src]` = 只要标签，不进路径那行）；
+ * ② 把圆括号条目剥掉括号（`(src+1)` = 两处都要 → 路径这边就是 `src+1`）。
+ * 同一条条目里的多组括号会展开成多条（`(a)(b)` → `a`、`b`）。
+ *
+ * ⚠️ **这个函数是「两侧一致」的关键一环**：宿主把它的结果随 `settings` 消息下发给面板
+ * （见 `graphView.settingsPayload()`），面板因此不需要、也不应该再懂括号。
+ * 早期版本只有宿主这一侧做预处理、面板拿到的是带括号的原文，于是
+ * `pathAnchors: "(LIB)"` 在面板上那一行根本不保留 LIB —— 两侧算出的路径文字不一致
+ * （renderCheck 的跨侧等值断言抓到的正是这一条）。
+ */
+export function pathOnlyAnchorPatterns(entries: readonly string[]): string[] {
+  return entries
+    .filter((entry) => !isTagOnlyEntry(entry))
+    .flatMap((entry) => (isTagEntry(entry) ? parseTagPatterns(entry) : [String(entry ?? '').trim()]))
+    .filter((entry) => entry.length > 0);
+}
+
+/**
+ * 这批锚点模式里，哪些**在给出的所有路径上一处都没命中**（会话级诊断用）。
+ *
+ * 为什么要单独做这个判断：命中与否是**逐路径**算的（`displayPathText` 每次只看到一条路径），
+ * 一张图上只要有一个文件不含某段就会「未命中」——在那里报「无法解析或越界」是误报。
+ * 真正的语法错误由 `invalid` 单独报；只有**全都没有命中**才说明用户白写了这一条。
+ *
+ * 入参是**去重后**的路径（同一文件的多个节点只需检查一次），因此开销与文件数成正比。
+ */
+export function unmatchedAnchorPatterns(
+  files: readonly string[],
+  options: PathDisplayOptions
+): string[] {
+  const patterns = pathOnlyAnchorPatterns(options.anchors);
+  if (patterns.length === 0 || files.length === 0) {
+    return [];
+  }
+  const matched = new Set<string>();
+  for (const file of files) {
+    const segments = file.split(/[\\/]/).filter((part) => part.length > 0);
+    if (segments.length <= 1) {
+      continue;
+    }
+    const dirs = options.showFileName === false ? segments.slice(0, -1) : segments;
+    const parts = dirs.length > 0 ? dirs : segments;
+    const { groups } = planAnchorPatterns(parts, patterns, false);
+    for (const group of groups) {
+      matched.add(group.raw);
+    }
+    if (matched.size >= patterns.length) {
+      break;
+    }
+  }
+  // 命中的是「剥壳后」的写法，提示时回原样更容易对照设置
+  return patterns.filter((pattern) => !matched.has(pattern));
 }
 
 /** 已经警告过的锚点模式：逐帧重排时同一个错别字只提示一次。 */
@@ -276,10 +778,10 @@ function assemblePath(parts: string[], anchors: Set<number>, tailCount: number):
 /**
  * 按设置把一条路径变成方框里显示的文字。
  *
- * - `full`：整条放得下就用整条；放不下则保留**首尾**（首部正是能区分 chip/board 的那几段，
- *   尾部是文件名），完整路径始终在悬停提示里。
- * - `tail`：末尾窗口（固定层数，或 `tailLevels = 0` 时按字符预算）+ 锚点段；
- *   锚点**优先保留**，窗口放不下时先缩窗口，实在放不下才退回保留首尾。
+ * - `full`：整条原样显示（不截断，方框按完整路径加宽）。
+ * - `tail`：末尾窗口（固定层数，或 `tailLevels = 0` 时按字符预算，即 0.20 的行为）+ 锚点段；
+ *   自动档会为了塞进预算而缩窗口（显式给了层数或锚点时一律完整显示 —— 0.22 起没有宽度上限，
+ *   靠方框加宽来容纳，不再截断）。
  */
 export function displayPathText(
   file: string,
@@ -305,15 +807,11 @@ export function displayPathText(
 
   const resolved = resolveAnchorIndexes(parts, options.anchors);
   const anchors = resolved.indexes;
-  // 写错的锚点模式要出声，否则用户只会看到"设置没反应"；同一模式只提示一次
-  for (const pattern of resolved.invalid) {
-    if (!warnedAnchorPatterns.has(pattern)) {
-      warnedAnchorPatterns.add(pattern);
-      logWarn(
-        `路径锚点「${pattern}」无法解析或越界，已忽略。写法：目录名 / 目录名+N / 目录名-N / +N（从根数）/ -N（从文件名往上数）。`
-      );
-    }
-  }
+  // ⚠️ 这里只报**语法**错误（正则写错、条目只剩偏移之类）。
+  // 「这条路径上没有那个段」**不是**错误 —— 一张图上只要有一个文件不含它就会走到那条分支，
+  // 早期版本把两者混在一起报「无法解析或越界」，于是在正常的图上也会刷出误导警告。
+  // 「整个标签里一处都没命中」由 `unmatchedAnchorPatterns()` 在会话这一层统一报一次。
+  warnInvalidAnchorPatterns(resolved.invalid, '路径锚点');
 
   let tailCount =
     options.tailLevels > 0 ? Math.min(options.tailLevels, parts.length) : budgetTailCount(parts, max);
@@ -327,6 +825,264 @@ export function displayPathText(
   }
   // 一律返回拼好的文字，**不截断**：长度超出预算时由方框加宽来容纳。
   return assemblePath(parts, anchors, tailCount);
+}
+
+/** 名称行标签里，标签与元素名之间的分隔符（用户 2026-10-14 指定：标签在前）。 */
+export const NAME_TAG_SEPARATOR = '→';
+
+/**
+ * 按分隔符拆分，但**引号内不拆**。
+ *
+ * 用途：设置项里的模式用逗号分隔，而目录名/文件名真的可能带逗号（`"a,b"` 这种写法），
+ * 直接把整串 `split(',')` 会把一个模式切成两个、两个都匹配不上（表现为「设置没反应」）。
+ */
+export function splitQuoted(text: string, separator: string): string[] {
+  const parts: string[] = [];
+  let current = '';
+  let inQuote = false;
+  for (const character of text) {
+    if (character === '"') {
+      inQuote = !inQuote;
+      current += character;
+      continue;
+    }
+    if (!inQuote && character === separator) {
+      parts.push(current);
+      current = '';
+      continue;
+    }
+    current += character;
+  }
+  parts.push(current);
+  return parts;
+}
+
+/** 整串是否被一对引号包住（引号内允许有分隔符，表示一条**字面量路径**）。 */
+export function isWhollyQuoted(text: string): boolean {
+  const trimmed = text.trim();
+  return trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"');
+}
+
+/**
+ * 把 `"aa/se"` 展开成 `"aa"/"se"`：每一段各自按**字面量**匹配。
+ *
+ * 这样「整体加引号」就能复用上下文匹配器，不必再写一套字面量路径匹配。
+ */
+export function quoteEachSegment(text: string): string {
+  return text
+    .trim()
+    .slice(1, -1)
+    .split(/[\\/]/)
+    .filter((segment) => segment.length > 0)
+    .map((segment) => `"${segment}"`)
+    .join('/');
+}
+
+/**
+ * 把设置里的模式文本拆成**多条**模式：**一组括号算一条**，没写括号时整串算一条。
+ *
+ * 用户 2026-10-14 口径：「支持加多个标签，数量按括号数量来」——
+ * 于是 `(lib)(lib+1)` 是两个标签，`lib+1` 仍是一个标签。
+ *
+ * 容忍四种括号（半角圆/方、全角圆/方/花），因为这一项的显示形态就是一对括号，
+ * 用户很自然会连着括号一起写；只认裸模式的话 `(lib+1)` 会**静默匹配不到**（表现为「设置没反应」）。
+ * 没写括号时再按逗号拆一次，与 `pathAnchors` 的手感保持一致。
+ *
+ * ⚠️ 括号扫描与逗号拆分都是**引号感知**的（`("se(1)")`、`"a,b"` 里的括号/逗号不算语法）。
+ */
+export function parseTagPatterns(raw: string | undefined): string[] {
+  const text = (raw ?? '').trim();
+  if (text.length === 0) {
+    return [];
+  }
+  const groups: string[] = [];
+  let current = '';
+  let depth = 0;
+  let inQuote = false;
+  /** 括号之外、逗号分隔的零散写法（`(a) lib` 里的 `lib`）也要当一组，不能丢。 */
+  const flushBare = (): void => {
+    if (depth === 0 && current.trim().length > 0) {
+      groups.push(current.trim());
+    }
+    current = '';
+  };
+  for (const character of text) {
+    if (character === '"') {
+      inQuote = !inQuote;
+      current += character;
+      continue;
+    }
+    if (character === ',' && !inQuote && depth === 0) {
+      flushBare();
+      continue;
+    }
+    // ⚠️ 括号集必须与 `tagEntryKind` **完全一致**（四种括号）：
+    // 多认一种（例如曾经还认 `{}`）会让 `{src}` 在标签链路里生效、在 `tagEntryKind` 那里
+    // 又不算标签，用户看到的是「同一个写法换个位置就不灵」。
+    if (!inQuote && '([（【'.includes(character)) {
+      depth += 1;
+      // 第一层括号只是分组标记，不进内容；嵌套的括号按字面量保留
+      if (depth > 1) {
+        current += character;
+      }
+      continue;
+    }
+    if (!inQuote && ')]）】'.includes(character)) {
+      if (depth > 0) {
+        depth -= 1;
+        if (depth === 0) {
+          groups.push(current.trim());
+          current = '';
+          continue;
+        }
+      }
+      current += character;
+      continue;
+    }
+    current += character;
+  }
+  flushBare();
+  return groups.filter((value) => value.length > 0);
+}
+
+/**
+ * 从命中下标里按 `nameFolderTagPick` 选一个。
+ *
+ * ⚠️ `indexes` 是 Set<number>，**按模式书写顺序插入**：`first` 取第一个元素就是
+ * 「pathAnchors 里第一个命中的模式」（用户 2026-10-14 选定），**不要**改成 Math.min ——
+ * 那是 `shallowest`（最靠根的一段），与 `first` 是两种不同口径。
+ */
+function pickAnchorIndex(indexes: number[], pick: NameFolderTagPick | undefined): number {
+  // `deepest` = 最靠文件的那一个；其余（含未设置）都取最左一个。
+  // （曾经还有 `shallowest`，它与 `first` 对同一条模式完全等价，已删除以免留下冗余取值。）
+  if (pick === 'deepest') {
+    return Math.max(...indexes);
+  }
+  return indexes[0];
+}
+
+/**
+ * 多个命中**区间**里按 `nameFolderTagPick` 选一个：比较的是区间**末段**（锚点）的下标。
+ *
+ * `keep:` 时一个命中是多段区间，此时 `first` / `deepest` / `shallowest` 仍按锚点判断，
+ * 与不写 `keep:` 时的选择结果一致（否则同一批候选会因为保留整段而换一个命中）。
+ */
+function pickSpanIndex(spans: number[][], pick: NameFolderTagPick | undefined): number {
+  const anchors = spans.map((span) => span[span.length - 1]);
+  return Math.max(0, anchors.indexOf(pickAnchorIndex(anchors, pick)));
+}
+
+/** 写错的锚点模式要出声（与 `displayPathText` 同一口径），否则用户只看到「设置没反应」。 */
+function warnInvalidAnchorPatterns(invalid: readonly string[], where: string): void {
+  for (const pattern of invalid) {
+    if (!warnedAnchorPatterns.has(pattern)) {
+      warnedAnchorPatterns.add(pattern);
+      logWarn(
+        `${where}「${pattern}」写法无法解析（正则不合法，或条目只剩偏移），已忽略。` +
+          `写法：目录名 / 目录名+N / 目录名-N / +N（从根数）/ -N（从文件名往上数）` +
+          `/ re:正则 / "字面量" / 前缀 all: 、keep: 、! 。`
+      );
+    }
+  }
+}
+
+/**
+ * 锚点命中的**那些**目录名（设置 `cppCallGraph.nameFolderTag` 的标签文字）。
+ *
+ * 与 `displayPathText` 同口径：同一套分段、同一个 `showFileName` 处理、同一套模式解析
+ * （见 `parsePattern`）。模式来源**只有一处**：`anchors` 里整体带括号的条目
+ * （`(src)` / `[src]`，一组括号一个标签）。
+ *
+ * 每条模式出一个标签，`all:` 时该模式的**每个**命中各出一个；`keep:` 时标签是整个命中区间
+ * （`aa/se`）；一条模式命中多处时取哪一个由条目后缀 `@deepest` / `@first`
+ * （或设置里的 `nameFolderTagPick`）决定。没有任何命中、或该路径被 `!` 排除时返回空数组。
+ */
+export function anchorTagTexts(
+  file: string,
+  options: PathDisplayOptions = DEFAULT_PATH_OPTIONS
+): string[] {
+  const segments = file.split(/[\\/]/).filter((part) => part.length > 0);
+  if (segments.length <= 1) {
+    return [];
+  }
+  // 与 displayPathText 完全一致：关掉文件名时先摘掉最后一段（文件名）
+  const dirs = options.showFileName === false ? segments.slice(0, -1) : segments;
+  const parts = dirs.length > 0 ? dirs : segments;
+  // 标签的模式来源**只有一处**（用户 2026-10-15 的口径：同一个设置里用括号区分）：
+  // `pathAnchors` 里整体带括号的条目 —— 圆括号 `(src+1)` = 路径与标签两处都要、
+  // 方括号 `[src+1]` = 只要标签。原先那个「标签专用」的独立设置（`nameFolderTagPattern`）
+  // 能力与 `[..]` 完全重合，已合并掉：两处都写只会让同一件事有两个入口。
+  const inline = options.anchors
+    .filter((entry) => isTagEntry(entry))
+    .flatMap((entry) => parseTagPatterns(entry));
+  if (inline.length === 0) {
+    return [];
+  }
+  // 标签链路**收齐全部命中**再挑（`collectAll = true`），这样 `@deepest` / `nameFolderTagPick`
+  // 才有意义；路径那行继续「只保留最左一个」，两项互不影响。
+  const { groups, invalid, excluded } = planAnchorPatterns(parts, inline, true, true);
+  warnInvalidAnchorPatterns(invalid, '名称行标签的锚点模式');
+  if (excluded) {
+    return [];
+  }
+  const texts: string[] = [];
+  for (const group of groups) {
+    // 一条模式（一组括号）：`all:` 时每个命中各出一个标签，否则按 `@deepest` / `@first`
+    // （条目后缀）或设置里的 `nameFolderTagPick` 选一个。
+    const spans = group.all
+      ? group.spans
+      : [group.spans[pickSpanIndex(group.spans, group.pick ?? options.nameFolderTagPick)]];
+    for (const span of spans) {
+      texts.push(span.map((index) => parts[index]).join('/'));
+    }
+  }
+  return texts;
+}
+
+/** 单个标签的便捷形式（多条时取第一条）：留给只需要一处的调用方与断言。 */
+export function anchorTagText(
+  file: string,
+  options: PathDisplayOptions = DEFAULT_PATH_OPTIONS
+): string | undefined {
+  return anchorTagTexts(file, options)[0];
+}
+
+/** 名称行标签的摆法（设置 `cppCallGraph.nameFolderTagStyle`）。 */
+export type NameFolderTagStyle = 'arrow' | 'parenAfter' | 'bracketAfter' | 'dotAfter';
+
+/** 一条模式命中多个段时取哪一个（设置 `cppCallGraph.nameFolderTagPick`）。 */
+export type NameFolderTagPick = 'first' | 'deepest';
+
+/**
+ * 名称行标签的两段文字：`arrow` 只用 `prefix`（`[core] → `），三种后置摆法只用 `suffix`。
+ * 开关关闭、或没有命中任何锚点时返回 `undefined` —— 这时不显示任何标签。
+ *
+ * 为什么由宿主生成**已经格式化好**的文字、而不是把目录段发给 webview 让它自己拼：
+ * 格式只有一处定义，两侧就不可能各写一份而慢慢分叉；估宽与实际渲染用的也是同一个字符串。
+ */
+export function nameTagPartsFor(
+  file: string,
+  options: PathDisplayOptions = DEFAULT_PATH_OPTIONS
+): { prefix?: string; suffix?: string } | undefined {
+  if (options.nameFolderTag !== true) {
+    return undefined;
+  }
+  const tags = anchorTagTexts(file, options);
+  if (tags.length === 0) {
+    return undefined;
+  }
+  switch (options.nameFolderTagStyle ?? 'arrow') {
+    // 多条标签按顺序并列（用户 2026-10-14 口径：数量按括号数量来）：
+    // `[LIB] [core] → 元素名` / `元素名 (LIB) (core)`。单条时的文字与 8.10.5 逐字一致。
+    case 'parenAfter':
+      return { suffix: tags.map((tag) => ` (${tag})`).join('') };
+    case 'bracketAfter':
+      return { suffix: tags.map((tag) => ` [${tag}]`).join('') };
+    case 'dotAfter':
+      return { suffix: tags.map((tag) => ` · ${tag}`).join('') };
+    default:
+      return { prefix: `${tags.map((tag) => `[${tag}]`).join(' ')} ${NAME_TAG_SEPARATOR} ` };
+  }
 }
 
 /** 一段文字的「宽度毫数」（每 1000 毫 = 1 倍字号）。
@@ -362,7 +1118,12 @@ export function estimateBoxWidth(
   pathOptions: PathDisplayOptions = DEFAULT_PATH_OPTIONS
 ): number {
   // 名称一律用全名：0.22 起不许从中间截断（长度由方框宽度去容纳）
-  const nameText = `${node.isCycle ? '↻ ' : ''}${node.name}`;
+  // 名称行可能带路径标签（设置 `cppCallGraph.nameFolderTag`）：四种摆法里两种加在前面、
+  // 两种加在后面，所以两段都要算进名称宽 —— 否则列位置按窄的排、标签会压到加减号那一带。
+  const nameTag = nameTagPartsFor(node.file, pathOptions);
+  const nameText =
+    `${nameTag?.prefix ?? ''}${node.isCycle ? '↻ ' : ''}${node.name}` +
+    `${nameTag?.suffix ?? ''}`;
   const nameWidth = (textWidthMilli(nameText) * 13) / 1000;
   const locText = showLocation
     ? `${displayPathText(node.file, pathOptions, LOC_MAX_CHARS)}:${node.line}`
@@ -456,7 +1217,7 @@ export function createLayout(
     /**
      * 沿 parent 上溯到第一个有方框的祖先（被丢弃的节点自己没有方框，计数记在它头上看不到）。
      *
-     * ⚠️ 必须**记忆化 + 路径压缩**：不做的话每个被丢弃节点都要走上溯一遍，深链上总代价近似
+     * ⚠️ 必须**记忆化 + 路径压缩**：不做的话每个被丢弃节点都要上溯一次，深链上总代价近似
      * O(深度²) —— 实测 1000 层 4.9ms、2000 层 47.6ms（压测里唯一超线性的一项）。
      */
     const nearestPlacedCache = new Map<string, string | undefined>();

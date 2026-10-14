@@ -136,7 +136,7 @@ function findCodiconFont() {
 /**
  * Windows：从注册表读出 VS Code 的安装目录，覆盖「装在非默认盘符」的情况。
  *
- * 实现要点（都踩过）：
+ * 实现要点（均曾出错）：
  *   1. 不能用固定键名——用户级安装的键是 GUID，如
  *      HKCU\...\Uninstall\{771FD6B0-FA20-440A-A002-3B3BAC16DC50}_is1
  *   2. `reg query <root> /s /f "Visual Studio Code"` 实测抓不到该键，

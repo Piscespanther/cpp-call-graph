@@ -3,9 +3,23 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      导出 PNG 要在 webview 里把序列化后的 SVG 交给 `new Image()` 栅格化，所以 CSP 必须
+      放行图像来源：`img-src blob: data:`。`default-src 'none'` 会让 img-src 回退成 none，
+      那样图像加载会被**静默**拦下（表现是导出没有任何反应）。
+
+      两条来源各有用途，都不能去掉：
+        - `blob:` 是**主路径**（`URL.createObjectURL(new Blob([...]))`）。原因：Chromium
+          对 URL 长度有硬上限 **2 MB**（`url::kMaxURLChars = 2 * 1024 * 1024`），而大图的
+          SVG 序列化后就是 2 MB 量级（真机实测 276 个节点 = 2154007 字节），base64 之后
+          约 2.87 MB —— 超长 data URL 会被截断/判为非法，`new Image()` 直接走 `onerror`，
+          小图却一切正常。blob URL 只是一个短字符串，不受该上限约束。
+        - `data:` 保留作**后备**：blob 加载失败时用 `data:image/svg+xml;base64,…` 再试一次
+          （小图仍可成功，也覆盖 `createObjectURL` 不可用的环境）。
+    -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; style-src {{cspSource}} 'unsafe-inline'; script-src 'nonce-{{nonce}}';"
+      content="default-src 'none'; img-src blob: data:; style-src {{cspSource}} 'unsafe-inline'; script-src 'nonce-{{nonce}}';"
     />
     <title>调用关系图</title>
   </head>
@@ -40,12 +54,24 @@
           <path d="M11.84 10.13 Q12 10.29 12 10.51 L11.84 10.83 L8.37 14.35 Q8.21 14.51 8 14.51 L7.63 14.35 L4.16 10.83 Q4 10.72 4 10.51 Q4.27 9.97 4.48 9.97 L4.85 10.13 L8 13.28 L11.15 10.13 Q11.31 9.97 11.52 9.97 L11.84 10.13 L11.84 10.13 Z M4.85 5.87 L8 2.72 L11.15 5.87 Q11.31 6.03 11.52 6.03 Q12 5.71 12 5.49 L11.84 5.17 L8.37 1.65 Q8.21 1.49 8 1.49 L7.63 1.65 L4.16 5.17 Q4 5.28 4 5.49 Q4.27 6.03 4.48 6.03 L4.85 5.87 Z" />
         </svg>
       </button>
-      <button id="btn-collapse-all" type="button" title="收起全部（仅保留根节点）">
+      <button id="btn-collapse-all" type="button" title="收起全部（仅保留根节点；已取回的展开数据一并丢弃，下次展开重新读取）">
         <svg viewBox="0 0 16 16" aria-hidden="true">
           <path d="M14.03 4.27 Q14.45 4.53 14.72 4.99 L14.99 6.03 L14.99 10.99 Q14.99 12.11 14.45 13.01 Q12.11 14.99 10.99 14.99 L10.99 14.99 L6.03 14.99 Q5.44 14.99 4.99 14.72 L4.27 13.97 L10.99 13.97 Q12.21 13.97 13.12 13.09 L14.03 10.99 L14.03 4.27 Z M9.49 6.99 Q9.71 6.99 9.84 7.15 Q10.03 7.73 9.87 7.87 L9.49 8 L5.49 8 Q5.28 8 5.15 7.87 Q5.01 7.31 5.15 7.15 L5.49 6.99 L9.49 6.99 Z M10.99 1.97 Q11.84 1.97 12.43 2.56 L13.01 4 L13.01 10.99 Q13.01 11.84 12.43 12.43 L10.99 13.01 L4 13.01 Q3.15 13.01 2.59 12.43 L1.97 10.99 L1.97 4 Q2.03 3.15 2.59 2.56 L4 2.03 L10.99 2.03 L10.99 1.97 Z M4 2.99 Q3.57 2.99 3.28 3.28 L2.99 4 L2.99 10.99 Q2.99 11.41 3.28 11.71 L4 12 L10.99 12 Q11.41 12 11.71 11.71 L12 10.99 L12 4 Q12 3.57 11.71 3.28 L10.99 2.99 L4 2.99 Z" />
         </svg>
       </button>
       <button id="btn-copy-tab" type="button" title="复制当前标签为文本">
+        <svg viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M2.99 5.01 L2.99 12.75 Q2.56 12.48 2.29 12 L2.03 10.99 L2.03 5.01 Q2.03 3.89 2.56 2.99 Q4.91 1.01 6.03 1.01 L6.03 1.01 L9.01 1.01 Q9.55 1.01 10 1.28 L10.72 1.97 L6.03 1.97 Q4.75 1.97 3.87 2.88 L2.99 5.01 Z M10.99 14.99 L6.03 14.99 Q5.17 14.99 4.59 14.4 L4 13.01 L4 5.01 Q4 4.16 4.59 3.57 L5.97 2.99 L10.99 2.99 Q11.84 2.99 12.43 3.57 L13.01 5.01 L13.01 13.01 Q13.01 13.81 12.43 14.4 L10.99 14.99 Z M12 5.01 Q12 4.59 11.71 4.29 L10.99 4 L6.03 4 Q5.6 4 5.31 4.29 L5.01 5.01 L5.01 13.01 Q5.01 13.44 5.31 13.71 L6.03 13.97 L10.99 13.97 Q11.41 13.97 11.71 13.71 L12 13.01 L12 5.01 Z" />
+        </svg>
+      </button>
+      <!--
+        「导出」按钮：点击后在按钮下方弹出 #export-menu（五个格式）。
+
+        ⚠️ 图标**刻意复用**上面「复制」按钮的那一条 path：本文件里的内联轮廓派生自
+        VS Code 的图标字体（署名与计数见 THIRD-PARTY-NOTICES.txt，并由 renderCheck 计数）。
+        复用同一条路径不新增派生素材，因此署名文件里的轮廓条数（31 条）保持不变。
+      -->
+      <button id="btn-export" type="button" title="导出当前标签（图片 / 矢量图 / Markdown / JSON）">
         <svg viewBox="0 0 16 16" aria-hidden="true">
           <path d="M2.99 5.01 L2.99 12.75 Q2.56 12.48 2.29 12 L2.03 10.99 L2.03 5.01 Q2.03 3.89 2.56 2.99 Q4.91 1.01 6.03 1.01 L6.03 1.01 L9.01 1.01 Q9.55 1.01 10 1.28 L10.72 1.97 L6.03 1.97 Q4.75 1.97 3.87 2.88 L2.99 5.01 Z M10.99 14.99 L6.03 14.99 Q5.17 14.99 4.59 14.4 L4 13.01 L4 5.01 Q4 4.16 4.59 3.57 L5.97 2.99 L10.99 2.99 Q11.84 2.99 12.43 3.57 L13.01 5.01 L13.01 13.01 Q13.01 13.81 12.43 14.4 L10.99 14.99 Z M12 5.01 Q12 4.59 11.71 4.29 L10.99 4 L6.03 4 Q5.6 4 5.31 4.29 L5.01 5.01 L5.01 13.01 Q5.01 13.44 5.31 13.71 L6.03 13.97 L10.99 13.97 Q11.41 13.97 11.71 13.71 L12 13.01 L12 5.01 Z" />
         </svg>
@@ -57,8 +83,12 @@
       </button>
       <!--
         搜索栏：固定在这一小栏的**最右侧**（CSS 用 margin-left:auto 推到行尾）。
-        按需求：只搜当前标签的**元素名**，命中方框黄色高亮，上下箭头在多个命中间跳；
-        三个开关分别是「区分大小写 / 全字 / 正则」。
+        按需求：搜索当前标签的**元素名**（下面的两个开关可把路径也纳入搜索），命中方框黄色高亮，
+        上下箭头在多个命中间跳；五个开关分别是「区分大小写 / 全字 / 正则 / 同时搜显示的路径 /
+        同时搜完整路径」（后两个是用户 2026-10-15 要求新增的搜索范围开关）。
+
+        同一栏右侧还有**临时路径过滤**的输入框（用户 2026-10-15 要求）：它按路径把命中的
+        方框（连同其子树）从所有标签里隐藏，与搜索互不影响，也不写入任何设置；清空即恢复。
 
         这里刻意全部用文字与 CSS，不加内联图标轮廓：
         图标轮廓数量是第三方署名清单与校验脚本都盯着的数字，加一个就要同步改两处。
@@ -76,12 +106,57 @@
         <button id="btn-search-case" class="search-toggle" type="button" title="区分大小写" aria-label="区分大小写" aria-pressed="false">Aa</button>
         <button id="btn-search-word" class="search-toggle" type="button" title="全字匹配" aria-label="全字匹配" aria-pressed="false">全字</button>
         <button id="btn-search-regex" class="search-toggle" type="button" title="正则匹配" aria-label="正则匹配" aria-pressed="false">.*</button>
+        <button id="btn-search-path" class="search-toggle" type="button" title="同时搜索方框里显示的路径（随路径显示设置变化）" aria-label="同时搜索显示的路径" aria-pressed="false">路径</button>
+        <button id="btn-search-full" class="search-toggle" type="button" title="同时搜索完整文件路径（不受路径显示设置影响）" aria-label="同时搜索完整路径" aria-pressed="false">全路径</button>
         <span id="search-count" class="search-count" role="status" aria-live="polite"></span>
         <button id="btn-search-prev" class="search-step" type="button" title="上一个命中（Shift+Enter）">↑</button>
         <button id="btn-search-next" class="search-step" type="button" title="下一个命中（Enter）">↓</button>
+        <!--
+          临时路径过滤。整段用 `<span>` 包一层（而不是再嵌一个 div）：校验脚本按 #search 外层
+          div 的**结束标签**截取这一段，里面若再出现一个 div 的结束标签，抓取会提前截断。
+          查询是**子串 + 通配**（`*` 段内任意长、`?` 单字符、两个星号后接斜杠表示任意层），
+          匹配对象是完整（相对工作区）路径；「已隐藏 N 个」由宿主算好后随 payload 下发。
+        -->
+        <span id="path-filter" class="path-filter">
+          <input
+            id="path-filter-input"
+            class="search-input path-filter-input"
+            type="text"
+            placeholder="临时过滤路径…"
+            title="临时过滤：路径命中该查询的方框（连同其子树）在所有标签里都不显示；不写入设置，清空后立即恢复"
+            spellcheck="false"
+            autocomplete="off"
+          />
+          <span id="path-filter-count" class="search-count path-filter-count" role="status" aria-live="polite"></span>
+        </span>
       </div>
     </div>
     <div id="tabs" class="tabs" role="tablist"></div>
+    <!--
+      标签栏的自有右键菜单（用户 2026-10-14 要求）。VS Code 给 webview 的默认菜单（剪切/复制/粘贴）
+      无法由扩展扩展，因此自建一套；复用 `#box-menu` 的样式类，不新增 CSS。
+      「关闭所有」与工具栏「关闭全部调用关系标签」同语义（含收起面板视图），避免两处语义分叉。
+    -->
+    <div id="tab-menu" class="box-menu" hidden role="menu">
+      <button type="button" role="menuitem" data-action="copyTabName"><span>复制标签名</span></button>
+      <button type="button" role="menuitem" data-action="closeSelf"><span>关闭</span></button>
+      <button type="button" role="menuitem" data-action="closeOthers"><span>关闭其他</span></button>
+      <button type="button" role="menuitem" data-action="closeLeft"><span>关闭左侧</span></button>
+      <button type="button" role="menuitem" data-action="closeRight"><span>关闭右侧</span></button>
+      <button type="button" role="menuitem" data-action="closeAll"><span>关闭所有</span></button>
+    </div>
+    <!--
+      工具栏「导出」按钮的下拉菜单（用户本轮要求）。复用 `#box-menu` 的样式类，
+      **不新增 CSS**；`data-format` 是稳定取值，webview 与断言都按它取格式。
+      放在工具栏按钮下方（贴着按钮），点其它地方或按 Esc 收起。
+    -->
+    <div id="export-menu" class="box-menu" hidden role="menu">
+      <button type="button" role="menuitem" data-format="png"><span>导出图片（PNG，2×）</span></button>
+      <button type="button" role="menuitem" data-format="svg"><span>导出矢量图（SVG）</span></button>
+      <button type="button" role="menuitem" data-format="md-tree"><span>导出 Markdown（结构树）</span></button>
+      <button type="button" role="menuitem" data-format="md-table"><span>导出 Markdown（表格）</span></button>
+      <button type="button" role="menuitem" data-format="json"><span>导出 JSON（数据）</span></button>
+    </div>
     <!--
       节点总数上限提示：到上限时两个展开按钮会被置为禁用（它们那时必然无效），
       这里显示一行说明与两条出路。用内联文字而不是右下角弹窗 —— 本项目明确不要打扰式提示。
