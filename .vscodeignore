@@ -10,6 +10,7 @@ esbuild.js
 tsconfig.json
 tsconfig.scripts.json
 **/*.vsix
+**/*.code-workspace
 .gitignore
 .npmrc
 .npm-cache/**

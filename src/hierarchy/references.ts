@@ -14,7 +14,7 @@
 import * as vscode from 'vscode';
 import { Answer } from './relations';
 import { pickByChoice } from './callHierarchy';
-import { isCancellation, logWarn } from '../util/log';
+import { isCancellation, logInfo, logWarn } from '../util/log';
 
 /** 引用点数量上限：宏常被广泛使用，避免一次抓回上千个把画布撑爆。 */
 export const MAX_REFERENCE_HITS = 200;
@@ -440,7 +440,19 @@ export async function resolveByReferences(
   const dropped = Math.max(0, hits.length - MAX_REFERENCE_HITS);
   const limited = hits.slice(0, MAX_REFERENCE_HITS);
   const symbolCache: SymbolCache = new Map();
+  // 耗时留痕（用户 2026-10-17「子级特别多时展开偏慢」）：这一层是**唯一按引用点个数
+  // 线性付出语言服务往返**的地方（每个引用点一次 `prepareCallHierarchy`），压测里
+  // 宿主的排序 + 布局只要 0.3 ms，所以真机上慢就慢在这里。
+  // 只在「确实值得看一眼」时记一条，免得正常的小展开也刷屏。
+  const resolveStarted = Date.now();
   const answers = await answersFromHits(limited, isCancelled, symbolCache);
+  const resolveElapsed = Date.now() - resolveStarted;
+  if (limited.length >= 50 || resolveElapsed >= 200) {
+    logInfo(
+      `引用兜底：${limited.length} 个引用点 → ${answers.length} 个节点，` +
+        `耗时 ${resolveElapsed} ms（每批 ${REFERENCE_CONCURRENCY} 个并发）。`
+    );
+  }
   if (answers.length === 0 || isCancelled()) {
     return undefined;
   }

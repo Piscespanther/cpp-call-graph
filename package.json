@@ -2,7 +2,7 @@
   "name": "cpp-call-graph",
   "displayName": "C/C++ 调用关系图 (Call Graph)",
   "description": "在底部面板以图形化方式浏览 C/C++ 函数的被调用关系与调用关系，每次查询一个标签页（基于 LSP Call Hierarchy / clangd）。",
-  "version": "0.22.0",
+  "version": "0.23.0",
   "publisher": "Piscespanther",
   "license": "MIT",
   "repository": {

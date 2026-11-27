@@ -643,9 +643,31 @@ console.log(
     'PNG 导出应当按浏览器画布面积上限（16384 × 16384）设闸'
   );
   assert(
-    /canvas\.width \* canvas\.height > MAX_CANVAS_AREA/.test(exportWebviewSource) &&
+    // ⚠️ 2026-10-17 起超面积不再直接失败：先经 `choosePngScale` 自动降倍率（2× → 1×），
+    // 1 倍也放不下才报错。两条都必须在这个函数体内，否则「降倍率」就成了死代码。
+    /choosePngScale\(/.test(exportWebviewSource) &&
+      /preferred: EXPORT_SCALE/.test(exportWebviewSource) &&
+      /maxArea: MAX_CANVAS_AREA/.test(exportWebviewSource) &&
+      /choice\.tooLarge/.test(exportWebviewSource) &&
       /导出矢量图（SVG）/.test(exportWebviewSource),
-    '超出画布面积上限时必须报错并指向矢量导出，而不是产出空 PNG'
+    '超出画布面积上限时必须先自动降倍率、仍超限才报错并指向矢量导出，而不是产出空 PNG'
+  );
+  // 降倍率不是静默行为：面板要把「已从 2 倍降为 1 倍」随导出消息带给宿主（输出通道留痕）
+  assert(
+    /downgraded/.test(exportWebviewSource) && /降为/.test(exportWebviewSource),
+    '自动降倍率必须在输出通道留一条说明（否则用户以为图本来就只有 1 倍分辨率）'
+  );
+  // 正文一律走 postExportBody：超大图（几十 MB）必须分块，不能塞进一条 postMessage
+  assert(
+    /function postExportBody\(/.test(exportWebviewSource) &&
+      /chunkText\(body, EXPORT_CHUNK_CHARS\)/.test(exportWebviewSource) &&
+      /type: 'exportGraphChunk'/.test(exportWebviewSource) &&
+      /const EXPORT_CHUNK_CHARS = 512 \* 1024/.test(exportWebviewSource),
+    '导出正文必须按固定块大小分块发送（一条几十 MB 的 postMessage 会让导出「点了没反应」）'
+  );
+  assert(
+    (exportWebviewSource.match(/postExportBody\(/g) ?? []).length >= 3,
+    'SVG 与 PNG 两条正文都要走 postExportBody（含函数自身的定义），否则大图仍会卡在一条消息上'
   );
   assert(
     /const PNG_DATA_URL_PREFIX = 'data:image\/png;base64,'/.test(exportWebviewSource) &&
@@ -702,13 +724,19 @@ console.log(
         /encodeBase64Utf8\(prepared\.text\)/.test(body),
       'blob 加载失败时必须退回 data URL（encodeBase64Utf8 + data:image/svg+xml;base64,…）再试一次'
     );
-    // 面积闸门必须**提前**：先建 canvas、先判 MAX_CANVAS_AREA，再去 new Image()。
+    // 面积判定必须**提前**：先算分辨率（含面积闸门）→ 按它建 canvas → 再去 new Image()。
+    // 2026-10-17 起闸门并入 `choosePngScale`（它同时决定用 2 倍还是降到 1 倍），
+    // 所以判定点在建 canvas **之前** —— 超限时连那块画布都不必建。
+    const gateAt = body.indexOf('choosePngScale');
     const canvasAt = body.indexOf("createElement('canvas')");
-    const gateAt = body.indexOf('MAX_CANVAS_AREA');
     const imageAt = body.indexOf('new Image()');
     assert(
-      canvasAt >= 0 && gateAt > canvasAt && imageAt > gateAt,
-      `面积闸门必须在建 canvas 之后、new Image() 之前（实际下标 canvas=${canvasAt} 闸门=${gateAt} 图像=${imageAt}）`
+      gateAt >= 0 && canvasAt > gateAt && imageAt > canvasAt,
+      `分辨率与面积判定必须在建 canvas 之前、new Image() 之前（实际下标判定=${gateAt} 画布=${canvasAt} 图像=${imageAt}）`
+    );
+    assert(
+      /canvas\.width = choice\.width/.test(body) && /canvas\.height = choice\.height/.test(body),
+      '画布尺寸必须直接取自分辨率判定的结果（各算一次就会与实际使用的倍数分叉）'
     );
     // 失败文案必须带序列化字节数：「序列化 <字节> 字节」。
     assert(
@@ -740,13 +768,13 @@ console.log(
     const begin = functionBodyOf(exportWebviewSource, 'beginExport');
     const svgSerializeAt = begin.indexOf('buildExportSvg({ stripTitles: false })');
     const svgCheckAt = begin.indexOf('checkExportXml(prepared.text)');
-    const svgPostAt = begin.indexOf(
-      "post({ type: 'exportGraph', sessionId, format, data: prepared.text })"
-    );
+    // 2026-10-17：交付动作从「一条 exportGraph」变成 `postExportBody()`（大图要分块），
+    // 判据随之改成「预检 → 交付」的先后关系，而不是某个具体的消息构造写法。
+    const svgPostAt = begin.indexOf('postExportBody(sessionId, format, prepared.text)');
     assert(
       svgSerializeAt >= 0 && svgCheckAt > svgSerializeAt && svgPostAt > svgCheckAt,
       'SVG 路径必须在序列化之后、交给宿主写盘之前做预检' +
-        `（实际 序列化=${svgSerializeAt} 预检=${svgCheckAt} 写盘=${svgPostAt}）`
+        `（实际 序列化=${svgSerializeAt} 预检=${svgCheckAt} 交付=${svgPostAt}）`
     );
     const rasterize = functionBodyOf(exportWebviewSource, 'rasterizePng');
     const pngCheckAt = rasterize.indexOf('checkExportXml(prepared.text)');
@@ -792,8 +820,10 @@ console.log(
     );
     const svgBranch = begin.slice(keepAt, stripCallAt);
     assert(
-      /post\(\{\s*type: 'exportGraph'/.test(svgBranch) && !/rasterizePng\(/.test(svgBranch),
-      'SVG 分支（stripTitles: false）应当把文本交给宿主写盘，而不是走栅格化'
+      /postExportBody\(sessionId, format, prepared\.text\)/.test(svgBranch) &&
+        !/rasterizePng\(/.test(svgBranch),
+      'SVG 分支（stripTitles: false）应当把文本交给宿主写盘（经 postExportBody，大图会分块），' +
+        '而不是走栅格化'
     );
     const pngBranch = begin.slice(stripCallAt, rasterizeAt);
     assert(
@@ -1038,9 +1068,12 @@ for (const id of [
   'search-count',
   'btn-search-prev',
   'btn-search-next',
-  // 临时路径过滤（搜索栏区域，用户 2026-10-15）：输入框与「已隐藏 N 个」
+  // 临时路径过滤（搜索栏区域，用户 2026-10-15）：输入框、三个开关与「已隐藏 N 个」
   'path-filter',
   'path-filter-input',
+  'btn-filter-tag',
+  'btn-filter-tag-only',
+  'btn-filter-keep',
   'path-filter-count',
 ]) {
   assert(searchHtml[0].includes(`id="${id}"`), `搜索栏缺少 #${id}`);
@@ -1446,6 +1479,11 @@ assert(
     'btn-search-regex',
     'btn-search-path',
     'btn-search-full',
+    // 临时过滤的三个开关（用户 2026-10-17 / 2026-11-20）：它们也是「看得见的状态」，
+    // 必须同样把状态暴露给辅助技术。
+    'btn-filter-tag',
+    'btn-filter-tag-only',
+    'btn-filter-keep',
   ]) {
     const tag = new RegExp(`<button id="${id}"[^>]*>`).exec(htmlSource)?.[0] ?? '';
     assert(
@@ -1494,6 +1532,10 @@ for (const id of [
   'btn-search-full',
   'btn-search-prev',
   'btn-search-next',
+  // 临时过滤的三个开关：真实事件处理器也在这套桩上跑
+  'btn-filter-tag',
+  'btn-filter-tag-only',
+  'btn-filter-keep',
 ]) {
   const button = createElement('button');
   button.setAttribute('id', id);
@@ -2734,6 +2776,64 @@ for (const tab of tabsEl.children) {
   assert(
     relaid.boxes.f0.width === measured.get('f0'),
     '用实测宽度重排时，方框宽度应当直接采用实测值'
+  );
+
+  // ---- 宿主改用估宽重排时必须**再报一次**（用户 2026-10-17：「展开后箭头偶发错位」） ----
+  // 复现路径：宿主把实测宽度表清掉过（「收起全部」会 `measuredWidths.delete()`），于是它按
+  // **估宽**排版下发；而面板这一帧量到的宽度与上次回报的一模一样（文字没变）。
+  // 若签名只看自己量到的宽度，这里就再也不回报了 → 宿主永远按估宽摆列 → 箭头与方框一直错着。
+  const feedback = () => ({
+    type: 'sessionUpdate',
+    session: {
+      id: 'feedback-check',
+      title: '回传检查',
+      description: '',
+      direction: 'callees',
+      engineLabel: 'clangd',
+      rootId: 'f0',
+      nodes: {
+        f0: { id: 'f0', name: 'short_name', file: 'a.c', line: 1, direction: 'callees', depth: 0, isCycle: false, canExpand: false, children: ['f1'], loaded: true, kind: 'function' },
+        f1: { id: 'f1', name: 'another_short_name', file: 'b.c', line: 2, direction: 'callees', depth: 1, isCycle: false, canExpand: false, children: [], loaded: true, kind: 'function' },
+      },
+      edges: [{ id: 'e', from: 'f0', to: 'f1', depth: 1 }],
+      boxes: {
+        f0: { x: 0, y: 0, width: 400, height: NODE_HEIGHT },
+        f1: { x: 456, y: 0, width: 400, height: NODE_HEIGHT },
+      },
+      collapsedCount: 0,
+    },
+  });
+  // ① 先按实测宽度重排一次并下发：面板量到的宽度与宿主下发的相同。
+  //    第一帧会回报一次（宿主上一帧下发的是 400，签名里的「宿主动下发值」变了），
+  //    之后同样的负载**再发多少次都不该回报** —— 否则就是「回传 → 重排 → 再回传」来回刷。
+  const measuredBoxes = {
+    f0: { x: 0, y: 0, width: measured.get('f0'), height: NODE_HEIGHT },
+    f1: { x: measured.get('f0') + 52, y: 0, width: measured.get('f1'), height: NODE_HEIGHT },
+  };
+  const stable = feedback();
+  stable.session.boxes = measuredBoxes;
+  sendToWebview(stable);
+  const beforeStable = posted.length;
+  sendToWebview(stable);
+  assert(
+    posted.slice(beforeStable).every((message) => message.type !== 'reportWidths'),
+    '宿主下发的宽度已等于实测值时，面板不该再回报（否则会「回传 → 重排 → 再回传」来回刷）'
+  );
+  // ② 宿主改用估宽重排（宽度变了、面板量到的没变）→ 必须再报一次
+  const beforeEstimate = posted.length;
+  sendToWebview(feedback());
+  const reReports = posted.slice(beforeEstimate).filter((message) => message.type === 'reportWidths');
+  assert(
+    reReports.length >= 1,
+    '宿主改用估宽重排后，面板必须把实测宽度**再报一次**（否则列位置与箭头永远按估宽摆）'
+  );
+  assert(
+    reReports[0].widths.every((item) => item.width === measured.get(item.id)),
+    `再报的应当是实测宽度，实际 ${JSON.stringify(reReports[0].widths)}`
+  );
+  console.log(
+    `诊断: 宽度回报 —— 宿主下发的宽度与实测一致时不重复回报；宿主改用估宽（400）重排后立刻再报 ` +
+      `${reReports[0].widths.map((w) => `${w.id}=${w.width}`).join(', ')}`
   );
 }
 
@@ -6639,7 +6739,267 @@ setTimeout(() => {
   console.log('OK: 展开/收起的滚动行为（最小位移显露、极端宽锚父框、收起不动视口）');
 }
 
-// ------------------------------------------------ 节点总数上限：按钮禁用 + 提示行（D）
+// ------------------------------------------------ 展开后「同目录优先」（用户 2026-10-17，§8.23.3）
+//
+// 新一级里的方框都排在同一列（列坐标相同），所以「优先露出」只可能是**纵向**的选择：
+// 从前只保证「整级起点 / 父框下沿」可见，同目录的那个子节点排在后面时照样被切在视口外 ——
+// 而它才是这次展开最相关的一个。这里用「父框在 lib/、两个新子节点分别在 other/ 与 lib/」
+// 的夹具复现：异目录的排在前面，同目录的排在后面。
+{
+  const PAD = 12; // 与 webview 的 CAMERA_PADDING 同值（它没有导出，这里按口径写死并注明）
+  const node = (id, depth, parent, children, loaded, file) => ({
+    id,
+    name: id,
+    file,
+    line: depth + 1,
+    direction: 'callers',
+    depth,
+    isCycle: false,
+    children,
+    parent,
+    loaded,
+    canExpand: loaded ? children.length > 0 : true,
+    kind: 'function',
+  });
+  const before = {
+    r: node('r', 0, undefined, ['p'], true, 'src/r.c'),
+    p: node('p', 1, 'r', [], false, 'lib/p.c'),
+  };
+  // 子节点顺序 = 纵向顺序（布局按 children 依次向下堆）：异目录的 y 在前、同目录的 x 在后
+  const after = {
+    ...before,
+    p: node('p', 1, 'r', ['y', 'x'], true, 'lib/p.c'),
+    y: node('y', 2, 'p', [], false, 'other/y.c'),
+    x: node('x', 2, 'p', [], false, 'lib/x.c'),
+  };
+  const sessionOf = (nodes) => ({
+    boxes: createLayout(nodes, 'r').boxes,
+    message: {
+      type: 'sessionUpdate',
+      session: {
+        id: 'same-dir',
+        title: '同目录优先',
+        description: '',
+        direction: 'callers',
+        engineLabel: 'clangd',
+        rootId: 'r',
+        nodes,
+        edges: [],
+        boxes: createLayout(nodes, 'r').boxes,
+        collapsedCount: 0,
+      },
+    },
+  });
+  const groupOfId = (id) =>
+    nodesGroup.children.find((child) => child.getAttribute('data-node') === id);
+
+  sendToWebview({ type: 'settings', settings: { stickyParent: false, showLocation: true } });
+  const VIEW_H = 70; // 装得下一个方框、装不下「父框 + 同目录子节点」两段：足以区分新旧两种口径
+  canvasEl.clientHeight = VIEW_H;
+  canvasEl.clientWidth = 99999;
+  canvasEl.scrollTop = 0;
+  canvasEl.scrollLeft = 0;
+  const beforeLayout = sessionOf(before);
+  sendToWebview(beforeLayout.message);
+
+  // 点 p 的加减号（mousedown + window mouseup，与真实交互一致）
+  const expander = groupOfId('p')?.children.find((child) =>
+    String(child.getAttribute('class') || '').startsWith('expander')
+  );
+  assert(expander !== undefined, 'p 应当有加减号（否则这条用例根本没展开）');
+  expander.dispatch('mousedown', { stopPropagation() {}, preventDefault() {} });
+  for (const handler of windowListeners.mouseup ?? []) {
+    handler({});
+  }
+  assert(
+    posted.some((message) => message.type === 'expand' && message.nodeId === 'p'),
+    '点开 p 应当向宿主请求展开 p'
+  );
+
+  const afterLayout = sessionOf(after);
+  const boxes = afterLayout.boxes;
+  const pBox = boxes.p;
+  const pBefore = beforeLayout.boxes.p;
+  const levelTop = Math.min(boxes.y.y, boxes.x.y);
+  sendToWebview(afterLayout.message);
+  const viewTop = canvasEl.scrollTop;
+  /** 方框**完整**落在视口内（留出与相机同量的余量）。 */
+  const fullyInView = (box, top, height) =>
+    box.y >= top + PAD / 2 && box.y + box.height <= top + height - PAD / 2;
+  /** 至少有一部分在视口内（父框用这个口径就够）。 */
+  const partlyInView = (box, top, height) =>
+    box.y + box.height > top + PAD / 2 && box.y < top + height - PAD / 2;
+  // 旧口径（没有「同目录优先」这一块）会滚到哪里：先取补偿值，再按两个分支取先满足者。
+  // ⚠️ 必须**照旧口径重放**，不能用「候选里最小的那个」近似 —— 后者会算出一个并不存在的视口顶部，
+  // 把「旧口径看不到 x」这条前提判成真（第一版就是这么写的，反向检查因此没能变红）。
+  const legacyCompensated = pBox.y - pBefore.y;
+  let legacyTop = legacyCompensated;
+  if (pBox.y + pBox.height + PAD > legacyTop + VIEW_H) {
+    legacyTop = pBox.y + pBox.height + PAD - VIEW_H;
+  } else if (pBox.y - PAD < legacyTop) {
+    legacyTop = Math.max(0, pBox.y - PAD);
+  } else if (levelTop - PAD < legacyTop) {
+    legacyTop = Math.max(0, levelTop - PAD);
+  }
+  assert(
+    !fullyInView(boxes.x, legacyTop, VIEW_H),
+    `夹具应当让旧口径看不到同目录子节点（否则这条断言是空的）：x ${boxes.x.y.toFixed(1)}~${(
+      boxes.x.y + boxes.x.height
+    ).toFixed(1)}、旧视口 ${legacyTop.toFixed(1)}~${(legacyTop + VIEW_H).toFixed(1)}`
+  );
+  assert(
+    fullyInView(boxes.x, viewTop, VIEW_H),
+    `展开后同目录的子节点 x 应当完整落进视口（实际 ${boxes.x.y.toFixed(1)}~${(
+      boxes.x.y + boxes.x.height
+    ).toFixed(1)}，视口 ${viewTop}~${viewTop + VIEW_H}）`
+  );
+  log(
+    `诊断: 展开的同目录优先 —— 异目录 y（${boxes.y.y.toFixed(0)}）与同目录 x（${boxes.x.y.toFixed(
+      0
+    )}）同列，旧口径的视口顶部 ${legacyTop.toFixed(0)} 看不到 x，现在滚到 ${viewTop} 后完整落在视口内`
+  );
+
+  // ② 视口足够高时，父框与同目录子节点必须**同时**可见 —— 露出子节点不能以顶掉父框为代价
+  //    （父框刚被点过，用户还看着它）。
+  canvasEl.clientHeight = 200;
+  canvasEl.scrollTop = 0;
+  sendToWebview(sessionOf(before).message);
+  const expanderAgain = groupOfId('p')?.children.find((child) =>
+    String(child.getAttribute('class') || '').startsWith('expander')
+  );
+  assert(expanderAgain !== undefined, '回到展开前之后 p 应当又变成可展开（加减号复位）');
+  expanderAgain.dispatch('mousedown', { stopPropagation() {}, preventDefault() {} });
+  for (const handler of windowListeners.mouseup ?? []) {
+    handler({});
+  }
+  sendToWebview(sessionOf(after).message);
+  const wideTop = canvasEl.scrollTop;
+  assert(
+    partlyInView(pBox, wideTop, 200) && fullyInView(boxes.x, wideTop, 200),
+    `视口放得下时父框与同目录子节点应当同时可见（父框 ${pBox.y.toFixed(1)}~${(
+      pBox.y + pBox.height
+    ).toFixed(1)}、子节点 ${boxes.x.y.toFixed(1)}~${(boxes.x.y + boxes.x.height).toFixed(
+      1
+    )}、视口 ${wideTop}~${wideTop + 200}）`
+  );
+  log(
+    `诊断: 展开的同目录优先（视口放得下）—— 父框与子节点同时在视口内（视口顶部 ${wideTop}）`
+  );
+  console.log('OK: 展开后优先露出同目录的子节点（新一级同列，纵向按同目录那一个定位）');
+}
+
+// ------------------------------------------------ 节点总数上限：按钮禁用 + 提示行（D）// ------------------------------------------------ 展开一层 200 个子节点：先量化（用户 2026-10-17，§8.23.6）
+//
+// 「子级特别多时展开偏慢」这条必须**先拿到数字**再决定改哪里。这里量三件事：
+//   ① 面板把这一层画出来的一帧耗时（`render()` 重建 DOM + 量宽）；
+//   ② 这一帧的**量宽探测次数**（每个方框 3 次 getBBox 调用会强制同步布局）；
+//   ③ 紧接着的「宿主按实测宽度重排」那一帧——它同样是展开的一部分（第二帧）。
+// ⚠️ 阈值只能防「复杂度退化」，不能当浏览器性能指标：桩里的 DOM 与测量都是内存对象，
+// 比真机快一个量级。真机数字要另看，这里钉的是「别退化成 O(n²)」与「缓存真的生效」。
+{
+  const CHILD_COUNT = 200;
+  const nodes = { root: null };
+  const childIds = [];
+  for (let i = 0; i < CHILD_COUNT; i += 1) {
+    const id = `big_${i}`;
+    childIds.push(id);
+    nodes[id] = {
+      id,
+      name: `handler_${i}`,
+      file: `src/module_${i % 7}/file_${i}.cpp`,
+      line: 10 + i,
+      direction: 'callers',
+      depth: 1,
+      isCycle: false,
+      children: [],
+      parent: 'root',
+      loaded: true,
+      canExpand: false,
+      kind: 'function',
+    };
+  }
+  nodes.root = {
+    id: 'root',
+    name: 'dispatcher',
+    file: 'src/dispatcher.cpp',
+    line: 1,
+    direction: 'callers',
+    depth: 0,
+    isCycle: false,
+    children: childIds,
+    parent: undefined,
+    loaded: true,
+    canExpand: false,
+    kind: 'function',
+  };
+  const boxes = createLayout(nodes, 'root').boxes;
+  const payload = {
+    type: 'sessionUpdate',
+    session: {
+      id: 'wide-layer',
+      title: '宽层计时',
+      description: '',
+      direction: 'callers',
+      engineLabel: 'clangd',
+      rootId: 'root',
+      nodes,
+      edges: childIds.map((id, index) => ({ id: `e${index}`, from: id, to: 'root', depth: 1 })),
+      boxes,
+      collapsedCount: 0,
+    },
+  };
+
+  const realNow = Date.now;
+  const readsBefore = measureProbeReads;
+  const paintStart = realNow();
+  sendToWebview(payload);
+  flushFrames();
+  const paintCost = realNow() - paintStart;
+  const readsFirst = measureProbeReads - readsBefore;
+
+  const readsBeforeRepeat = measureProbeReads;
+  const repeatStart = realNow();
+  sendToWebview(payload);
+  flushFrames();
+  const repeatCost = realNow() - repeatStart;
+  const readsRepeat = measureProbeReads - readsBeforeRepeat;
+
+  // DOM 里每个可见方框必须**恰好出现一次**（将来若改成「增量插入」，这就是不许破的不变式：
+  // 少一个 = 画面缺框，多一个 = 幽灵框）。顺序按 `visibleNodes()` 的遍历序（兄弟是倒序），
+  // 视觉顺序由宿主给的 y 决定，所以这里只比集合，并单独钉住「根在最前」。
+  const renderedIds = nodesGroup.children.map((child) => String(child.getAttribute('data-node')));
+  const expectedIds = ['root', ...childIds];
+  assert(
+    renderedIds.length === expectedIds.length &&
+      renderedIds[0] === 'root' &&
+      new Set(renderedIds).size === expectedIds.length &&
+      expectedIds.every((id) => renderedIds.includes(id)),
+    `每个可见方框都应当恰好画一次、根在最前（期望 ${expectedIds.length} 个，实际 ${renderedIds.length} 个）`
+  );
+  assert(
+    readsFirst >= CHILD_COUNT,
+    `第一帧应当为每个方框量宽（期望至少 ${CHILD_COUNT} 次探测，实际 ${readsFirst} 次）`
+  );
+  assert(
+    readsRepeat === 0,
+    `内容没变的重发帧不得再量宽（缓存失效了：又探测了 ${readsRepeat} 次）`
+  );
+  log(
+    `诊断: 宽层展开（${CHILD_COUNT + 1} 个方框）—— 首帧 ${paintCost.toFixed(1)}ms / 量宽探测 ${readsFirst} 次；` +
+      `同内容重发帧 ${repeatCost.toFixed(1)}ms / 探测 ${readsRepeat} 次`
+  );
+  // 宽松阈值：桩里 200 个方框远快于此；这里只拦「复杂度退化」这种数量级问题。
+  assert(
+    paintCost < 400,
+    `一层 200 个子节点的首帧不该慢到 ${paintCost.toFixed(1)}ms（桩环境下这已属数量级异常）`
+  );
+  assert(
+    repeatCost < 200,
+    `内容未变的重发帧不该慢到 ${repeatCost.toFixed(1)}ms（说明量宽缓存没命中）`
+  );
+}
+
+
 // 用户反馈「到上限后再点展开、完全展开都没用」：那时两个按钮必然无效（画不下的节点没有方框），
 // 却不给任何反馈。现在的约定是**禁用 + 写明原因与两条出路**，所以两侧都要断言。
 {
@@ -7503,9 +7863,173 @@ setTimeout(() => {
     posted.every((message) => message.type !== 'pathFilter'),
     'init 还原输入框**不得**顺带把查询再发回去（那会在宿主与面板之间形成回环）'
   );
+  // ⑥ 两个匹配素材开关（用户 2026-10-17）：状态要显示出来、要发给宿主、要**互斥**，
+  //    并且随 init 一起还原 —— 缺任何一环都会出现「开关显示为关、图却按标签过滤着」。
+  const tagButton = byId.get('btn-filter-tag');
+  const tagOnlyButton = byId.get('btn-filter-tag-only');
+  assert(
+    tagButton !== undefined && tagOnlyButton !== undefined,
+    '桩里缺少临时过滤的两个开关（#btn-filter-tag / #btn-filter-tag-only）'
+  );
+  const filterMessages = () => posted.filter((message) => message.type === 'pathFilter');
+  filterInput.value = 'aaa';
+  posted.length = 0;
+  tagButton.dispatch('click', {});
+  const tagMessage = filterMessages().pop();
+  assert(
+    tagMessage !== undefined && tagMessage.matchTag === true && tagMessage.tagOnly === false,
+    `点「包含标签」应当立刻把 matchTag=true 发给宿主（无需防抖），实际 ${JSON.stringify(tagMessage)}`
+  );
+  assert(
+    tagButton.classList.contains('on') && tagButton.getAttribute('aria-pressed') === 'true',
+    '「包含标签」按下后按钮应当点亮并同步 aria-pressed'
+  );
+  // 互斥：点「仅标签」要把「包含标签」关掉（前者已隐含后者，两个同时亮含义说不清）
+  posted.length = 0;
+  tagOnlyButton.dispatch('click', {});
+  const tagOnlyMessage = filterMessages().pop();
+  assert(
+    tagOnlyMessage !== undefined && tagOnlyMessage.tagOnly === true && tagOnlyMessage.matchTag === false,
+    `点「仅标签」应当发出 tagOnly=true / matchTag=false，实际 ${JSON.stringify(tagOnlyMessage)}`
+  );
+  assert(
+    tagOnlyButton.classList.contains('on') && !tagButton.classList.contains('on'),
+    '两个开关必须互斥：开「仅标签」时「包含标签」应当自动熄灭'
+  );
+  assert(
+    tagButton.getAttribute('aria-pressed') === 'false',
+    '互斥熄灭时 aria-pressed 也要跟着改（不能只改样式）'
+  );
+  // 反方向同样要互斥：从「仅标签」切回「包含标签」时，「仅标签」必须熄灭。
+  // 两个方向都要测 —— 只测一侧时另一侧的守卫写掉了也看不出来。
+  posted.length = 0;
+  tagButton.dispatch('click', {});
+  const backToTag = filterMessages().pop();
+  assert(
+    backToTag !== undefined && backToTag.matchTag === true && backToTag.tagOnly === false,
+    `从「仅标签」切回「包含标签」应当发出 matchTag=true / tagOnly=false，实际 ${JSON.stringify(backToTag)}`
+  );
+  assert(
+    tagButton.classList.contains('on') && !tagOnlyButton.classList.contains('on'),
+    '反方向也要互斥：开「包含标签」时「仅标签」应当自动熄灭'
+  );
+  // 再点一次 = 关掉，回到「只看路径」（与 2026-10-16 之前逐字一致的那一档）
+  posted.length = 0;
+  tagButton.dispatch('click', {});
+  const clearedToggle = filterMessages().pop();
+  assert(
+    clearedToggle !== undefined && clearedToggle.tagOnly === false && clearedToggle.matchTag === false,
+    `再点一次「包含标签」应当两个开关都关，实际 ${JSON.stringify(clearedToggle)}`
+  );
+  assert(
+    !tagButton.classList.contains('on') && tagButton.getAttribute('aria-pressed') === 'false',
+    '关掉后按钮应当熄灭并同步 aria-pressed'
+  );
+
+  // ⑦ 「仅保留」（用户 2026-11-20）：与另外两个开关**正交** —— 它只翻转处置方式，
+  //    不改匹配素材，所以既能单独开，也能与「包含标签 / 仅标签」叠加。
+  const keepButton = byId.get('btn-filter-keep');
+  assert(keepButton !== undefined, '桩里缺少「仅保留」开关（#btn-filter-keep）');
+  posted.length = 0;
+  keepButton.dispatch('click', {});
+  const keepMessage = filterMessages().pop();
+  assert(
+    keepMessage !== undefined && keepMessage.keepOnly === true && keepMessage.query === 'aaa',
+    `点「仅保留」应当立刻把 keepOnly=true 与当前查询一起发给宿主，实际 ${JSON.stringify(keepMessage)}`
+  );
+  assert(
+    keepMessage.matchTag === false && keepMessage.tagOnly === false,
+    '「仅保留」不得顺手改动匹配素材的两个开关（正交）'
+  );
+  assert(
+    keepButton.classList.contains('on') && keepButton.getAttribute('aria-pressed') === 'true',
+    '「仅保留」按下后应当点亮并同步 aria-pressed'
+  );
+  // 叠加：开「包含标签」时「仅保留」必须保持点亮（两者不互斥）
+  posted.length = 0;
+  tagButton.dispatch('click', {});
+  const combined = filterMessages().pop();
+  assert(
+    combined !== undefined &&
+      combined.keepOnly === true &&
+      combined.matchTag === true &&
+      tagButton.classList.contains('on') &&
+      keepButton.classList.contains('on'),
+    `「仅保留」与「包含标签」应当可以同时开启，实际 ${JSON.stringify(combined)}`
+  );
+  // 再点一次 = 关掉，回到默认的「排除」
+  posted.length = 0;
+  keepButton.dispatch('click', {});
+  const keepOff = filterMessages().pop();
+  assert(
+    keepOff !== undefined && keepOff.keepOnly === false && !keepButton.classList.contains('on'),
+    `再点一次「仅保留」应当回到排除模式，实际 ${JSON.stringify(keepOff)}`
+  );
+  tagButton.dispatch('click', {}); // 收尾：把「包含标签」也关掉，回到都关的状态
+  posted.length = 0;
+
+  // 面板重建：两个开关随 init 还原（宿主那一份是唯一真相）
+  posted.length = 0;
+  sendToWebview({
+    type: 'init',
+    sessions: [filterSession(2)],
+    summaries: [{ id: 'filter-check', title: '临时过滤检查', description: '', direction: 'callers' }],
+    activeId: 'filter-check',
+    pathFilterQuery: 'deepdir',
+    pathFilterMatchTag: true,
+    pathFilterTagOnly: false,
+  });
+  flushFrames();
+  assert(
+    tagButton.classList.contains('on') && !tagOnlyButton.classList.contains('on'),
+    'init 必须把两个开关还原（matchTag=true 时「包含标签」应当点亮）'
+  );
+  assert(
+    !keepButton.classList.contains('on'),
+    'init 没带 keepOnly 字段时「仅保留」应当保持熄灭（默认=排除），不能被上一次的状态残留点亮'
+  );
+  // 「仅保留」也随 init 还原（与两个标签开关各自独立）
+  sendToWebview({
+    type: 'init',
+    sessions: [filterSession(2)],
+    summaries: [{ id: 'filter-check', title: '临时过滤检查', description: '', direction: 'callers' }],
+    activeId: 'filter-check',
+    pathFilterQuery: 'deepdir',
+    pathFilterMatchTag: false,
+    pathFilterTagOnly: false,
+    pathFilterKeepOnly: true,
+  });
+  flushFrames();
+  assert(
+    keepButton.classList.contains('on') && keepButton.getAttribute('aria-pressed') === 'true',
+    'init 必须把「仅保留」还原（pathFilterKeepOnly=true 时应当点亮）'
+  );
+  assert(
+    !tagButton.classList.contains('on') && !tagOnlyButton.classList.contains('on'),
+    '「仅保留」还原时不得点亮两个标签开关（四者各自独立）'
+  );
+  // 宿主若同时给了两个真值（旧面板发过），按「仅标签」优先收口，绝不允许两个都亮
+  sendToWebview({
+    type: 'init',
+    sessions: [filterSession(2)],
+    summaries: [{ id: 'filter-check', title: '临时过滤检查', description: '', direction: 'callers' }],
+    activeId: 'filter-check',
+    pathFilterQuery: 'deepdir',
+    pathFilterMatchTag: true,
+    pathFilterTagOnly: true,
+  });
+  flushFrames();
+  assert(
+    tagOnlyButton.classList.contains('on') && !tagButton.classList.contains('on'),
+    '两个开关都收到真值时应当收口成「仅标签」一个亮着（界面不允许出现含义不清的双亮）'
+  );
+  assert(
+    posted.every((message) => message.type !== 'pathFilter'),
+    'init 还原三个开关**不得**顺带把查询再发回去（那会在宿主与面板之间形成回环）'
+  );
   log(
     'OK: 临时路径过滤的界面接线 —— 输入清空/ Esc 立刻发空查询、计数用宿主回传的 filteredCount、' +
-      'init 还原输入框且不回发查询'
+      'init 还原输入框与三个开关且不回发查询、标签两开关互斥、「仅保留」与它们正交'
   );
 }
 

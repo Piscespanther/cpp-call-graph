@@ -48,7 +48,7 @@ import {
   resolveAt,
   selectedProfile,
 } from './hierarchy/callHierarchy';
-import { CallSession, baseKeyOf, expandTimeout } from './hierarchy/session';
+import { CallSession, arrangeByProximity, baseKeyOf, expandTimeout } from './hierarchy/session';
 import { resolveByReferences } from './hierarchy/references';
 import { Direction, DIRECTION_LABEL } from './hierarchy/graphTypes';
 import {
@@ -65,6 +65,10 @@ import {
   unmatchedAnchorPatterns as layoutUnmatchedAnchorPatterns,
 } from './hierarchy/graphLayout';
 import { GraphViewProvider } from './views/graphView';
+import {
+  applyPathQueryFilter as pathApplyQueryFilter,
+  splitPathQueries as pathSplitQueries,
+} from './hierarchy/pathQuery';
 import { renderGraphHtml } from './webview/webviewHtml';
 import { buildSessionText, copyNodeLocation, copyNodeName } from './commands/copyTree';
 import {
@@ -73,6 +77,7 @@ import {
   buildMarkdownTable,
   buildMarkdownTree,
 } from './commands/exportGraph';
+import { choosePngScale, chunkText } from './util/exportTransfer';
 import {
   disposeLog,
   isCancellation,
@@ -100,6 +105,10 @@ export interface ExtensionTestApi {
   /** 取消类错误的判据（窗口重载时的 Canceled 不该写成警告）——供冒烟断言复用同一份实现。 */
   isCancellation: typeof isCancellation;
   isShuttingDown: typeof isShuttingDown;
+  /** 导出正文的分块切分（面板侧切、宿主侧拼，这里给断言用**同一份**实现）。 */
+  chunkText: typeof chunkText;
+  /** PNG 分辨率的选择（超面积时先自动降倍率再试，仍超限才算失败）。 */
+  choosePngScale: typeof choosePngScale;
 }
 
 /** 目录过滤设置项的键（两条右键命令共用）。 */
@@ -668,6 +677,9 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
     buildExportFileName,
     isCancellation,
     isShuttingDown,
+    // 导出正文的传输口径（纯函数，宿主与面板共用一份）：分块与 PNG 分辨率选择
+    chunkText,
+    choosePngScale,
   };
 }
 
@@ -705,6 +717,13 @@ export const __layout = {
   resolveAnchorIndexes: layoutResolveAnchorIndexes,
   /** 括号扫描（一组括号一个标签）——`{src}` 这类写法不再被当成分组，有断言钉住。 */
   parseTagPatterns: layoutParseTagPatterns,
+  /**
+   * 临时路径过滤的裁剪（纯函数）。断言「逗号分隔多条 = 任一命中」「引号里的逗号不算分隔」
+   * 以及标签匹配的三档开关 —— 这些只在单段路径的冒烟夹具上看不出来（标签需要多段路径）。
+   */
+  applyPathQueryFilter: pathApplyQueryFilter,
+  /** 临时过滤查询的拆分（引号感知）——把拆分单独暴露出来，断言不必依赖「有没有命中」。 */
+  splitPathQueries: pathSplitQueries,
 };
 
 /**
@@ -716,6 +735,11 @@ export const __hierarchy = {
   resolveAt,
   /** 节点 id 的 key 反解（`operator>` 这类含 `>` 的名字曾经被切错，见 session.ts）。 */
   baseKeyOf,
+  /**
+   * 子节点「最亲的居中」排序（纯函数）。
+   * 压测用它量「一层 200 个子节点」的宿主侧开销（用户 2026-10-17 的「子级特别多」场景）。
+   */
+  arrangeByProximity,
 };
 
 /**

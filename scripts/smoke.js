@@ -63,14 +63,14 @@ const configStore = {
 
 let ranges = {};
 
-function buildItem(id, name, line) {
+function buildItem(id, name, line, file = 'demo.cpp') {
   return {
     id,
     name,
     detail: `int ${name}(int)`,
     kind: 11, // SymbolKind.Function
     tags: [],
-    uri: vscodeStub.Uri.file(`${PROJ}\\demo.cpp`),
+    uri: vscodeStub.Uri.file(`${PROJ}\\${file.split('/').join('\\')}`),
     range: ranges.make(line, 0, line, 40),
     selectionRange: ranges.make(line, 4, line, 4 + name.length),
   };
@@ -86,6 +86,16 @@ function wireCalls() {
   items.isOdd = buildItem('isOdd', 'isOdd', 11);
   items.report = buildItem('report', 'report', 26);
   items.noCaller = buildItem('noCaller', 'noCaller', 40);
+}
+
+/**
+ * 把某个函数的文件挪到夹具根下的子目录（多段相对路径）。
+ *
+ * 用途：名称行标签的锚点必须命中**目录段**（单段路径如 `demo.cpp` 没有目录可言，
+ * `anchorTagTexts` 会直接返回空）。用完必须还原，否则后面的用例都会带上目录。
+ */
+function setItemFile(name, file) {
+  items[name].uri = vscodeStub.Uri.file(`${PROJ}\\${file.split('/').join('\\')}`);
 }
 
 /** 每个函数「被谁调用」以及调用发生的行号。 */
@@ -455,7 +465,18 @@ const vscodeStub = {
       };
     },
     onDidChangeConfiguration: makeEvent(),
-    asRelativePath: (uri) => path.basename(uri.fsPath ?? String(uri)),
+    // 相对路径：落在夹具根 `G:\proj` 下的文件按真实层级给出（`lib/x.cpp`），其余退回文件名。
+    // ⚠️ 这一条必须与真实 VS Code 同口径（`asRelativePath(uri, false)`）：早先一律取 basename，
+    // 于是所有夹具路径都是**单段**的，多段路径才会走到的逻辑（名称行标签、锚点分段）
+    // 在冒烟里根本跑不到。既有夹具的文件都在 `G:\proj` 根下，结果与从前逐字相同。
+    asRelativePath: (uri) => {
+      const fsPath = String(uri.fsPath ?? uri);
+      const prefix = `${PROJ}\\`;
+      if (fsPath.startsWith(prefix)) {
+        return fsPath.slice(prefix.length).split('\\').join('/');
+      }
+      return path.basename(fsPath);
+    },
     openTextDocument: (arg) => {
       if (arg && typeof arg === 'object' && 'language' in arg) {
         return Promise.resolve({ getText: () => String(arg.content) });
@@ -1244,8 +1265,98 @@ async function main() {
     `诊断: 宿主不传 progress 时展开全部仍生效 → 节点 ${Object.keys(noReporterAfter.nodes).length}`
   );
 
-  // 说明：实测宽度回传（reportWidths）的端到端验证在 renderCheck.js —— 
-  // 那个脚本才真正加载 webview 前端；smoke 只跑宿主侧。
+  // 实测宽度回传的**宿主侧**契约（用户 2026-10-17）：
+  // 「展开后盒子宽度必须等于面板实测宽度（含新增节点）」，且「同值不重排」（否则回传 → 重排 →
+  // 回传无限循环）。面板那一半（宿主改用估宽重排时要再报一次）在 renderCheck.js。
+  {
+    const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    await registered.get('cppCallGraph.closeAllTabs')();
+    await wait(40);
+    currentRootName = 'compute';
+    await registered.get('cppCallGraph.showCallees')();
+    await wait(90);
+
+    const p1 = lastSessionPayload();
+    const ids1 = Object.keys(p1.nodes);
+    assert(ids1.length >= 3, `本用例需要至少 3 个节点，实际 ${ids1.length} 个`);
+    const maxDepth = Math.max(...ids1.map((id) => p1.nodes[id].depth));
+    const deepest = ids1.find((id) => p1.nodes[id].depth === maxDepth);
+    // 刻意与宿主估宽不同（+40）：这样「用了实测值」与「还在用估宽」一眼可分
+    const reported = ids1.map((id) => ({ id, width: p1.boxes[id].width + 40 }));
+
+    captured.posted.length = 0;
+    fake.send({ type: 'reportWidths', sessionId: p1.id, widths: reported });
+    await wait(120);
+    const p2 = lastSessionPayload();
+    assert(
+      p2 !== p1 && Object.keys(p2.nodes).length === ids1.length,
+      '回传实测宽度后宿主应当按同样的节点集合重排并重发一次'
+    );
+    for (const item of reported) {
+      assert(
+        p2.boxes[item.id].width === item.width,
+        `宿主应当采用回传的实测宽度（${item.id} 期望 ${item.width}，实际 ${p2.boxes[item.id].width}）`
+      );
+    }
+    assert(
+      p2.boxes[deepest].x === p1.boxes[deepest].x + 40,
+      `列位置必须按实测宽度重算：最深一列应当右移 40（实际 ${p1.boxes[deepest].x} → ${p2.boxes[deepest].x}）`
+    );
+
+    // 同一份宽度再报一次：**不得**重排（否则面板每帧回传都会引发一次整图重排）
+    captured.posted.length = 0;
+    fake.send({ type: 'reportWidths', sessionId: p1.id, widths: reported });
+    await wait(120);
+    assert(
+      captured.posted.every((message) => message.type !== 'sessionUpdate'),
+      '宽度没变时不得重排 —— 否则「回传 → 重排 → 再回传」会无限循环'
+    );
+
+    // 展开一个未加载的节点：新节点的宽度初值是**宿主估宽**，必须能被随后的实测值改掉。
+    // ⚠️ 不能随便挑一个可展开的节点：夹具里有的函数没有任何下一层（展开后一个节点也不多），
+    // 那样这条断言会以「没有新节点」告终、看起来像功能坏了。逐个试到真的多出节点为止。
+    const candidates = ids1.filter((id) => p2.nodes[id].canExpand);
+    assert(candidates.length > 0, '本用例需要一个可展开的节点');
+    let addedIds = [];
+    let expandable;
+    for (const id of candidates) {
+      captured.posted.length = 0;
+      fake.send({ type: 'expand', sessionId: p1.id, nodeId: id });
+      await wait(220);
+      const added = Object.keys(lastSessionPayload().nodes).filter((item) => !ids1.includes(item));
+      if (added.length > 0) {
+        addedIds = added;
+        expandable = id;
+        break;
+      }
+    }
+    assert(
+      expandable !== undefined,
+      `试过 ${candidates.length} 个可展开节点都没有带来新层（夹具失效）`
+    );
+    const p3 = lastSessionPayload();
+    const withBox = addedIds.filter((id) => p3.boxes[id] !== undefined);
+    assert(withBox.length > 0, '新增节点应当有方框（否则宽度无从谈起）');
+    const newWidth = p3.boxes[withBox[0]].width + 55;
+    // ⚠️ 旧节点的宽度**一个都不改**：这样「必须重排」的理由只能是「出现了新 id」
+    const nextReport = [...reported, ...withBox.map((id) => ({ id, width: newWidth }))];
+    captured.posted.length = 0;
+    fake.send({ type: 'reportWidths', sessionId: p1.id, widths: nextReport });
+    await wait(140);
+    const p4 = lastSessionPayload();
+    assert(
+      withBox.every((id) => p4.boxes[id].width === newWidth),
+      `新增节点的宽度必须按实测值重排（含新增 id 的报告必须被采纳）：期望 ${newWidth}，实际 ${JSON.stringify(
+        withBox.map((id) => p4.boxes[id].width)
+      )}`
+    );
+    console.log(
+      `诊断: 实测宽度契约 —— ${ids1.length} 个节点按实测值重排（最深列右移 40）、` +
+        `同值不重排；展开 ${expandable} 后新增 ${withBox.length} 个方框的宽度按实测值 ${newWidth} 生效`
+    );
+    await registered.get('cppCallGraph.closeAllTabs')();
+    await wait(40);
+  }
 
   console.log('--- 展开全部 / 收起全部 的往复 ---');
   // 用户报的问题：工具栏「展开全部 → 收起全部 → 再展开全部」后第二次无效。
@@ -1573,6 +1684,346 @@ async function main() {
       `诊断: 临时路径过滤 —— ${baseline.size} 个标签各 ${[...beforeCounts.values()].join('/')} 个节点` +
         ` → 查询 demo 后各只剩根（filteredCount 已下发） → 清空后全部回来` +
         ` → 重新查询后做「收起全部 + 完全展开」仍只剩根；查询既不进设置也不进快照`
+    );
+  }
+
+  // 临时过滤的两条扩充（用户 2026-10-17）：
+  //   ① 一条查询里可以用逗号写多条（引号里的逗号不算分隔符），任一命中即隐藏；
+  //   ② 两个开关「包含标签」/「仅标签」把匹配素材从路径扩到名称行标签。
+  // 这里走**真实链路**（消息 → 宿主匹配 → payload 裁剪 + filteredCount），
+  // 拆分的边界情况由 `__layout.splitPathQueries` 与 `applyPathQueryFilter` 直接断言。
+  {
+    const provider = captured.webviewViewProvider.provider;
+    const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const layoutApi = extension.__layout;
+    const lastPayload = () => {
+      let found;
+      for (const message of captured.posted) {
+        if (message.type === 'sessionUpdate' && message.session) {
+          found = message.session;
+        }
+      }
+      return found;
+    };
+
+    // ---- ① 多条查询与引号感知的拆分（纯函数，边界比端到端更好钉） ----
+    const split = layoutApi.splitPathQueries('a, "b,c" ,, d');
+    assert(
+      JSON.stringify(split) === JSON.stringify([
+        { text: 'a', literal: false },
+        { text: 'b,c', literal: true },
+        { text: 'd', literal: false },
+      ]),
+      `逗号拆分应当是引号感知的、空项丢弃，实际 ${JSON.stringify(split)}`
+    );
+    const synth = (files) => {
+      const nodes = { root: { file: 'root.cpp', children: Object.keys(files) } };
+      for (const [id, file] of Object.entries(files)) {
+        nodes[id] = { file, children: [] };
+      }
+      return nodes;
+    };
+    const synthNodes = synth({
+      a: 'aaa/a.cpp',
+      b: 'bbb/b.cpp',
+      c: 'ccc/a,b.cpp',
+      d: 'aaa/deep/d.cpp',
+    });
+    /** 过滤后**仍在图里**的节点 id（根永远在，不参与比较）。 */
+    const visibleIds = (query, options) => {
+      const { nodes } = layoutApi.applyPathQueryFilter(synthNodes, 'root', query, options);
+      return Object.keys(nodes).filter((id) => id !== 'root').sort().join(',');
+    };
+    /** 过滤后被隐藏的节点数（用于「空查询不隐藏任何东西」这类断言）。 */
+    const hiddenCount = (query, options) =>
+      layoutApi.applyPathQueryFilter(synthNodes, 'root', query, options).hidden;
+    assert(
+      visibleIds('aaa, ccc') === 'b',
+      `多条查询应当是「任一命中即隐藏」（逗号分隔）：a/c/d 命中、只该留下 b，实际 ${visibleIds(
+        'aaa, ccc'
+      )}`
+    );
+    assert(
+      hiddenCount('  ') === 0 && visibleIds('  ') === 'a,b,c,d',
+      '全是空项的查询不得隐藏任何节点（把空串当成一条查询会匹配一切，整张图被清空）'
+    );
+    assert(
+      visibleIds('aaa,,ccc') === 'b',
+      `空项要被丢弃且不影响其余条目（实际留下 ${visibleIds('aaa,,ccc')}）`
+    );
+    assert(
+      visibleIds('"a,b"') === 'a,b,d',
+      `整体加引号的条目按一条**字面量**匹配（引号里的逗号是内容，不是分隔符）：` +
+        `只该隐藏带逗号的 c，实际留下 ${visibleIds('"a,b"')}`
+    );
+    assert(
+      visibleIds('a,b') === '',
+      `不加引号时 \`a,b\` 是两条查询（\`a\` 与 \`b\`），不得当成一条字面量，实际留下 ${visibleIds(
+        'a,b'
+      )}`
+    );
+    assert(
+      visibleIds('"aaa/*"') === 'a,b,c,d',
+      `引号里的通配符必须当字面量（\`"aaa/*"\` 不应命中 aaa/ 下的文件），实际留下 ${visibleIds(
+        '"aaa/*"'
+      )}`
+    );
+    assert(
+      visibleIds('aaa/*') === 'b,c',
+      `不带引号时 \`*\` 段内任意长（不跨斜杠），实际留下 ${visibleIds('aaa/*')}`
+    );
+
+    // ---- ①b 「仅保留」：翻转处置方式（用户 2026-11-20） ----
+    // 语义 = 只保留命中节点 + 它们到根的**祖先链**；未命中的一律隐藏。
+    // 这里用同一份合成夹具，与上面的「排除」结果**互为反义**，一眼能看出方向是否真的翻了。
+    assert(
+      visibleIds('aaa', { keepOnly: true }) === 'a,d',
+      '「仅保留」应当只留下命中的 a/d 及其祖先链，实际留下 ' + visibleIds('aaa', { keepOnly: true })
+    );
+    assert(
+      hiddenCount('aaa', { keepOnly: true }) === 2,
+      '「仅保留」也要报隐藏数量（b、c 被隐藏 = 2），实际 ' + hiddenCount('aaa', { keepOnly: true })
+    );
+    assert(
+      visibleIds('aaa') === 'b,c' && visibleIds('aaa', { keepOnly: true }) === 'a,d',
+      '同一查询在两种模式下结果必须互为反义（排除命中项 vs 只留命中项）'
+    );
+    assert(
+      visibleIds('zzz-nothing', { keepOnly: true }) === '' &&
+        hiddenCount('zzz-nothing', { keepOnly: true }) === 4,
+      '「仅保留」且一个都没命中时应当只剩根、其余全部隐藏'
+    );
+    assert(
+      visibleIds('deep/d', { keepOnly: true }) === 'd',
+      '命中深层节点时只保留它自己（其祖先只有根），实际留 ' + visibleIds('deep/d', { keepOnly: true })
+    );
+    assert(
+      'root' in layoutApi.applyPathQueryFilter(synthNodes, 'root', 'zzz', { keepOnly: true }).nodes,
+      '「仅保留」模式下根也必须保留（否则整张图连入口都没有）'
+    );
+    // 「仅保留」与标签开关正交：可以「按标签保留」
+    const tagTextOf = (file) => (file.startsWith('aaa/') ? '[lib] → ' : '');
+    assert(
+      visibleIds('[lib]', { keepOnly: true, matchTag: true, tagText: tagTextOf }) === 'a,d',
+      '「按标签保留」应当留下带标签的 a/d，实际留 ' +
+        visibleIds('[lib]', { keepOnly: true, matchTag: true, tagText: tagTextOf })
+    );
+    assert(
+      visibleIds('bbb, ccc', { keepOnly: true }) === 'b,c',
+      '「仅保留」与多条查询叠加：两条各命中一个就留这两个，实际留 ' +
+        visibleIds('bbb, ccc', { keepOnly: true })
+    );
+
+    // ---- ② 两个开关的端到端：夹具挪进子目录，锚点 `(lib)` 产生名称行标签 ----
+    // 根 leafAdd 的调用者链：leafAdd ← compute → main（初始只取到已加载的那几层）。
+    // 三个文件都放进 `lib/`，因此锚点 `(lib)` 会给每个方框一个 `[lib] → ` 的名称行标签。
+    await registered.get('cppCallGraph.closeAllTabs')();
+    await wait(40);
+    setItemFile('leafAdd', 'lib/leaf.cpp');
+    setItemFile('compute', 'lib/compute.cpp');
+    setItemFile('main', 'lib/main.cpp');
+    configStore['cppCallGraph.nameFolderTag'] = true;
+    configStore['cppCallGraph.pathAnchors'] = ['(lib)'];
+    currentRootName = 'leafAdd';
+    await registered.get('cppCallGraph.showCallers')();
+    await wait(100);
+    const sessionId = provider.__debugSnapshot().sessionIds[0];
+
+    const withFilter = async (message) => {
+      captured.posted.length = 0;
+      captured.outputLines.length = 0;
+      fake.send({ type: 'pathFilter', ...message });
+      await wait(120);
+      return lastPayload();
+    };
+
+    const base = await withFilter({ query: 'zzz-no-such' });
+    const baseCount = Object.keys(base.nodes).length;
+    assert(
+      baseCount >= 3,
+      `标签匹配的用例需要至少 3 个节点（实际总共 ${baseCount} 个）`
+    );
+    assert(
+      sessionId !== undefined && base.id === sessionId,
+      '夹具标签应当就是刚打开的那个会话'
+    );
+    // 标签由锚点 `(lib)` 命中 `lib/` 这一段产生：每个方框都应当带上它。
+    // 逐条按文件核对（而不是挑「第一个非根节点」），否则键序一变断言就可能挑到没有标签的那个。
+    const tagByFile = new Map(
+      Object.entries(base.nodes).map(([, node]) => [node.file, node.nameTagPrefix ?? ''])
+    );
+    assert(
+      [...tagByFile].length === baseCount && [...tagByFile].every(([, prefix]) => prefix.includes('[lib]')),
+      `每个夹具方框都应当带上名称行标签 "[lib] → "，实际 ${JSON.stringify([...tagByFile])}`
+    );
+
+    // 两个开关都关：`[lib]` 不是任何路径的子串（路径里没有方括号）→ 不隐藏任何节点（与从前逐字一致）
+    const offPayload = await withFilter({ query: '[lib]' });
+    assert(
+      offPayload.filteredCount === undefined,
+      `两个开关都关时只看路径，查询 [lib] 不该隐藏任何节点（实际 ${offPayload.filteredCount}）`
+    );
+    assert(
+      Object.keys(offPayload.nodes).length === baseCount,
+      '两个开关都关时的结果必须与从前逐字一致（节点一个不少）'
+    );
+
+    // 「包含标签」：标签文字命中 → 隐藏带 lib 标签的节点以及它们的子树（这里就是除根以外的全部）
+    const tagPayload = await withFilter({ query: '[lib]', matchTag: true });
+    assert(
+      tagPayload.filteredCount === baseCount - 1,
+      `包含标签时标签命中应当隐藏其整棵子树：期望 ${baseCount - 1}，实际 ${tagPayload.filteredCount}`
+    );
+    assert(
+      Object.keys(tagPayload.nodes).length === 1 && tagPayload.nodes[tagPayload.rootId] !== undefined,
+      '仅根节点应当留下（根永不参与过滤）'
+    );
+    assert(
+      captured.outputLines.some((line) => /临时路径过滤：隐藏 \d+ 个节点.*标签/.test(line)),
+      `输出通道应当说明这次是按标签匹配的，实际最后几行 ${JSON.stringify(captured.outputLines.slice(-3))}`
+    );
+
+    // 「仅标签」：`compute` 只命中路径（`lib/compute.cpp`）、标签文字 `[lib] → ` 里没有它 → 一个都不隐藏
+    const onlyTagPayload = await withFilter({ query: 'compute', tagOnly: true });
+    assert(
+      onlyTagPayload.filteredCount === undefined,
+      `「仅标签」不得看路径：查询 compute 只命中路径，实际隐藏了 ${onlyTagPayload.filteredCount} 个`
+    );
+    // 同一查询在「包含标签」下按路径命中 → 隐藏 compute 自己
+    const pathOrTagPayload = await withFilter({ query: 'compute', matchTag: true });
+    assert(
+      pathOrTagPayload.filteredCount === 1,
+      `「包含标签」应当同时看路径与标签：期望隐藏 1 个，实际 ${pathOrTagPayload.filteredCount}`
+    );
+    // 默认口径（都关）下按路径命中的结果与「包含标签」一致 —— 路径这一侧没有被开关削弱
+    const defaultPayload = await withFilter({ query: 'compute' });
+    assert(
+      defaultPayload.filteredCount === 1,
+      `默认只看路径时查询 compute 应当隐藏 1 个，实际 ${defaultPayload.filteredCount}`
+    );
+
+    // 多条查询 + 标签：`compute, [lib]` —— 两条各命中一部分，合起来是除根以外的全部
+    const multiPayload = await withFilter({ query: 'compute, [lib]', matchTag: true });
+    assert(
+      multiPayload.filteredCount === baseCount - 1,
+      `多条查询与标签匹配应当叠加（任一命中即隐藏）：期望 ${baseCount - 1}，实际 ${multiPayload.filteredCount}`
+    );
+
+    // ---- ②b 「仅保留」的端到端（用户 2026-11-20）----
+    // 查询 compute：只有 compute 命中 → 保留 root + compute，其余隐藏（filteredCount = 总数 - 2）。
+    const keepPayload = await withFilter({ query: 'compute', keepOnly: true });
+    assert(
+      Object.keys(keepPayload.nodes).length === 2 &&
+        keepPayload.nodes[keepPayload.rootId] !== undefined,
+      `「仅保留」应当只剩根与 compute（2 个），实际留下 ${Object.keys(keepPayload.nodes).length} 个：` +
+        JSON.stringify(Object.values(keepPayload.nodes).map((node) => node.file))
+    );
+    assert(
+      keepPayload.filteredCount === baseCount - 2,
+      `「仅保留」也要报隐藏数量：期望 ${baseCount - 2}，实际 ${keepPayload.filteredCount}`
+    );
+    // 与「排除」互反：同一条查询，两种模式留下的**节点集合**必须不同。
+    // ⚠️ 不能拿隐藏数量比：这个夹具里两个分支都各有 1 个节点，两种模式的隐藏数恰好相同。
+    const excludeIds = Object.keys(
+      (await withFilter({ query: 'compute' })).nodes
+    ).sort().join(',');
+    const keepIds = Object.keys(keepPayload.nodes).sort().join(',');
+    assert(
+      excludeIds !== keepIds,
+      `同一条查询在两种模式下留下的节点集合必须不同（排除：${excludeIds}；保留：${keepIds}）`
+    );
+    // 「按标签保留」：`[lib]` 命中三个方框的标签 → 三个都留，一个也不隐藏
+    const keepTagPayload = await withFilter({ query: '[lib]', matchTag: true, keepOnly: true });
+    assert(
+      Object.keys(keepTagPayload.nodes).length === baseCount &&
+        keepTagPayload.filteredCount === undefined,
+      `「按标签保留」应当全部留下（${baseCount} 个且不报隐藏），实际留下 ` +
+        `${Object.keys(keepTagPayload.nodes).length} 个 / filteredCount=${keepTagPayload.filteredCount}`
+    );
+    // 日志里要能看出是「仅保留」这一档（否则排障时分不清两种模式）
+    const keepLogPayload = await withFilter({ query: 'compute', keepOnly: true });
+    assert(
+      keepLogPayload !== undefined &&
+        captured.outputLines.some((line) => /临时路径过滤：隐藏 \d+ 个节点.*仅保留/.test(line)),
+      `输出通道应当说明这次是「仅保留」，实际 ${JSON.stringify(captured.outputLines.slice(-3))}`
+    );
+
+    // 面板重建时三个开关必须随 init 还原，否则界面显示「都关」而图仍是过滤后的。
+    // ⚠️ 每个值都要**各测一次**：只看「当前是 true 的那一个」等于没验另一个 ——
+    // 曾经只断言 `tagOnly === false`，而那一刻宿主手里本来就是 false，写死 false 也照样绿。
+    const initFlags = async (message) => {
+      await withFilter(message);
+      captured.posted.length = 0;
+      fake.send({ type: 'ready' });
+      await wait(60);
+      const init = captured.posted.find((item) => item.type === 'init');
+      return {
+        matchTag: init?.pathFilterMatchTag,
+        tagOnly: init?.pathFilterTagOnly,
+        keepOnly: init?.pathFilterKeepOnly,
+        init,
+      };
+    };
+    const onlyTagInit = await initFlags({ query: '[lib]', matchTag: false, tagOnly: true });
+    assert(
+      onlyTagInit.init !== undefined && onlyTagInit.tagOnly === true && onlyTagInit.matchTag === false,
+      `init 必须带上「仅标签」的当前取值（true），实际 ${JSON.stringify({
+        matchTag: onlyTagInit.matchTag,
+        tagOnly: onlyTagInit.tagOnly,
+      })}`
+    );
+    const withTagInit = await initFlags({ query: '[lib]', matchTag: true, tagOnly: false });
+    assert(
+      withTagInit.init !== undefined && withTagInit.matchTag === true && withTagInit.tagOnly === false,
+      `init 必须带上「包含标签」的当前取值（true），实际 ${JSON.stringify({
+        matchTag: withTagInit.matchTag,
+        tagOnly: withTagInit.tagOnly,
+      })}`
+    );
+    const keepInit = await initFlags({ query: 'compute', keepOnly: true });
+    assert(
+      keepInit.init !== undefined && keepInit.keepOnly === true,
+      `init 必须带上「仅保留」的当前取值（true），实际 ${JSON.stringify({
+        keepOnly: keepInit.keepOnly,
+      })}`
+    );
+    const keepOffInit = await initFlags({ query: 'compute', keepOnly: false });
+    assert(
+      keepOffInit.init !== undefined && keepOffInit.keepOnly === false,
+      `「仅保留」关掉时 init 也要带上 false（否则面板会停在点亮状态），实际 ${JSON.stringify({
+        keepOnly: keepOffInit.keepOnly,
+      })}`
+    );
+    // 先把状态摆成已知的一份，再核对调试快照 —— 上面几个 init 用例把开关留在不同组合上
+    await withFilter({ query: '[lib]', matchTag: true, keepOnly: true });
+    const debugSnapshot = provider.__debugSnapshot();
+    assert(
+      debugSnapshot.pathFilterMatchTag === true && debugSnapshot.pathFilterTagOnly === false,
+      '两个标签开关只活在宿主内存里（不写设置、不进快照），因此必须能从调试快照里看到'
+    );
+    assert(
+      debugSnapshot.pathFilterKeepOnly === true,
+      '「仅保留」同样只活在宿主内存里，调试快照里应当能读到它（此刻为 true）'
+    );
+
+    // 收尾：清空查询与三个开关，并把夹具文件还原 —— 否则后面的用例都在多段路径下跑
+    await withFilter({ query: '', matchTag: false, tagOnly: false, keepOnly: false });
+    assert(
+      !captured.outputLines.some((line) => /临时路径过滤：隐藏/.test(line)),
+      `没有隐藏时不该报「隐藏 N 个」，实际 ${JSON.stringify(captured.outputLines.slice(-3))}`
+    );
+    setItemFile('leafAdd', 'demo.cpp');
+    setItemFile('compute', 'demo.cpp');
+    setItemFile('main', 'demo.cpp');
+    delete configStore['cppCallGraph.nameFolderTag'];
+    delete configStore['cppCallGraph.pathAnchors'];
+    await registered.get('cppCallGraph.closeAllTabs')();
+    await wait(40);
+    console.log(
+      `诊断: 临时过滤扩充 —— 拆分「a, "b,c" ,, d」= 3 条（引号内逗号不拆、空项丢弃）；` +
+        `标签开关三档：都关 = 0 命中、包含标签 = ${baseCount - 1} 个、仅标签对纯路径命中 = 0 个；` +
+        `「仅保留」按 compute 只剩 2 个（隐藏 ${keepPayload.filteredCount}）、按标签保留则一个不隐藏；` +
+        `多条查询与标签匹配叠加；三个开关随 init 还原且只活在内存里`
     );
   }
 
@@ -2309,6 +2760,132 @@ async function main() {
         'OK: 导出宿主侧 —— 取消不写文件不报错；md-tree/md-table/json 与纯函数逐字一致；' +
           'svg 按 UTF-8、png 按 base64 解码落盘；缺 data 时只警告'
       );
+
+      // ⑤b 超大正文的**分块**传输（用户 2026-10-17）：
+      //     几十 MB 的正文不能塞进一条 postMessage。这里走真实链路（分块消息 → 宿主拼 → 写盘），
+      //     并钉住两条：**最后一块到达前不写盘**、拼起来与原文**逐字一致**。
+      {
+        const body = `<svg xmlns="http://www.w3.org/2000/svg">${'x'.repeat(5000)}</svg>`;
+        const chunks = api.chunkText(body, 512);
+        assert(
+          chunks.length > 1 && chunks.join('') === body,
+          `分块必须无损：${chunks.length} 块拼回来应当与原文本逐字相同`
+        );
+        assert(
+          api.chunkText('', 512).length === 1 && api.chunkText('', 512)[0] === '',
+          '空正文也应当得到一块（调用方不必特判）'
+        );
+        assert(
+          api.chunkText('abc', 0).join('') === 'abc',
+          '块大小非法时必须退化为「每块 1 个字符」而不是死循环'
+        );
+        assert(
+          api.chunkText('abcd', 2).join('|') === 'ab|cd',
+          `分块边界必须是「从前往后每 size 个字符」，实际 ${api.chunkText('abcd', 2).join('|')}`
+        );
+
+        const chunkFile = { ...savedTo, fsPath: path.join(ROOT, '导出测试-分块.svg') };
+        captured.saveDialogResult = chunkFile;
+        captured.writes.length = 0;
+        captured.saveDialogs.length = 0;
+        const errorCountBefore = errorLines();
+        const sendChunk = async (seq) => {
+          fake.send({
+            type: 'exportGraphChunk',
+            sessionId: exportSessionId,
+            format: 'svg',
+            seq,
+            chunk: chunks[seq],
+            last: seq === chunks.length - 1,
+            ...(seq === 0 ? { note: '分块导出说明' } : {}),
+          });
+          await tick();
+        };
+        // 前面的块全部发完（不包含最后一块）：不得写盘、也不得弹保存对话框
+        for (let seq = 0; seq < chunks.length - 1; seq += 1) {
+          await sendChunk(seq);
+        }
+        assert(
+          captured.writes.length === 0 && captured.saveDialogs.length === 0,
+          `收到结束标记前不得写盘（已发 ${chunks.length - 1} 块，却写了 ${captured.writes.length} 次、` +
+            `弹了 ${captured.saveDialogs.length} 次保存对话框）`
+        );
+        // 最后一块：这才拼正文、问位置、写盘
+        await sendChunk(chunks.length - 1);
+        assert(
+          captured.saveDialogs.length === 1 && captured.writes.length === 1,
+          `最后一块到达后应当问一次保存位置并写一次文件，实际对话框 ${captured.saveDialogs.length} 次、` +
+            `写盘 ${captured.writes.length} 次`
+        );
+        assert(
+          captured.outputLines.some((line) => line.includes('分块导出说明')),
+          '面板随正文带来的说明（例如「已降为 1 倍分辨率」）应当写进输出通道'
+        );
+        assert(
+          Buffer.from(captured.writes[0].bytes).toString('utf8') === body,
+          '分块拼出来的正文必须与原文本逐字一致（少一块或多一块都会在这里露出来）'
+        );
+        assert(errorLines() === errorCountBefore, '分块导出正常完成时不该写 error 级日志');
+        console.log(
+          `诊断: 分块导出 —— ${chunks.length} 块（每块 ${512} 字符，共 ${body.length} 字符）：` +
+            `末块到达前不写盘，拼回后与原文逐字一致`
+        );
+
+        // 缺最后一块（用户中途关掉面板之类）：不得留下半个文件
+        captured.writes.length = 0;
+        captured.saveDialogs.length = 0;
+        for (let seq = 0; seq < chunks.length - 1; seq += 1) {
+          await sendChunk(seq);
+        }
+        assert(
+          captured.writes.length === 0 && captured.saveDialogs.length === 0,
+          '缺最后一块时不得写盘（宁可什么都不做，也不要写出缺了一截的文件）'
+        );
+        // 序号不连续：整次导出作废，并留下可诊断的警告
+        const warnBefore = captured.outputLines.length;
+        await sendChunk(1);
+        assert(
+          captured.writes.length === 0 && captured.saveDialogs.length === 0,
+          '序号错乱时不得写盘'
+        );
+        assert(
+          captured.outputLines
+            .slice(warnBefore)
+            .some((line) => line.startsWith('warn:') && line.includes('分块正文不连续')),
+          `序号错乱必须留下可诊断的警告，实际 ${JSON.stringify(
+            captured.outputLines.slice(warnBefore)
+          )}`
+        );
+        captured.saveDialogResult = undefined;
+      }
+
+      // ⑤c PNG 分辨率：超面积时先自动降倍率再试，1 倍也放不下才失败
+      {
+        const maxArea = 16384 * 16384;
+        const wide = api.choosePngScale(9000, 9000, { preferred: 2, maxArea });
+        assert(
+          wide.scale === 1 && wide.downgraded === true && wide.tooLarge === false,
+          `2 倍超面积、1 倍放得下时应当自动降为 1 倍，实际 ${JSON.stringify(wide)}`
+        );
+        assert(
+          wide.width === 9000 && wide.height === 9000,
+          `降为 1 倍后的像素尺寸应当是原尺寸，实际 ${wide.width}×${wide.height}`
+        );
+        const small = api.choosePngScale(400, 300, { preferred: 2, maxArea });
+        assert(
+          small.scale === 2 && small.downgraded === false && small.width === 800,
+          `小图应当保持 2 倍分辨率，实际 ${JSON.stringify(small)}`
+        );
+        const huge = api.choosePngScale(9000, 40000, { preferred: 2, maxArea });
+        assert(
+          huge.tooLarge === true,
+          `1 倍也超面积时应当报「过大」（面板据此指向 SVG 导出），实际 ${JSON.stringify(huge)}`
+        );
+        console.log(
+          `诊断: PNG 分辨率 —— 小图 2 倍（${small.width}×${small.height}）；` +
+            `9000² 自动降为 1 倍；9000×20000 判定为过大（提示改用 SVG）`
+        );
+      }
 
       // ⑥ webview 报错转日志：前缀「视图内报错：」只能出现一次。
       //    历史缺陷：graphView.ts 拼了一次前缀，extension.ts 注册的回调又拼一次，

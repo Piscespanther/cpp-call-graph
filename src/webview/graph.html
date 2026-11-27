@@ -115,7 +115,10 @@
           临时路径过滤。整段用 `<span>` 包一层（而不是再嵌一个 div）：校验脚本按 #search 外层
           div 的**结束标签**截取这一段，里面若再出现一个 div 的结束标签，抓取会提前截断。
           查询是**子串 + 通配**（`*` 段内任意长、`?` 单字符、两个星号后接斜杠表示任意层），
-          匹配对象是完整（相对工作区）路径；「已隐藏 N 个」由宿主算好后随 payload 下发。
+          可以用逗号写多条（任一命中即命中，引号里的逗号不算分隔符）；
+          匹配对象默认是完整（相对工作区）路径，两个开关可把它换成名称行标签；
+          第三个开关「仅保留」翻转处置方式：默认是「命中即排除」，按下后改成「只保留命中项」。
+          「已隐藏 N 个」由宿主算好后随 payload 下发。
         -->
         <span id="path-filter" class="path-filter">
           <input
@@ -123,10 +126,13 @@
             class="search-input path-filter-input"
             type="text"
             placeholder="临时过滤路径…"
-            title="临时过滤：路径命中该查询的方框（连同其子树）在所有标签里都不显示；不写入设置，清空后立即恢复"
+            title="临时过滤：命中该查询的方框（连它们所在的子树或它们的上级链）在所有标签里都不显示或只显示其一。默认「排除」= 命中项连同子树隐藏；按下面「仅保留」= 只留下命中项与它们到根的上级。多条查询用逗号分隔，任一命中即生效；引号里的逗号不算分隔符。不写入设置，清空后立即恢复"
             spellcheck="false"
             autocomplete="off"
           />
+          <button id="btn-filter-tag" class="search-toggle" type="button" title="包含标签：路径或名称行标签命中即算命中（与「仅标签」互斥）" aria-label="包含标签" aria-pressed="false">包含标签</button>
+          <button id="btn-filter-tag-only" class="search-toggle" type="button" title="仅标签：只按名称行标签匹配，不看路径（需打开 cppCallGraph.nameFolderTag）" aria-label="仅标签" aria-pressed="false">仅标签</button>
+          <button id="btn-filter-keep" class="search-toggle" type="button" title="仅保留：翻转过滤方向 —— 只留下命中项与它们到根的上级链，其余全部隐藏" aria-label="仅保留" aria-pressed="false">仅保留</button>
           <span id="path-filter-count" class="search-count path-filter-count" role="status" aria-live="polite"></span>
         </span>
       </div>

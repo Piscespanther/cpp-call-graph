@@ -101,7 +101,7 @@ Module._load = function patched(request, parent, isMain) {
 
 const extension = require(path.join(ROOT, 'dist', 'extension.js'));
 const { createLayout } = extension.__layout;
-const { baseKeyOf, pickByChoice } = extension.__hierarchy;
+const { baseKeyOf, pickByChoice, arrangeByProximity } = extension.__hierarchy;
 
 // ------------------------------------------------------------ 夹具
 function makeNode(id, depth, parent, children) {
@@ -195,8 +195,37 @@ for (const depth of [100, 500, 1000, 2000]) {
   );
 }
 
-console.log('=== 其他热路径 ===');
+// ------------------------------------------------------------ 展开一层 200 个子节点
+// 用户 2026-10-17 的「子级特别多时展开偏慢」：宿主这一侧在这一层到达后要做两件事 ——
+// ① 把子节点按「最亲的居中」排序（`arrangeByProximity`，每个子节点算一次路径亲疏）；
+// ② 按实测宽度重排列位置（`createLayout`）。
+// 面板侧那一帧的耗时与量宽次数在 renderCheck.js 里量（它才加载真实前端）。
+console.log('=== 展开一层 200 个子节点（宿主侧） ===');
 {
+  const childCount = 200;
+  const childIds = Array.from({ length: childCount }, (_item, index) => `w${index}`);
+  const nodes = {};
+  for (const id of childIds) {
+    // 刻意让文件分散在 12 个目录里：路径亲疏比较要逐段走完，目录越多越接近真实工程
+    nodes[id] = makeNode(id, 1, 'root', []);
+    nodes[id].file = `src/module_${Number(id.slice(1)) % 12}/file_${id}.cpp`;
+  }
+  nodes.root = makeNode('root', 0, undefined, childIds);
+  nodes.root.file = 'src/module_3/dispatcher.cpp';
+  const measured = new Map(
+    ['root', ...childIds].map((id) => [id, 140 + (id.length % 5) * 24])
+  );
+  const fileOf = (id) => nodes[id]?.file ?? '';
+  const arrange = time(() => arrangeByProximity(nodes.root.file, childIds, fileOf), 20);
+  console.log(`  子节点排序 arrangeByProximity（${childCount} 个）：${arrange.ms.toFixed(2)} ms`);
+  const layout = time(() => createLayout(nodes, 'root', measured));
+  console.log(
+    `  按实测宽度排布 createLayout（${childCount + 1} 节点）：${layout.ms.toFixed(1)} ms，` +
+      `出坐标 ${Object.keys(layout.result.boxes).length} 个`
+  );
+}
+
+console.log('=== 其他热路径 ===');{
   const nodes = wideGraph(2000, 2);
   const ids = Object.keys(nodes);
   const measured = new Map(ids.map((id) => [id, 120 + (id.length % 7) * 20]));

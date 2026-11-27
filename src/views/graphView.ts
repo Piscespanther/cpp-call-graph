@@ -286,6 +286,32 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
    * 因此由宿主匹配、并把隐藏数量随 payload 回给面板显示。
    */
   private pathFilterQuery = '';
+  /**
+   * 过滤是否也看**名称行标签**（面板上的「包含标签」，用户 2026-10-17 要求）。
+   *
+   * 与查询同样只活在内存里：不写设置、不进快照，但面板重建时随 `init` 一起还原 ——
+   * 否则会出现「图仍是按标签过滤的、开关却显示为关」，用户只能靠连点两下开关才发现。
+   */
+  private pathFilterMatchTag = false;
+  /** 过滤是否**只看**标签、不看路径（面板上的「仅标签」；它已隐含「包含标签」）。 */
+  private pathFilterTagOnly = false;
+  /**
+   * 过滤是**只保留**命中项，还是**排除**命中项（面板上的「仅保留」，用户 2026-11-20 要求）。
+   *
+   * `false` = 排除（默认，命中连同子树都不显示）；`true` = 只保留命中节点与它们到根的祖先链。
+   * 它与「包含标签 / 仅标签」正交：那两个决定什么算命中，这一个决定命中之后是留还是去。
+   */
+  private pathFilterKeepOnly = false;
+  /**
+   * 分块传输中的导出正文（键 = `会话 id|格式`）。
+   *
+   * 只在同一次导出的一串消息之间存活：收到 `last` 立刻取出并删除；序号不连续时也删除
+   * （宁可让这次导出失败，也不拼出一个拼接错位的文件）。会话关闭时一并清掉。
+   */
+  private exportChunks = new Map<
+    string,
+    { chunks: string[]; next: number; note?: string }
+  >();
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -388,12 +414,23 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
    *
    * 结果一律写输出通道（不弹右下角提示）；只有**写盘失败**才用 `showErrorMessage`。
    * 用户取消保存对话框时什么都不做，也不报错。
+   *
+   * @param note 面板随正文带来的一条说明（例如「大图已自动降为 1 倍分辨率」）。
+   *   走输出通道，不弹提示 —— 这不是错误，但用户需要知道自己拿到的是哪一档。
    */
-  async exportGraph(sessionId: string, format: ExportFormat, data?: string): Promise<void> {
+  async exportGraph(
+    sessionId: string,
+    format: ExportFormat,
+    data?: string,
+    note?: string
+  ): Promise<void> {
     const session = this.getSession(sessionId);
     if (!session) {
       logWarn(`导出失败：找不到会话 ${sessionId}`);
       return;
+    }
+    if (note) {
+      logWarn(note);
     }
     const info = EXPORT_FORMATS[format];
     if (!info) {
@@ -461,6 +498,12 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
     this.measuredWidths.delete(id);
     this.collapsedNodes.delete(id);
     this.selectedIds.delete(id);
+    // 分块导出缓冲区也要清：标签关掉后剩下的半截正文永远等不到最后一块
+    for (const key of [...this.exportChunks.keys()]) {
+      if (key.startsWith(`${id}|`)) {
+        this.exportChunks.delete(key);
+      }
+    }
   }
 
   closeSession(id: string): void {
@@ -671,13 +714,24 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
       case 'pathFilter': {
         // 临时路径过滤（面板搜索栏右侧的输入框）：整窗一份查询，所有标签一起重排。
         //
-        // ⚠️ 查询没变就直接跳过：输入框的 `input` 事件比语义变化密得多（面板侧已做防抖，
-        // 这里再挡一道），而每一次都要重算所有标签的布局并整份下发。
+        // ⚠️ 查询与三个开关**任一**没变就直接跳过：输入框的 `input` 事件比语义变化密得多
+        // （面板侧已做防抖，这里再挡一道），而每一次都要重算所有标签的布局并整份下发。
         const query = String(message.query ?? '');
-        if (query === this.pathFilterQuery) {
+        const matchTag = message.matchTag === true;
+        const tagOnly = message.tagOnly === true;
+        const keepOnly = message.keepOnly === true;
+        if (
+          query === this.pathFilterQuery &&
+          matchTag === this.pathFilterMatchTag &&
+          tagOnly === this.pathFilterTagOnly &&
+          keepOnly === this.pathFilterKeepOnly
+        ) {
           break;
         }
         this.pathFilterQuery = query;
+        this.pathFilterMatchTag = matchTag;
+        this.pathFilterTagOnly = tagOnly;
+        this.pathFilterKeepOnly = keepOnly;
         // 每个标签都要重发：过滤是窗口级的，非活动标签的图也得跟着变。
         for (const item of this.sessions) {
           this.postSession(item);
@@ -750,6 +804,12 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
         }
         const previous = this.measuredWidths.get(message.sessionId);
         // 只在**确实变了**的时候才重排，否则会「回传 → 重排 → 再回传」无限循环。
+        //
+        // ⚠️ 比较必须连**节点集合**一起比（`sameWidths` 先比 size、再逐 id 比值）：
+        // 展开后新方框宽度的初值是宿主估宽，只要漏掉「有新增 id 也要重排」，
+        // 列位置就会一直按估宽摆着，箭头与方框对不上（用户 2026-10-17 反馈的「展开后箭头偶发错位」）。
+        // 另一半由面板负责：只要宿主这一帧下发的宽度与上次回报时不同（例如宿主改用估宽重排），
+        // 面板就再报一次 —— 两边合起来保证「一次展开最多两帧就收敛」。
         if (previous && sameWidths(previous, next)) {
           break;
         }
@@ -780,7 +840,41 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
       }
       case 'exportGraph': {
         // 工具栏「导出」菜单：PNG / SVG 的正文由 webview 给出，Markdown 与 JSON 由宿主生成
-        await this.exportGraph(message.sessionId, message.format, message.data);
+        await this.exportGraph(message.sessionId, message.format, message.data, message.note);
+        break;
+      }
+      case 'exportGraphChunk': {
+        // 导出正文的**分块**传输（用户 2026-10-17）：几十 MB 的序列化文本
+        // 塞进一条 postMessage 会让结构化克隆卡住主线程（真机表现是「点了没反应」）。
+        // 这里按序号累积，**收到 last 之后**才拼正文、问保存位置、写盘 ——
+        // 宁可什么都不做，也不写出一个缺了一截的文件。
+        const key = `${message.sessionId}|${message.format}`;
+        let buffer = this.exportChunks.get(key);
+        if (message.seq === 0) {
+          buffer = { chunks: [], next: 0, note: message.note };
+          this.exportChunks.set(key, buffer);
+        }
+        if (!buffer || buffer.next !== message.seq) {
+          this.exportChunks.delete(key);
+          logWarn(
+            `导出失败：分块正文不连续（收到第 ${message.seq} 块，期望第 ${
+              buffer?.next ?? 0
+            } 块），已丢弃这次导出。`
+          );
+          break;
+        }
+        buffer.chunks.push(message.chunk);
+        buffer.next += 1;
+        if (!message.last) {
+          break;
+        }
+        this.exportChunks.delete(key);
+        await this.exportGraph(
+          message.sessionId,
+          message.format,
+          buffer.chunks.join(''),
+          buffer.note
+        );
         break;
       }
     }
@@ -1197,7 +1291,11 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
         // 临时路径过滤的查询：**必须随 init 一起下发**。面板被隐藏后重新显示时 webview 会重建
         // （输入框回到空），而宿主这份查询还活着 —— 不下发的话，界面看起来「没有过滤」、
         // 图却是过滤后的，用户也没有办法清掉它（除非先随便打一个字再删掉）。
+        // 三个开关同理：不还原就会出现「图按标签过滤 / 只保留，开关却显示为关」这种界面与宿主分叉。
         pathFilterQuery: this.pathFilterQuery,
+        pathFilterMatchTag: this.pathFilterMatchTag,
+        pathFilterTagOnly: this.pathFilterTagOnly,
+        pathFilterKeepOnly: this.pathFilterKeepOnly,
         // 收起状态同理：面板收到 init 会把本地的收起表清空，而宿主仍在按它算坐标 ——
         // 不下发就会出现「父框画着 − 号，子框一个都不画」（要点两下才恢复）。
         collapsed: this.sessions.map((session) => ({
@@ -1279,6 +1377,34 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
+   * 路径显示方式（设置项）——**估宽、渲染文字、名称行标签**三处必须共用这一份。
+   *
+   * 两处各读一次设置就会分叉：列宽按一种口径排、文字按另一种画。
+   * 锚点条目在这里取**原文**（含括号）：路径那行与名称行标签都从这一份算，
+   * 括号语义（`(x)` = 两处都要、`[x]` = 只要标签）只此一处解释。
+   * ⚠️ 下发给面板的那一份是**剥过括号**的（见 settingsPayload），两者结果必须一致。
+   */
+  private pathDisplayOptions(): PathDisplayOptions {
+    const settings = this.settingsPayload();
+    const config = vscode.workspace.getConfiguration('cppCallGraph');
+    const rawStyle = config.get<string>('nameFolderTagStyle', 'arrow');
+    const rawPick = config.get<string>('nameFolderTagPick', 'first');
+    return {
+      mode: settings.pathDisplay,
+      tailLevels: settings.pathTailLevels,
+      showFileName: settings.pathShowFileName,
+      anchors: readAnchors(config.get<unknown>('pathAnchors', [])),
+      nameFolderTag: config.get<boolean>('nameFolderTag', false),
+      // 非法取值一律退回默认：手改 settings.json 写错字时，不该让整行标签消失或渲染成 "undefined"
+      nameFolderTagStyle:
+        rawStyle === 'parenAfter' || rawStyle === 'bracketAfter' || rawStyle === 'dotAfter'
+          ? rawStyle
+          : 'arrow',
+      nameFolderTagPick: rawPick === 'deepest' ? 'deepest' : 'first',
+    };
+  }
+
+  /**
    * 按当前过滤算出**这个标签里真正会被画出来的**节点表，并把锚点诊断顺带做了。
    *
    * 三处必须共用这一份口径，否则会出现「图里看不到、导出里却有」这类自相矛盾：
@@ -1290,8 +1416,14 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
    *
    * 过滤都放在这一层（而不是会话层）：会话仍保留取回来的数据，改设置后节点立刻回来，
    * 不需要重新请求语言服务。根节点永不参与过滤。
+   *
+   * @param pathOptions 路径显示方式。调用方已经算过时传进来复用（`buildPayload` 就是如此），
+   *   否则在这里现算 —— 「包含标签」的匹配素材正是由它决定的，两者不能各算一份。
    */
-  private visibleNodeRecord(session: CallSession): {
+  private visibleNodeRecord(
+    session: CallSession,
+    pathOptions: PathDisplayOptions = this.pathDisplayOptions()
+  ): {
     nodes: Record<string, GraphNode>;
     /** 因目录过滤隐藏的节点数（含子树）。 */
     folderHidden: number;
@@ -1316,7 +1448,19 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
     const { nodes, hidden: queryHidden } = applyPathQueryFilter(
       folderKept,
       session.rootId,
-      this.pathFilterQuery
+      this.pathFilterQuery,
+      {
+        matchTag: this.pathFilterMatchTag,
+        tagOnly: this.pathFilterTagOnly,
+        // 「仅保留」= 翻转语义：留下命中节点与它们到根的祖先链，其余隐藏
+        keepOnly: this.pathFilterKeepOnly,
+        // 标签文字就是名称行上那两段文字（payload 里的同名字段），因此两侧不存在第二种口径：
+        // 面板显示什么，这里就匹配什么。
+        tagText: (file) => {
+          const parts = nameTagPartsFor(file, pathOptions);
+          return `${parts?.prefix ?? ''}${parts?.suffix ?? ''}`;
+        },
+      }
     );
     return {
       nodes,
@@ -1348,31 +1492,8 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
     const { edges } = session.graph();
     // 用 webview 上一帧回传的实测宽度排布列位置；没有时 createLayout 自己估宽。
     const measured = this.measuredWidths.get(session.id);
-    // ⚠️ 路径显示方式必须与 webview 渲染用同一份设置：估宽与实际文字不一致时，
-    // 列宽会按错误的宽度排，文字要么顶到加减号、要么右边空一大截。
-    const settings = this.settingsPayload();
-    // 名称行标签（设置 `cppCallGraph.nameFolderTag` / `…Style` / `…Pick`）：估宽与 payload 里的
-    // 渲染文字都从这一份口径来 —— 两处各读一次设置，列宽与实际文字就会对不上。
-    const config = vscode.workspace.getConfiguration('cppCallGraph');
-    const rawStyle = config.get<string>('nameFolderTagStyle', 'arrow');
-    const rawPick = config.get<string>('nameFolderTagPick', 'first');
-    // 锚点条目在这里取**原文**（含括号）：路径那行与名称行标签都从这一份算，
-    // 括号语义（`(x)` = 两处都要、`[x]` = 只要标签）只此一处解释。
-    // ⚠️ 下发给面板的那一份是**剥过括号**的（见 settingsPayload），两者结果必须一致。
-    const rawAnchors = readAnchors(config.get<unknown>('pathAnchors', []));
-    const pathOptions: PathDisplayOptions = {
-      mode: settings.pathDisplay,
-      tailLevels: settings.pathTailLevels,
-      showFileName: settings.pathShowFileName,
-      anchors: rawAnchors,
-      nameFolderTag: config.get<boolean>('nameFolderTag', false),
-      // 非法取值一律退回默认：手改 settings.json 写错字时，不该让整行标签消失或渲染成 "undefined"
-      nameFolderTagStyle:
-        rawStyle === 'parenAfter' || rawStyle === 'bracketAfter' || rawStyle === 'dotAfter'
-          ? rawStyle
-          : 'arrow',
-      nameFolderTagPick: rawPick === 'deepest' ? 'deepest' : 'first',
-    };
+    // 路径显示方式（含名称行标签）：估宽、渲染文字、以及「包含标签」的匹配素材都从这一份来。
+    const pathOptions = this.pathDisplayOptions();
     // 目录过滤 + 临时路径过滤 + 锚点诊断：三处口径都在 `visibleNodeRecord()` 里
     // （payload 画什么、批量展开能碰什么、导出什么，必须完全一致）。
     const {
@@ -1380,13 +1501,16 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
       folderHidden,
       queryHidden: filteredCount,
       folderEntryCount,
-    } = this.visibleNodeRecord(session);
+    } = this.visibleNodeRecord(session, pathOptions);
     if (folderHidden > 0) {
       logInfo(`目录过滤：隐藏 ${folderHidden} 个节点（生效条目 ${folderEntryCount} 条）。`);
     }
     if (filteredCount > 0) {
       logInfo(
-        `临时路径过滤：隐藏 ${filteredCount} 个节点（查询「${this.pathFilterQuery.trim()}」）。`
+        `临时路径过滤：隐藏 ${filteredCount} 个节点（查询「${this.pathFilterQuery.trim()}」` +
+          `${this.pathFilterKeepOnly ? '，仅保留命中项' : ''}` +
+          `${this.pathFilterMatchTag || this.pathFilterTagOnly ? '，匹配名称行标签' : ''}` +
+          `${this.pathFilterTagOnly ? '（仅标签）' : ''}）。`
       );
     }
     const visibleIds = new Set(Object.keys(visibleNodes));
@@ -1413,7 +1537,7 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
       session.rootId,
       measured,
       this.collapsedNodes.get(session.id),
-      settings.showLocation,
+      vscode.workspace.getConfiguration('cppCallGraph').get<boolean>('showLocation', true),
       pathOptions,
       maxLayoutNodesLimit()
     );
@@ -1535,6 +1659,12 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
     selectedIds: Array<{ sessionId: string; nodeId: string }>;
     /** 临时路径过滤的查询（用于断言「它只活在内存里、不进快照」）。 */
     pathFilterQuery: string;
+    /** 「包含标签」开关（同样是临时状态，只用于断言）。 */
+    pathFilterMatchTag: boolean;
+    /** 「仅标签」开关（同样是临时状态，只用于断言）。 */
+    pathFilterTagOnly: boolean;
+    /** 「仅保留」开关（同样是临时状态，只用于断言）。 */
+    pathFilterKeepOnly: boolean;
   } {
     return {
       sessionIds: this.sessions.map((session) => session.id),
@@ -1550,6 +1680,9 @@ export class GraphViewProvider implements vscode.WebviewViewProvider {
       })),
       selectedIds: [...this.selectedIds].map(([sessionId, nodeId]) => ({ sessionId, nodeId })),
       pathFilterQuery: this.pathFilterQuery,
+      pathFilterMatchTag: this.pathFilterMatchTag,
+      pathFilterTagOnly: this.pathFilterTagOnly,
+      pathFilterKeepOnly: this.pathFilterKeepOnly,
     };
   }
 }
@@ -1592,8 +1725,19 @@ type WebviewMessage =
    *
    * **不按标签分**：整窗一份查询，所有打开的标签一起重排 —— 用户口径是「所有标签通用」。
    * 宿主每次也会把它**遗弃在内存里**：既不写设置，也不进 `persist()` 的快照。
+   *
+   * `matchTag` / `tagOnly` 是两个开关（「包含标签」/「仅标签」，用户 2026-10-17 要求）。
+   * `keepOnly` 是第三个开关（「仅保留」，用户 2026-11-20 要求）：翻转语义 ——
+   * 只保留命中节点与它们到根的祖先链，而不是把命中项排除掉。
+   * 三者都带默认值：旧面板不发这些字段时按「都关」处理，行为与从前逐字一致。
    */
-  | { type: 'pathFilter'; query: string }
+  | {
+      type: 'pathFilter';
+      query: string;
+      matchTag?: boolean;
+      tagOnly?: boolean;
+      keepOnly?: boolean;
+    }
   | { type: 'resetExpansion'; sessionId: string }
   | { type: 'openLocation'; sessionId: string; nodeId: string }
   | { type: 'selectNode'; sessionId: string; nodeId: string }
@@ -1607,6 +1751,23 @@ type WebviewMessage =
    *
    * `png` / `svg` 的正文由 webview 抓取后放进 `data`（png 是 base64，svg 是序列化文本）；
    * `md-tree` / `md-table` / `json` **不带 data**，由宿主用纯函数生成。
+   *
+   * `note` 是面板随正文带来的说明（例如「大图已自动降为 1 倍分辨率」），走输出通道。
    */
-  | { type: 'exportGraph'; sessionId: string; format: ExportFormat; data?: string }
+  | { type: 'exportGraph'; sessionId: string; format: ExportFormat; data?: string; note?: string }
+  /**
+   * 导出正文的一条分块（正文超过面板的分块阈值时用它；用户 2026-10-17）。
+   *
+   * `seq` 从 0 开始、`last` 只在最后一块为真；宿主按序号拼接，**收到 `last` 才写盘**。
+   */
+  | {
+      type: 'exportGraphChunk';
+      sessionId: string;
+      format: ExportFormat;
+      seq: number;
+      chunk: string;
+      last: boolean;
+      /** 面板要转达给用户的一条说明（只随第一块发一次）。 */
+      note?: string;
+    }
   | { type: 'copyNodeLocation'; sessionId: string; nodeId: string };

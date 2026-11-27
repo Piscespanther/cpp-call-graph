@@ -8,6 +8,7 @@
 
 import { ICON_BY_CODICON, KIND_TO_ICON } from './symbolIcons';
 import { createDirectionIcon } from './callIcons';
+import { choosePngScale, chunkText } from '../util/exportTransfer';
 
 type Direction = 'callers' | 'callees';
 
@@ -141,6 +142,12 @@ interface InitMessage {
    * 否则会出现「界面看着没过滤、图却是过滤后的」这种没法解释、也没法清掉的状态。
    */
   pathFilterQuery?: string;
+  /** 过滤是否也看名称行标签（「包含标签」）。旧宿主不带时保留界面上的当前取值。 */
+  pathFilterMatchTag?: boolean;
+  /** 过滤是否只看标签（「仅标签」）。 */
+  pathFilterTagOnly?: boolean;
+  /** 过滤是否**只保留**命中项（「仅保留」）；缺省 = 排除命中项。 */
+  pathFilterKeepOnly?: boolean;
   /**
    * 宿主手里的**收起状态**（按标签）。面板重建或可见性变化时，本地的收起表会被清空，
    * 而宿主的仍在按它算坐标（收起的子树没有坐标、不占高度）—— 不下发就会出现
@@ -611,22 +618,33 @@ function measureBoxWidth(node: GraphNode): number {
 }
 
 /**
+ * 本帧从宿主 payload 里读到的**原始**方框宽度（按会话、按节点）。
+ *
+ * 为什么必须单独记一份：`measureSessionWidths()` 会就地把 `geometry.width` 改写成实测值，
+ * 改完就再也看不到「宿主这一帧给的是多少」。而这一份正是判断「宿主是否改用估宽排版」的依据。
+ */
+const hostSentWidths = new Map<string, Map<string, number>>();
+
+/**
  * 给当前可见节点量宽，写回 boxes。
  *
  * 必须在算画布大小（contentBounds）与画边之前调用，否则 viewBox 和箭头锚点
  * 会按宿主给的固定宽度算，和新方框对不上。
  */
 function measureSessionWidths(session: SessionPayload): void {
+  const sent = new Map<string, number>();
   for (const node of visibleNodes(session)) {
     const geometry = session.boxes[node.id];
     if (!geometry) {
       continue;
     }
+    sent.set(node.id, geometry.width);
     const measured = measureBoxWidth(node);
     if (geometry.width !== measured) {
       geometry.width = measured;
     }
   }
+  hostSentWidths.set(session.id, sent);
 }
 
 /**
@@ -635,8 +653,16 @@ function measureSessionWidths(session: SessionPayload): void {
  * 为什么需要：宿主（扩展进程）没有排版引擎，排布列位置时只能按字符数估宽；
  * 估宽一旦偏大，列就被推远、箭头被拉得很长。这里回传实测值后，宿主用真实宽度
  * 排列各列，列间距才严格等于设计值。宿主会在宽度变化时才重排，所以不会死循环。
+ *
+ * ⚠️ 判据必须**同时**看「自己量到的宽度」与「宿主这一帧下发的宽度」（用户 2026-10-17：
+ * 「展开后箭头偶发错位」）。只看前者会漏掉这一种情形：宿主把实测宽度表清掉过（例如
+ * 「收起全部」会 `measuredWidths.delete()`），于是它改用**估宽**排版下发；而面板这一帧量到的
+ * 宽度与上一次回报的**一模一样**（文字没变），签名不变 → 不再回报 → 宿主永远按估宽摆列，
+ * 箭头与方框就一直错着，直到用户重新打开标签。把宿主下发的那一份也算进签名，这种情况
+ * 必定再报一次；报完宿主用同一批实测值重排、下发的宽度就等于实测值，签名随之稳定（不会来回刷）。
+ *
+ * 上一次回报的签名（按会话）：一模一样就不再发，省掉每帧一次含 N 项的 IPC。
  */
-/** 上一次回报给宿主的宽度（按会话）：一模一样就不再发，省掉每帧一次含 N 项的 IPC。 */
 const lastReportedWidths = new Map<string, string>();
 
 /**
@@ -661,17 +687,24 @@ function clearSessionLoading(sessionId: string): void {
 }
 
 function reportMeasuredWidths(session: SessionPayload): void {
+  const sent = hostSentWidths.get(session.id);
   const widths: Array<{ id: string; width: number }> = [];
+  const parts: string[] = [];
   for (const node of visibleNodes(session)) {
     const geometry = session.boxes[node.id];
     if (geometry) {
       widths.push({ id: node.id, width: geometry.width });
+      // 签名里同时带上**宿主下发的**那一份宽度（见本函数上方的说明）：宿主一旦改用它自己的
+      // 估宽重排（实测宽度表被清掉过），这一项就会变，于是必定再报一次。
+      parts.push(
+        `${node.id}:${Math.round(geometry.width)}@${Math.round(sent?.get(node.id) ?? -1)}`
+      );
     }
   }
   if (widths.length === 0) {
     return;
   }
-  const signature = widths.map((item) => `${item.id}:${Math.round(item.width)}`).join('|');
+  const signature = parts.join('|');
   if (lastReportedWidths.get(session.id) === signature) {
     return;
   }
@@ -1005,12 +1038,37 @@ function compensatedView(session: SessionPayload, intent: CameraIntent): { left:
   };
 }
 
+/**
+ * 取路径里的目录部分（去掉最后一段文件名）。
+ *
+ * 只在 `revealNewLevel()` 里用于「同目录优先」，因此不追求与宿主那套路径显示同口径：
+ * 它比较的是**两段原始路径的目录是否相同**，两侧同样处理即可（大小写、斜杠两种都兼容）。
+ */
+function directoryOf(file: string): string {
+  const parts = String(file ?? '').split(/[\\/]/).filter((part) => part.length > 0);
+  return parts.length <= 1 ? '' : parts.slice(0, -1).join('/');
+}
+
 /** 展开：先让被点的方框原地不动，再最小位移地让新一级露出来。 */
 function revealNewLevel(session: SessionPayload, intent: CameraIntent): void {
   const parent = session.boxes[intent.nodeId];
-  const children = (session.nodes[intent.nodeId]?.children ?? [])
+  const childIds = session.nodes[intent.nodeId]?.children ?? [];
+  const children = childIds
     .map((id) => session.boxes[id])
     .filter((box): box is NonNullable<typeof box> => box !== undefined);
+  // 同目录优先（用户 2026-10-17 要求）：新一级里与父框**同目录**的那个方框最贴近用户当前
+  // 在看的那一支，展开后应当先被带进视野。父框在根目录时所有子节点都「同目录」，无优先可言
+  // （此时取不到偏好项，下面的纵向逻辑与从前逐字一致）。
+  const parentDir = directoryOf(session.nodes[intent.nodeId]?.file ?? '');
+  const preferredId =
+    parentDir.length === 0
+      ? undefined
+      : childIds.find(
+          (id) =>
+            session.boxes[id] !== undefined &&
+            directoryOf(session.nodes[id]?.file ?? '') === parentDir
+        );
+  const preferred = preferredId === undefined ? undefined : session.boxes[preferredId];
   const view = compensatedView(session, intent);
   // ⚠️ 横向只允许**右移**，且不做「把被点方框按回原位」的补偿：
   // 那个补偿会把视口往左推，与「把新一级露出来」的右移方向相反 —— 用户实测到的
@@ -1057,6 +1115,25 @@ function revealNewLevel(session: SessionPayload, intent: CameraIntent): void {
       view.top = Math.max(0, parent.y - CAMERA_PADDING);
     } else if (levelTop - CAMERA_PADDING < viewTop) {
       view.top = Math.max(0, levelTop - CAMERA_PADDING);
+    }
+    // 同目录的那个新方框必须真的落进视口：上面三条只保证「父框下沿 / 整级起点」可见，
+    // 而它在同列里排在后面时照样被切在下面 —— 偏偏它才是这次展开最相关的一个。
+    //
+    // 位移口径（按「能不能都放下」分开，避免为它把父框顶出视口）：
+    //   · 父框与它都放得下 → 把父框贴到视口上沿，两者一起可见且位移最小；
+    //   · 放不下（这一列比视口还高）→ 以它为准：把它的上沿对齐视口上沿
+    //     （它自己比视口还高时也只能从上沿看起）。
+    if (preferred !== undefined) {
+      const preferredTop = preferred.y - CAMERA_PADDING;
+      const preferredBottom = preferred.y + preferred.height + CAMERA_PADDING;
+      const viewportBottom = view.top + viewportHeight;
+      if (preferredBottom > viewportBottom || preferredTop < view.top) {
+        const spanTop = parent.y - CAMERA_PADDING;
+        view.top =
+          preferredBottom - spanTop <= viewportHeight
+            ? Math.max(0, spanTop)
+            : Math.max(0, preferredTop);
+      }
     }
   }
   panTo(view.left, view.top);
@@ -3522,7 +3599,7 @@ if (searchInputEl) {
 // ------------------------------------------------ 临时路径过滤（搜索栏区域，用户 2026-10-15）
 
 /**
- * 临时路径过滤的输入框与计数。
+ * 临时路径过滤的输入框、三个开关与计数。
  *
  * 与搜索**互不影响**（用户明确要求分开）：搜索只改高亮与「第 N/M 处」计数，
  * 过滤改的是**哪些方框存在**。两者各有一个输入框、各自独立。
@@ -3530,31 +3607,71 @@ if (searchInputEl) {
  * 这是**窗口级**功能：查询发给宿主，由宿主裁剪**每个标签**的 payload 再重排 ——
  * 因此切标签、新开标签都自动生效，也不需要面板自己维护一份「谁被隐藏了」的集合。
  * 它同时是**临时**的：不写设置、不进会话快照，清空输入框立即恢复。
+ *
+ * 匹配素材由前两个开关决定（都关 = 只看路径，与 2026-10-16 之前逐字一致）；
+ * 第三个开关「仅保留」决定**命中之后怎么处置** —— 默认排除命中项，按下后改成只保留命中项。
+ * 匹配本身仍**只在宿主一处**做：标签文字要拿路径显示设置现算，面板不必懂那套规则。
  */
 const pathFilterInputEl = document.getElementById('path-filter-input') as HTMLInputElement | null;
+/** 「包含标签」：路径或标签命中即算命中。 */
+const pathFilterTagButtonEl = document.getElementById('btn-filter-tag') as HTMLButtonElement | null;
+/** 「仅标签」：只看标签，不看路径。 */
+const pathFilterTagOnlyButtonEl = document.getElementById(
+  'btn-filter-tag-only'
+) as HTMLButtonElement | null;
+/** 「仅保留」：翻转处置方式 —— 只留下命中项（与「包含标签 / 仅标签」正交，可叠加）。 */
+const pathFilterKeepButtonEl = document.getElementById('btn-filter-keep') as HTMLButtonElement | null;
+
+/**
+ * 三个开关的当前取值。与查询一样是**临时**状态：不进设置，但随 `init` 一起还原。
+ *
+ * 前两个**互斥**（同时看不懂「只看标签」与「路径或标签」的区别）：开一个即关另一个，
+ * 于是三种状态各自可见 —— 都关 = 只看路径（与从前逐字一致）。
+ * 第三个与它们**正交**：它不管「什么算命中」，只管「命中之后留还是去」。
+ */
+let pathFilterMatchTag = false;
+let pathFilterTagOnly = false;
+let pathFilterKeepOnly = false;
 
 /** 输入防抖（毫秒）：宿主每个查询都要重算所有标签的布局，逐字符发会让大图明显卡顿。 */
 const PATH_FILTER_DEBOUNCE_MS = 200;
 
 let pathFilterTimer: ReturnType<typeof setTimeout> | undefined;
 
+/** 把三个开关的当前取值同步到按钮的显示状态（`.on` 与 `aria-pressed`）。 */
+function syncPathFilterToggles(): void {
+  pathFilterTagButtonEl?.classList.toggle('on', pathFilterMatchTag);
+  pathFilterTagButtonEl?.setAttribute('aria-pressed', String(pathFilterMatchTag));
+  pathFilterTagOnlyButtonEl?.classList.toggle('on', pathFilterTagOnly);
+  pathFilterTagOnlyButtonEl?.setAttribute('aria-pressed', String(pathFilterTagOnly));
+  pathFilterKeepButtonEl?.classList.toggle('on', pathFilterKeepOnly);
+  pathFilterKeepButtonEl?.setAttribute('aria-pressed', String(pathFilterKeepOnly));
+}
+
 /**
- * 把当前查询发给宿主。清空时**不等**防抖（「清空即恢复」必须是立刻的）。
+ * 把当前查询与三个开关发给宿主。清空时**不等**防抖（「清空即恢复」必须是立刻的）。
  *
- * 这样也顺带保证了对称性：输入框里的文字永远等于宿主手里的查询。
+ * 这样也顺带保证了对称性：输入框里的文字与三个开关，永远等于宿主手里的那一份。
  */
-function postPathFilter(query: string): void {
+function postPathFilter(query: string, immediate = false): void {
   if (pathFilterTimer !== undefined) {
     clearTimeout(pathFilterTimer);
     pathFilterTimer = undefined;
   }
-  if (query.trim().length === 0) {
-    post({ type: 'pathFilter', query });
+  const payload = {
+    type: 'pathFilter',
+    query,
+    matchTag: pathFilterMatchTag,
+    tagOnly: pathFilterTagOnly,
+    keepOnly: pathFilterKeepOnly,
+  };
+  if (immediate || query.trim().length === 0) {
+    post(payload);
     return;
   }
   pathFilterTimer = setTimeout(() => {
     pathFilterTimer = undefined;
-    post({ type: 'pathFilter', query });
+    post(payload);
   }, PATH_FILTER_DEBOUNCE_MS);
 }
 
@@ -3601,6 +3718,48 @@ if (pathFilterInputEl) {
     }
   });
 }
+
+/**
+ * 两个开关的点击：互斥地切换，然后**立刻**把新素材发给宿主（这不是逐字符输入，无需防抖）。
+ *
+ * 查询为空时也照发：宿主那边查询仍为空，不会隐藏任何节点；这样一来开关的状态与宿主
+ * 始终同步，用户接着打字时不必再补发一次。
+ */
+function togglePathFilterTag(only: boolean): void {
+  if (only) {
+    pathFilterTagOnly = !pathFilterTagOnly;
+    // 互斥：开「仅标签」就关「包含标签」（前者已隐含后者）
+    if (pathFilterTagOnly) {
+      pathFilterMatchTag = false;
+    }
+  } else {
+    pathFilterMatchTag = !pathFilterMatchTag;
+    if (pathFilterMatchTag) {
+      pathFilterTagOnly = false;
+    }
+  }
+  syncPathFilterToggles();
+  updatePathFilterUi(activeSession(), true);
+  postPathFilter(pathFilterInputEl?.value ?? '', true);
+}
+
+pathFilterTagButtonEl?.addEventListener('click', () => togglePathFilterTag(false));
+pathFilterTagOnlyButtonEl?.addEventListener('click', () => togglePathFilterTag(true));
+
+/**
+ * 「仅保留」的点击：与另外两个开关**无关**地翻转（正交：只改处置方式，不改匹配素材）。
+ *
+ * 与它们共用同一条发送路径：立刻发（开关不是逐字符输入）、查询为空也照发，
+ * 保证开关状态与宿主始终同步。
+ */
+function togglePathFilterKeep(): void {
+  pathFilterKeepOnly = !pathFilterKeepOnly;
+  syncPathFilterToggles();
+  updatePathFilterUi(activeSession(), true);
+  postPathFilter(pathFilterInputEl?.value ?? '', true);
+}
+
+pathFilterKeepButtonEl?.addEventListener('click', togglePathFilterKeep);
 
 /**
  * 到节点总数上限时：两个展开按钮置为禁用态并写明原因，另在工具栏下显示一行提示。
@@ -3792,6 +3951,14 @@ const EXPORT_PADDING = 12;
 const MAX_CANVAS_AREA = 16384 * 16384;
 /** PNG 数据 URL 的前缀；取到的数据不以它开头说明画布没有给出有效图像。 */
 const PNG_DATA_URL_PREFIX = 'data:image/png;base64,';
+/**
+ * 一条 `exportGraph` / `exportGraphChunk` 消息最多带多少字符（约 0.5 M，UTF-16 码元）。
+ *
+ * 为什么必须分块：超大关系图序列化后有几十 MB，一条消息的结构化克隆会长时间占住主线程，
+ * 真机表现是「点了导出没反应」（超时或直接被内核拒绝）。分块后每条都在可处理量级内，
+ * 宿主按序号拼回再写盘。
+ */
+const EXPORT_CHUNK_CHARS = 512 * 1024;
 /** 后备路径用的 SVG 数据 URL 前缀（主路径是 `blob:`，见 `rasterizePng` 的说明）。 */
 const SVG_DATA_URL_PREFIX = 'data:image/svg+xml;base64,';
 /**
@@ -3931,6 +4098,37 @@ document.addEventListener('keydown', (event) => {
 });
 
 /**
+ * 把导出的正文交给宿主：短的一条消息，长的**分块**（见 `EXPORT_CHUNK_CHARS`）。
+ *
+ * `seq` 从 0 起、最后一块带 `last: true`；宿主只在收到 `last` 之后才拼正文、弹保存对话框、
+ * 写盘 —— 缺块时宁可什么都不做，也不写出一个缺了一截的文件。
+ */
+function postExportBody(
+  sessionId: string,
+  format: ExportFormat,
+  body: string,
+  note?: string
+): void {
+  const chunks = chunkText(body, EXPORT_CHUNK_CHARS);
+  if (chunks.length === 1) {
+    post({ type: 'exportGraph', sessionId, format, data: body, ...(note ? { note } : {}) });
+    return;
+  }
+  for (let seq = 0; seq < chunks.length; seq += 1) {
+    post({
+      type: 'exportGraphChunk',
+      sessionId,
+      format,
+      seq,
+      chunk: chunks[seq],
+      last: seq === chunks.length - 1,
+      // 说明只跟着第一块走（宿主在一次导出里只会看到它一次）
+      ...(seq === 0 && note ? { note } : {}),
+    });
+  }
+}
+
+/**
  * 导出入口。
  *
  * `md-tree` / `md-table` / `json` 的正文由宿主生成（**不带 data**）；
@@ -3965,7 +4163,7 @@ function beginExport(format: ExportFormat, sessionId: string): void {
         );
         return;
       }
-      post({ type: 'exportGraph', sessionId, format, data: prepared.text });
+      postExportBody(sessionId, format, prepared.text);
       return;
     }
     // 栅格导出：剔除 `<title>`（只作用于克隆体，真画布一个都不动）。
@@ -4320,17 +4518,27 @@ function rasterizePng(
       return;
     }
 
-    // ① 画布与面积闸门：必须在加载图像之前。
-    const canvas = document.createElement('canvas');
-    canvas.width = Math.max(1, Math.round(prepared.width * EXPORT_SCALE));
-    canvas.height = Math.max(1, Math.round(prepared.height * EXPORT_SCALE));
-    if (canvas.width * canvas.height > MAX_CANVAS_AREA) {
+    // ① 画布与分辨率：必须在加载图像之前。
+    //    2 倍分辨率只是偏好 —— 超出面积上限时先自动降到 1 倍再试，1 倍也放不下才报错并指向
+    //    矢量导出（用户口径：不要因为「不够清晰」就拒绝一张本来画得出来的图）。
+    const choice = choosePngScale(prepared.width, prepared.height, {
+      preferred: EXPORT_SCALE,
+      maxArea: MAX_CANVAS_AREA,
+    });
+    if (choice.tooLarge) {
       fail(
-        `图形过大（导出尺寸 ${canvas.width} × ${canvas.height} 像素，超出画布面积上限），` +
-          `请改用「导出矢量图（SVG）」`
+        `图形过大（1 倍分辨率下已是 ${choice.width} × ${choice.height} 像素，超出画布面积上限），` +
+          `请改用「导出矢量图（SVG）」，或先收起部分分支后再导出`
       );
       return;
     }
+    const downgradeNote = choice.downgraded
+      ? `图形较大：PNG 已从 ${EXPORT_SCALE} 倍分辨率降为 ${choice.scale} 倍` +
+        `（导出尺寸 ${choice.width} × ${choice.height} 像素）。`
+      : undefined;
+    const canvas = document.createElement('canvas');
+    canvas.width = choice.width;
+    canvas.height = choice.height;
     // ② 2D 上下文。
     const context = canvas.getContext('2d');
     if (!context) {
@@ -4373,12 +4581,13 @@ function rasterizePng(
           // 面积虽然没超上限，画布仍可能拒绝给出图像；此时不能把空数据当成导出成功。
           throw new Error('画布没有返回有效的 PNG 数据');
         }
-        post({
-          type: 'exportGraph',
+        // ⚠️ base64 的 PNG 也可能有几十 MB：同样要分块（见 postExportBody）。
+        postExportBody(
           sessionId,
-          format: 'png',
-          data: url.slice(PNG_DATA_URL_PREFIX.length),
-        });
+          'png',
+          url.slice(PNG_DATA_URL_PREFIX.length),
+          downgradeNote
+        );
       } catch (error) {
         fail(error);
       }
@@ -4493,11 +4702,28 @@ function handleHostMessage(message: HostMessage): void {
       state.stickyParent = message.settings?.stickyParent ?? state.stickyParent;
       state.showLocation = message.settings?.showLocation ?? state.showLocation;
       applyPathSettings(message.settings);
-      // 临时路径过滤：把宿主那一份查询还原到输入框（面板重建时输入框是空的）。
-      // 只在宿主明确给了字段时改写 —— 旧宿主不带这个字段，不能把用户正在输入的文字清掉。
+      // 临时路径过滤：把宿主那一份查询与三个开关还原到界面上（面板重建时输入框是空的）。
+      // 只在宿主明确给了字段时改写 —— 旧宿主不带这些字段，不能把用户正在输入的文字清掉。
       if (pathFilterInputEl && typeof message.pathFilterQuery === 'string') {
         pathFilterInputEl.value = message.pathFilterQuery;
       }
+      if (typeof message.pathFilterMatchTag === 'boolean') {
+        pathFilterMatchTag = message.pathFilterMatchTag;
+      }
+      if (typeof message.pathFilterTagOnly === 'boolean') {
+        pathFilterTagOnly = message.pathFilterTagOnly;
+      }
+      // 「仅保留」与另外两个正交，单独还原，不参与下面的互斥收口
+      if (typeof message.pathFilterKeepOnly === 'boolean') {
+        pathFilterKeepOnly = message.pathFilterKeepOnly;
+      }
+      // 互斥是界面上的约定：宿主理论上可能两份都为真（旧版本面板发过），这里按「仅标签」优先收口，
+      // 免得出现两个开关同时点亮、含义又说不清的状态。
+      if (pathFilterTagOnly) {
+        pathFilterMatchTag = false;
+      }
+      syncPathFilterToggles();
+      updatePathFilterUi(activeSession());
       for (const summary of message.summaries ?? []) {
         state.sessions.set(summary.id, {
           id: summary.id,
